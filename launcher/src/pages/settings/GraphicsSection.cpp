@@ -20,16 +20,12 @@ QComboBox* xclDropdown(Services& s, const QString& key, const QList<QPair<QStrin
     return box;
 }
 
-QString envOverride(const char* name)
-{
-    const QString v = qEnvironmentVariable(name).trimmed();
-    return v.isEmpty() ? QString() : QStringLiteral("%1=%2 in the environment overrides this.").arg(QLatin1String(name), v);
-}
-
 }
 
 // Theme and the in-game bar are launcher settings. display_mode, raytracing, present and
-// d3d12_adapter are launcher defaults written into each title's xcl.toml at launch (LaunchConfig).
+// d3d12_adapter are launcher defaults written into each title's xcl.toml at launch (LaunchConfig); the
+// display mode, adapter and raytracing rows say so when the run profile or the environment sets the
+// variable XSEmu reads instead.
 QWidget* SettingsSections::graphics(Services& s)
 {
     const SettingsKit::Section sec = SettingsKit::makeSection(
@@ -62,8 +58,6 @@ QWidget* SettingsSections::graphics(Services& s)
                              sec.page);
     SettingsKit::Row* modeRow = sec.row(QStringLiteral("Display mode"),
                                         QStringLiteral("The output mode the game is told about. Auto: 1280×720 at 60 Hz on Series S, this display on Series X."), mode);
-    if (const QString env = envOverride("XCL_DISPLAY_MODE"); !env.isEmpty())
-        modeRow->setUnavailable(env);
 
     sec.caps(QStringLiteral("Presentation"));
     auto* lowLatency = new Toggle;
@@ -97,8 +91,6 @@ QWidget* SettingsSections::graphics(Services& s)
     };
     showHardware();
     QObject::connect(&s.hardware, &HardwareMonitor::changed, sec.page, showHardware);
-    if (const QString env = envOverride("XCL_ADAPTER"); !env.isEmpty())
-        adapterRow->setUnavailable(env);
     auto* rt = xclDropdown(s, QStringLiteral("raytracing"),
                            {{QStringLiteral("Auto (this GPU)"), QStringLiteral("auto")},
                             {QStringLiteral("Tier 1.1"), QStringLiteral("tier1_1")},
@@ -106,14 +98,26 @@ QWidget* SettingsSections::graphics(Services& s)
                             {QStringLiteral("Off"), QStringLiteral("off")}},
                            sec.page, 180);
     SettingsKit::Row* rtRow = sec.row(QStringLiteral("Raytracing"), QStringLiteral("The raytracing tier the game is told the GPU has."), rt);
-    if (const QString env = envOverride("XCL_RAYTRACING"); !env.isEmpty())
-        rtRow->setUnavailable(env);
+    // XSEmu reads these variables over xcl.toml: a run profile or environment that sets one wins
+    const QList<QPair<SettingsKit::Row*, QString>> overridable{
+        {modeRow, QStringLiteral("XCL_DISPLAY_MODE")}, {adapterRow, QStringLiteral("XCL_ADAPTER")}, {rtRow, QStringLiteral("XCL_RAYTRACING")}};
+    const auto followOverrides = [&s, overridable] {
+        for (const auto& [row, variable] : overridable) {
+            if (const QString why = LaunchConfig::environmentOverride(s.settings, variable); why.isEmpty())
+                row->setAvailable();
+            else
+                row->setUnavailable(why);
+        }
+    };
+    followOverrides();
 
-    QObject::connect(&s.settings, &AppSettings::changed, sec.page, [&s, theme, bar](const QString& key) {
+    QObject::connect(&s.settings, &AppSettings::changed, sec.page, [&s, theme, bar, followOverrides](const QString& key) {
         if (key == QLatin1String(AppSettings::Key::Theme))
             theme->setCurrentIndex(int(s.settings.theme()));
         else if (key == QLatin1String(AppSettings::Key::WindowGameBarAutoHide))
             bar->setCurrentIndex(s.settings.windowGameBarAutoHide() ? 1 : 0);
+        else if (key == QLatin1String(AppSettings::Key::RunProfile))
+            followOverrides();
     });
     sec.finish();
     return sec.page;

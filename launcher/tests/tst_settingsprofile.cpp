@@ -3,11 +3,14 @@
 #include "Runner.h"
 #include "SettingsProfile.h"
 
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QTemporaryDir>
 #include <QTest>
 #include <QtEndian>
+
+#include <algorithm>
 
 using namespace SettingsProfile;
 
@@ -73,6 +76,7 @@ private slots:
     void applyToGameWritesTheGameOnly();
     void applyAsDefaultsWritesTheDefaultsOnly();
     void environmentOverridesAreNotApplied();
+    void runProfileTravelsWithoutPaths();
 };
 
 void TestSettingsProfile::allowListIsBuiltOnLaunchConfig()
@@ -191,7 +195,9 @@ void TestSettingsProfile::nothingPrivateIsExported()
         QStringLiteral("/opt/xsemu/XSEmu.exe"), QStringLiteral("/mnt/fast/dxil"), QStringLiteral("/tmp/xsemu.busy"),
         QStringLiteral("GeForce RTX 5080 #2"), QStringLiteral("LUID-0000-ABCD"), QStringLiteral("C:\\Users\\alice\\dumps"),
         QStringLiteral("tok-secret-42"), QStringLiteral("SignalGarden_1x2y3z"), QStringLiteral("Signal Garden"), QStringLiteral("4096"),
+        QStringLiteral("C:\\Users\\alice\\skip.txt"),
     };
+    s.setRunProfile({QStringLiteral("XCL_LOOP_GUARD=1024"), QStringLiteral("XCL_SKIP_SHADERS_FILE=") + planted[13]});
     s.setGameFolders({planted[0], planted[1]});
     s.setSteamGridDbKey(planted[2]);
     s.setArtLookups(true);
@@ -433,6 +439,51 @@ void TestSettingsProfile::environmentOverridesAreNotApplied()
     QCOMPARE(apply(in, s, Target::Game, kTitle), 1);
     qunsetenv("XCL_RAYTRACING");
     QCOMPARE(apply(in, s, Target::Defaults), 1);
+}
+
+void TestSettingsProfile::runProfileTravelsWithoutPaths()
+{
+    QTemporaryDir dir;
+    AppSettings s(dir.filePath(QStringLiteral("a.ini")));
+    s.setRunProfile({QStringLiteral("XCL_LOOP_GUARD=2048"), QStringLiteral("XCL_SKIP_SHADERS_FILE=C:\\Users\\alice\\skip.txt"),
+                     QStringLiteral("XCL_TRACE_DIR=/home/alice/trace"), QStringLiteral("XCL_SHARE=\\\\nas\\xcl"), QStringLiteral("XCL_HOME=~/xcl"),
+                     QStringLiteral("XCL_RATIO=1/2")});
+    const Profile p = fromDefaults(s);
+    QCOMPARE(p.values.value(QStringLiteral("run_profile")).toStringList(), (QStringList{QStringLiteral("XCL_LOOP_GUARD=2048"), QStringLiteral("XCL_RATIO=1/2")}));
+    for (const QByteArray& out : {toJson(p), decodeCode(toCode(p))})
+        QVERIFY2(!out.contains("alice") && !out.contains("nas") && !out.contains("~/xcl"), out.constData());
+
+    // the import keeps this PC's own path lines, and the preview shows the profile like any other setting
+    AppSettings to(dir.filePath(QStringLiteral("b.ini")));
+    to.setRunProfile({QStringLiteral("XCL_LOOP_GUARD=1024"), QStringLiteral("XCL_SKIP_SHADERS_FILE=D:\\mine\\skip.txt")});
+    const Parsed in = parse(toCode(p).toUtf8());
+    QVERIFY2(in.ok(), qPrintable(in.error));
+    QVERIFY(in.rejected.isEmpty());
+    const QList<Line> lines = preview(in, to, Target::Defaults);
+    const auto profileLine = std::find_if(lines.cbegin(), lines.cend(), [](const Line& l) { return l.key == QLatin1String("run_profile"); });
+    QVERIFY(profileLine != lines.cend());
+    QCOMPARE(int(profileLine->kind), int(Line::Kind::Change));
+    QCOMPARE(profileLine->label, QStringLiteral("Run profile"));
+    QCOMPARE(profileLine->from, QStringLiteral("2 variables"));
+    QCOMPARE(profileLine->to, QStringLiteral("3 variables (changes XCL_LOOP_GUARD, adds XCL_RATIO)"));
+    QCOMPARE(apply(in, to, Target::Defaults), 1);
+    QCOMPARE(to.runProfile(), (QStringList{QStringLiteral("XCL_LOOP_GUARD=2048"), QStringLiteral("XCL_RATIO=1/2"), QStringLiteral("XCL_SKIP_SHADERS_FILE=D:\\mine\\skip.txt")}));
+    for (const Line& l : preview(in, to, Target::Game, kTitle)) {
+        if (l.key == QLatin1String("run_profile"))
+            QCOMPARE(int(l.kind), int(Line::Kind::NotApplied));
+    }
+
+    // a path that arrives anyway is left out and listed; a malformed profile is refused whole
+    const Parsed planted = parse(profileJson({{QStringLiteral("run_profile"), QJsonArray{QStringLiteral("XCL_A=1"), QStringLiteral("XCL_DUMP=C:\\Users\\bob\\d")}}}));
+    QCOMPARE(planted.profile.values.value(QStringLiteral("run_profile")).toStringList(), QStringList{QStringLiteral("XCL_A=1")});
+    QCOMPARE(planted.rejected.size(), 1);
+    QCOMPARE(planted.rejected.first().value, QStringLiteral("XCL_DUMP"));
+    for (const QJsonArray& bad : {QJsonArray{QStringLiteral("xcl_a=1")}, QJsonArray{QStringLiteral("XCL_A=1"), QStringLiteral("XCL_A=2")}, QJsonArray{1}}) {
+        const Parsed refused = parse(profileJson({{QStringLiteral("run_profile"), bad}}));
+        QVERIFY(!refused.profile.values.contains(QStringLiteral("run_profile")));
+        QCOMPARE(refused.rejected.size(), 1);
+    }
+    QCOMPARE(valueLabel(QStringLiteral("run_profile"), AppSettings::defaultRunProfile()), QStringLiteral("Defaults, 20 variables"));
 }
 
 QTEST_GUILESS_MAIN(TestSettingsProfile)

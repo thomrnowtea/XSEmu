@@ -107,6 +107,10 @@ unsafe fn create_list(this: *mut c_void, node: u32, ty: u32, alloc: usize, pso: 
         real::dev_create_command_list_x(this, node, super::single::list_type(ty), alloc, pso, riid, ppv)
     } else {
         let resolved_pso = super::pso_async::resolve_for_bind(pso);
+        super::shader_code::taken_on(alloc, resolved_pso);
+        if ty == D3D12_COMMAND_LIST_TYPE_BUNDLE.0 as usize {
+            super::shader_code::in_bundle(resolved_pso);
+        }
         let hr = real::dev_create_command_list(this, node, super::single::list_type(ty), alloc, resolved_pso, riid, ppv);
         if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
             super::list_x::on_create(*ppv, alloc, pso, D3D12_COMMAND_LIST_TYPE(ty as i32));
@@ -1036,6 +1040,7 @@ pub(super) unsafe extern "system" fn create_placed_resource_layout_x(
             let clear = pc_clear(clear, &mut clear_buf, Some((&x, &d)));
             let hr = super::vram::place(this, va as usize, &pc, super::vram::TextureInitial::Undefined, clear, None, riid, ppv).unwrap_or(E_NOTIMPL);
             if hr >= 0 {
+                super::texture_alias::placed(this as usize, *ppv as usize, va as usize, &pc);
                 note_depth_resource_created(*ppv as usize, pc.Flags, || format!(
                     "route=console_placed_layout_vram host_layout={} title_address={va:#x} format={}", layout.0, pc.Format.0,
                 ));
@@ -1140,8 +1145,10 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
                         "route=console_placed_vram guest_state={guest_state:#x} host_state={state:#x} title_address={va:#x} format={}", pc.Format.0,
                     ));
                     if let Some(bytes) = console_bytes {
-                        super::title_textures::retire_overlapping(va as usize, bytes as usize);
+                        super::title_textures::retire_overlapping(va as usize, bytes as usize, *ppv as usize);
                     }
+                    // (after the retire: its log says which sampled texture gave way)
+                    super::texture_alias::placed(this as usize, *ppv as usize, va as usize, &pc);
                     real::note_title_address(*ppv as usize, va as usize);
                     super::title_textures::note_cpu_color_view(this, *ppv, va as usize, x, D3D12_RESOURCE_STATES(state as i32));
                 }
@@ -1159,6 +1166,7 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
         }
     };
     if hr >= 0 && !buffer && !(*ppv).is_null() {
+        super::texture_alias::placed(this as usize, *ppv as usize, va as usize, &std::ptr::read_unaligned(d.as_ptr() as *const D3D12_RESOURCE_DESC));
         super::title_textures::tag_created(ppv, va, x, [0, guest_state]);
         static M: AtomicU64 = AtomicU64::new(0);
         match super::title_textures::register(this, *ppv, va as usize, &x, D3D12_RESOURCE_STATES(state as i32)) {

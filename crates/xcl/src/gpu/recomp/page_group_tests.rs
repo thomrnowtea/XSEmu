@@ -9,6 +9,7 @@
 //! their offsets.
 //! A wrong page, offset or miss must show.
 
+use super::emit::OutlineAtomics;
 use super::{translate, Mode, Options};
 use crate::gpu::rdna2::encode;
 use xcl_dxil::interp::{self, Config, Verdict};
@@ -82,8 +83,11 @@ fn function(src: &str, head: &str) -> String {
     panic!("{head}: unclosed");
 }
 
-fn accessors() -> String {
+/// The accessors of the earlier form, or with the shrunk group accessors (`shrink`).
+fn accessors_with(shrink: bool) -> String {
+    super::emit::NO_ACCESSOR_SHRINK.set(!shrink);
     let all = super::emit::plain_mem_accessors(4, true);
+    super::emit::NO_ACCESSOR_SHRINK.set(false);
     let heads = [
         "uint4 xcl_group_pages(", "uint2 xcl_group_at(", "uint xcl_mLoad(", "uint2 xcl_mLoad2(", "uint4 xcl_mLoad4(", "uint4 xcl_loadx4(",
         "uint xcl_mLoadG(", "uint2 xcl_mLoad2G(", "uint4 xcl_mLoad4G(", "uint4 xcl_loadx4G(",
@@ -91,9 +95,17 @@ fn accessors() -> String {
     heads.iter().map(|h| function(&all, h)).collect()
 }
 
+fn accessors() -> String {
+    accessors_with(false)
+}
+
 fn program(accessors: &str, calls: &str) -> interp::Program {
+    program_with(accessors, calls, DRIVER)
+}
+
+fn program_with(accessors: &str, calls: &str, driver: &str) -> interp::Program {
     let src = format!(
-        "static uint xcl_mem_views = 0u, xcl_uma_base = 0u, xcl_windows = 0u, xcl_w = 0u;\n{}\n{}\n{SETUP}\n{accessors}\n{calls}\n{DRIVER}",
+        "static uint xcl_mem_views = 0u, xcl_uma_base = 0u, xcl_windows = 0u, xcl_w = 0u;\n{}\n{}\n{SETUP}\n{accessors}\n{calls}\n{driver}",
         super::GPU_PAGE_DIRECTORY_HLSL,
         super::emit::PHYSICAL_ACCESS
     );
@@ -106,9 +118,69 @@ fn verdict(accessors: &str) -> Verdict {
 
 #[test]
 fn grouped_loads_read_what_each_load_alone_reads() {
-    let acc = accessors();
-    assert!(acc.contains("xcl_group_at(v3, g, r)") && !acc.contains(" ? "));
-    assert_eq!(verdict(&acc), Verdict::Equal);
+    for shrink in [false, true] {
+        let acc = accessors_with(shrink);
+        assert!(acc.contains("xcl_group_at(v3, g, r)") && !acc.contains(" ? "));
+        assert_eq!(acc.contains("uint2 z = "), !shrink);
+        assert_eq!(acc.contains("[loop] for (uint k = 0u; k < 2u; k++)"), shrink);
+        assert_eq!(verdict(&acc), Verdict::Equal, "shrink {shrink}");
+    }
+}
+
+#[test]
+fn a_wrong_page_in_the_shrunk_accessors_is_caught() {
+    let acc = accessors_with(true);
+    for (from, to) in [
+        ("s + 0x10000ull * k + 1ull", "s + 0x10000ull * k"),
+        ("k < 2u", "k < 1u"),
+        ("select(k == 0u, uint4(p, r.zw)", "select(k == 1u, uint4(p, r.zw)"),
+        ("uint2 p1 = xcl_group_at(v1, g, r)", "uint2 p1 = xcl_group_at(v0, g, r)"),
+        ("uint2 p2 = xcl_group_at(v2, g, r)", "uint2 p2 = xcl_group_at(v1, g, r)"),
+    ] {
+        assert!(acc.contains(from), "{from}");
+        assert!(matches!(verdict(&acc.replacen(from, to, 1)), Verdict::Different(_)), "mutant {to} not caught");
+    }
+}
+
+/// `ld_raw` (unaligned: the 20 bytes from the address aligned down) at every byte offset, at the
+/// page and 32-bit ends. Its callers pass the low word of the effective address itself, unaligned
+/// (or a lane whose result they drop).
+const LD_DRIVER: &str = r#"
+[numthreads(128, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    uint i = id.x;
+    uint4 a = xin.Load4(i * 32u), b = xin.Load4(i * 32u + 16u);
+    setup(a, b, i ^ (i >> 7));
+    uint64_t e0 = xcl_ea;
+    uint m = a.w ^ b.y;
+    uint o = i * 256u;
+    [unroll] for (uint k = 0u; k < 8u; k++) {
+        uint d = (k == 7u ? 65516u : k == 6u ? 65532u : k == 5u ? 65520u : 4u * k * (k + 1u)) + ((m >> (2u * k)) & 3u);
+        xcl_ea = e0 + d;
+        xout.Store4(o + 16u * k, ld_raw((uint)xcl_ea));
+    }
+}
+"#;
+
+fn ld_raw(grouped: bool) -> String {
+    let f = function(super::emit::PRELUDE_MEM_ACCESS, "uint4 ld_raw(");
+    let f = if grouped { f.replacen(super::emit::LD_RAW_LOADS, super::emit::LD_RAW_GROUPED, 1) } else { f };
+    f.replace("mem.", "xcl_m")
+}
+
+fn ld_verdict(new: &str) -> Verdict {
+    let acc = accessors_with(true);
+    interp::diff(&program_with(&acc, &ld_raw(false), LD_DRIVER), &program_with(&acc, new, LD_DRIVER), 0..24, &Config::default()).0
+}
+
+#[test]
+fn ld_raw_in_one_group_reads_what_its_loads_alone_read() {
+    let new = ld_raw(true);
+    assert!(new.contains("xcl_mLoad4G(b, g, r)") && new.contains("xcl_mLoadG(b + 16u, g, r)"));
+    assert_eq!(ld_verdict(&new), Verdict::Equal);
+    for (from, to) in [("xcl_operand_va(b)", "xcl_operand_va(b + 16u)"), ("xcl_mLoadG(b + 16u", "xcl_mLoadG(b + 12u")] {
+        assert!(matches!(ld_verdict(&new.replacen(from, to, 1)), Verdict::Different(_)), "mutant {to} not caught");
+    }
 }
 
 #[test]
@@ -185,7 +257,22 @@ fn translate_cs(code: &[u8], groups: bool) -> String {
 }
 
 fn load(hlsl: &str) -> interp::Program {
+    let hlsl = &observed(hlsl);
     interp::load(&xcl_dxil::compile(hlsl, "main", "cs_6_6").unwrap_or_else(|e| panic!("{e}\n{hlsl}"))).unwrap()
+}
+
+/// A translated compute program with the address and value of every dword store and atomic add
+/// recorded in a buffer of the test's, in the thread's own words, instead of written to memory.
+/// The interpreter's memory is generated: the writes of the programs here resolve to one word
+/// of it, where only the last would show, and the waves of a group race on it.
+fn observed(hlsl: &str) -> String {
+    let store = function(hlsl, "void xcl_mStore(uint a, uint v)");
+    let entry = hlsl.find("void main(").unwrap();
+    let body = entry + hlsl[entry..].find('{').unwrap() + 1;
+    assert!(hlsl[entry..body].contains("uint gi : SV_GroupIndex") && !hlsl.contains("register(u2)"));
+    format!("RWByteAddressBuffer xcl_seen : register(u2);\nstatic uint xcl_seen_at = 0u;\n{} xcl_seen_at = gi * 512u;{}", &hlsl[..body], &hlsl[body..])
+        .replacen(store.trim_end(), "void xcl_mStore(uint a, uint v) { xcl_seen.Store2(xcl_seen_at, uint2(a, v)); xcl_seen_at += 8u; }", 1)
+        .replacen(function(hlsl, "void xcl_vInterlockedAdd(uint a, uint v, out uint o)").trim_end(), "void xcl_vInterlockedAdd(uint a, uint v, out uint o) { xcl_seen.Store2(xcl_seen_at, uint2(a, v)); xcl_seen_at += 8u; o = 0u; }", 1)
 }
 
 #[test]
@@ -240,4 +327,266 @@ fn interleaved_groups_declare_on_their_own_lines() {
         assert!(l.trim_start().starts_with("uint64_t t") && l.trim_end().ends_with("_g);"), "a declaration inside another line: {l}");
     }
     assert_eq!(interp::diff(&load(&old), &load(&new), 0..24, &Config::default()).0, Verdict::Equal);
+}
+
+
+/// Byte, short and format loads (`ld_raw`) at unaligned offsets, by buffer and by global
+/// address; every loaded register stored.
+fn small_loads_program() -> Vec<u8> {
+    let wait = || ("S_WAITCNT", "ENC_SOPP", vec![("SIMM16", 0)]);
+    let buf = |n: &'static str, d: u64, o: u64| -> Inst { (n, "ENC_MUBUF", vec![("VDATA", d), ("VADDR", 40), ("SRSRC", 4), ("SOFFSET", 128), ("OFFSET", o), ("OFFEN", 1)]) };
+    let glbl = |n: &'static str, d: u64, o: u64| -> Inst { (n, "ENC_FLAT_GLBL", vec![("VDST", d), ("ADDR", 42), ("SADDR", 0x7D), ("OFFSET", o)]) };
+    let mut p: Vec<Inst> = vec![
+        ("S_LOAD_DWORDX4", "ENC_SMEM", vec![("SDATA", 16), ("SBASE", 0), ("OFFSET", 0x80)]),
+        wait(),
+        ("V_LSHLREV_B32", "ENC_VOP2", vec![("VDST", 40), ("SRC0", 129), ("VSRC1", 0)]),
+        ("V_LSHLREV_B32", "ENC_VOP2", vec![("VDST", 42), ("SRC0", 129), ("VSRC1", 0)]),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 43), ("SRC0", 17)]),
+        buf("BUFFER_LOAD_UBYTE", 1, 1),
+        buf("BUFFER_LOAD_SBYTE", 2, 3),
+        buf("BUFFER_LOAD_USHORT", 3, 6),
+        buf("BUFFER_LOAD_SSHORT", 4, 4093),
+        glbl("GLOBAL_LOAD_UBYTE", 5, 3),
+        glbl("GLOBAL_LOAD_SBYTE", 6, 2),
+        glbl("GLOBAL_LOAD_USHORT", 7, 1),
+        glbl("GLOBAL_LOAD_SSHORT", 8, 4095),
+        buf("BUFFER_LOAD_FORMAT_XYZW", 9, 2),
+        ("TBUFFER_LOAD_FORMAT_XYZW", "ENC_MTBUF", vec![("VDATA", 13), ("VADDR", 40), ("SRSRC", 4), ("SOFFSET", 128), ("OFFSET", 9), ("OFFEN", 1), ("FORMAT", 29)]),
+        ("TBUFFER_LOAD_FORMAT_XY", "ENC_MTBUF", vec![("VDATA", 17), ("VADDR", 40), ("SRSRC", 4), ("SOFFSET", 128), ("OFFSET", 3), ("OFFEN", 1), ("FORMAT", 60)]),
+        wait(),
+        ("V_LSHLREV_B32", "ENC_VOP2", vec![("VDST", 44), ("SRC0", 134), ("VSRC1", 0)]),
+    ];
+    for r in 1..19u64 {
+        p.push(("BUFFER_STORE_DWORD", "ENC_MUBUF", vec![("VDATA", r), ("VADDR", 44), ("SRSRC", 4), ("SOFFSET", 128), ("OFFSET", 4 * r), ("OFFEN", 1)]));
+    }
+    p.push(("S_ENDPGM", "ENC_SOPP", vec![]));
+    code(&p)
+}
+
+fn translate_shrunk(code: &[u8], shrink: bool) -> String {
+    super::emit::NO_ACCESSOR_SHRINK.set(!shrink);
+    let t = translate_cs(code, true);
+    super::emit::NO_ACCESSOR_SHRINK.set(false);
+    t
+}
+
+#[test]
+fn translated_loads_with_shrunk_accessors_compute_the_same() {
+    for (c, small) in [(grouped_program(), false), (small_loads_program(), true)] {
+        let (old, new) = (translate_shrunk(&c, false), translate_shrunk(&c, true));
+        assert!(!old.contains("[loop] for (uint k = 0u; k < 2u; k++)") && !old.contains("xcl_mLoad4G(b, g, r)") && old.contains("uint4 w = xcl_mLoad4(b);"));
+        assert!(new.contains("[loop] for (uint k = 0u; k < 2u; k++)") && !new.contains("uint2 z = "));
+        assert_eq!(new.contains("uint4 w = xcl_mLoad4G(b, g, r); uint w4 = xcl_mLoadG(b + 16u, g, r);"), small);
+        assert_eq!(new.contains("uint4 w = xcl_vLoad4G(b, g, r); uint w4 = xcl_vLoadG(b + 16u, g, r);"), small);
+        assert_eq!(interp::diff(&load(&old), &load(&new), 0..24, &Config::default()).0, Verdict::Equal);
+    }
+}
+
+fn translate_outlined(code: &[u8], outline: bool) -> String {
+    translate_form(code, outline, false, OutlineAtomics::All)
+}
+
+/// `code` with its memory functions out of line in one form: results through statics or `out`
+/// parameters (`emit::outline_statics`), and which atomics are kept (`OutlineAtomics`).
+fn translate_form(code: &[u8], outline: bool, statics: bool, atomics: OutlineAtomics) -> String {
+    super::emit::OUTLINE.set(Some(outline));
+    super::emit::OUTLINE_FORM.set(Some((statics, atomics)));
+    let t = translate_cs(code, true);
+    super::emit::OUTLINE.set(None);
+    super::emit::OUTLINE_FORM.set(None);
+    t
+}
+
+/// The accessors kept out of line (`emit::outlined`): the same functions behind `[noinline]`
+/// functions of scalar parameters. The direct backend inlines them again, so its programs show
+/// that the outlined text computes what the plain text does.
+#[test]
+fn outlined_accessors_compute_the_same() {
+    let plain = accessors_with(true);
+    let pick = |n: &str| n.starts_with("xcl_m") || n.starts_with("xcl_loadx4") || n == "xcl_group_pages";
+    let outlined = |statics: bool, flat: bool| {
+        super::emit::OUTLINE_FORM.set(Some((statics, OutlineAtomics::All)));
+        super::emit::OUTLINE_FLAT.set(Some(flat));
+        let o = super::emit::outlined(&plain, &pick);
+        super::emit::OUTLINE_FORM.set(None);
+        super::emit::OUTLINE_FLAT.set(None);
+        o
+    };
+    let out = outlined(false, false);
+    for f in ["xcl_group_pages", "xcl_mLoad", "xcl_mLoad2", "xcl_mLoad4", "xcl_loadx4", "xcl_mLoadG", "xcl_mLoad2G", "xcl_mLoad4G", "xcl_loadx4G"] {
+        assert!(out.contains(&format!("[noinline] void {f}_n(")) && out.contains(&format!(" {f}_i(")), "{f}\n{out}");
+    }
+    assert!(out.contains("[noinline] void xcl_mLoad4G_n(uint a, uint64_t g, uint r0, uint r1, uint r2, uint r3, out uint xr0, out uint xr1, out uint xr2, out uint xr3) { uint4 xr = xcl_mLoad4G_i(a, g, uint4(r0, r1, r2, r3)); xr0 = xr.x; xr1 = xr.y; xr2 = xr.z; xr3 = xr.w; }"), "{out}");
+    assert!(out.contains("uint4 xcl_mLoad4G(uint a, uint64_t g, uint4 r) { uint xr0, xr1, xr2, xr3; xcl_mLoad4G_n(a, g, r.x, r.y, r.z, r.w, xr0, xr1, xr2, xr3); return uint4(xr0, xr1, xr2, xr3); }"), "{out}");
+    let diff = |a: &str, b: &str| interp::diff(&program(a, NEW_CALLS), &program(b, NEW_CALLS), 0..24, &Config::default()).0;
+    assert_eq!(diff(&plain, &out), Verdict::Equal);
+    for (from, to) in [
+        ("xr1 = xr.y; xr2 = xr.z; xr3 = xr.w; }\nuint4 xcl_mLoad4G(", "xr1 = xr.x; xr2 = xr.z; xr3 = xr.w; }\nuint4 xcl_mLoad4G("),
+        ("xcl_loadx4G_n(a.x, a.y, a.z, a.w, g,", "xcl_loadx4G_n(a.x, a.y, a.w, a.z, g,"),
+        ("xcl_group_pages_n(g, xr0, xr1, xr2, xr3); return uint4(xr0, xr1, xr2, xr3)", "xcl_group_pages_n(g, xr0, xr1, xr2, xr3); return uint4(xr2, xr3, xr0, xr1)"),
+    ] {
+        assert!(out.contains(from), "{from}\n{out}");
+        assert!(matches!(diff(&plain, &out.replacen(from, to, 1)), Verdict::Different(_)), "mutant {to} not caught");
+    }
+    // results through statics: no kept function takes an `out` parameter, and the values are the same
+    let st = format!("{}{}", super::emit::OUTLINE_RESULT_STATICS, outlined(true, false));
+    assert!(st.lines().filter(|l| l.starts_with("[noinline] ")).all(|l| !l.split_once(')').unwrap().0.contains("out ")), "{st}");
+    for f in ["xcl_group_pages", "xcl_mLoad", "xcl_mLoad2", "xcl_mLoad4", "xcl_loadx4", "xcl_mLoadG", "xcl_mLoad2G", "xcl_mLoad4G", "xcl_loadx4G"] {
+        assert!(st.contains(&format!("[noinline] void {f}_r(")) && st.contains(&format!(" {f}_i(")), "{f}\n{st}");
+    }
+    assert!(st.contains("[noinline] void xcl_mLoad4G_r(uint a, uint64_t g, uint r0, uint r1, uint r2, uint r3) { uint xr0; uint xr1; uint xr2; uint xr3; uint4 xr = xcl_mLoad4G_i(a, g, uint4(r0, r1, r2, r3)); xr0 = xr.x; xr1 = xr.y; xr2 = xr.z; xr3 = xr.w; xcl_ret_uint_0 = xr0; xcl_ret_uint_1 = xr1; xcl_ret_uint_2 = xr2; xcl_ret_uint_3 = xr3; }"), "{st}");
+    assert!(st.contains("uint4 xcl_mLoad4G(uint a, uint64_t g, uint4 r) { uint xr0, xr1, xr2, xr3; xcl_mLoad4G_r(a, g, r.x, r.y, r.z, r.w); xr0 = xcl_ret_uint_0; xr1 = xcl_ret_uint_1; xr2 = xcl_ret_uint_2; xr3 = xcl_ret_uint_3; return uint4(xr0, xr1, xr2, xr3); }"), "{st}");
+    assert_eq!(diff(&plain, &st), Verdict::Equal);
+    for (from, to) in [
+        ("xcl_ret_uint_1 = xr1; xcl_ret_uint_2 = xr2; xcl_ret_uint_3 = xr3; }\nuint4 xcl_mLoad4G(", "xcl_ret_uint_1 = xr0; xcl_ret_uint_2 = xr2; xcl_ret_uint_3 = xr3; }\nuint4 xcl_mLoad4G("),
+        ("xcl_loadx4G_r(a.x, a.y, a.z, a.w, g,", "xcl_loadx4G_r(a.x, a.y, a.w, a.z, g,"),
+        ("xcl_group_pages_r(g); xr0 = xcl_ret_uint_0; xr1 = xcl_ret_uint_1;", "xcl_group_pages_r(g); xr0 = xcl_ret_uint_1; xr1 = xcl_ret_uint_0;"),
+    ] {
+        assert!(st.contains(from), "{from}\n{st}");
+        assert!(matches!(diff(&plain, &st.replacen(from, to, 1)), Verdict::Different(_)), "mutant {to} not caught");
+    }
+    // flat: a kept function calls the text of the kept functions it uses, and the values are the same
+    // (the calls themselves run in tests::gpu_outlined_calls_atomics_and_loops_compute_the_same)
+    let flat = outlined(false, true);
+    let nested = "return uint4(xcl_mLoad(a.x), xcl_mLoad(a.y), xcl_mLoad(a.z), xcl_mLoad(a.w)); }";
+    assert!(out.contains(nested) && !flat.contains(nested) && flat.contains(&nested.replace("xcl_mLoad(", "xcl_mLoad_i(")), "{flat}");
+    for f in ["xcl_group_pages", "xcl_mLoad", "xcl_mLoad2", "xcl_mLoad4", "xcl_loadx4", "xcl_mLoadG", "xcl_mLoad2G", "xcl_mLoad4G", "xcl_loadx4G"] {
+        // what is left of a kept function's name with "(": its own definition
+        assert_eq!(flat.matches(&format!(" {f}(")).count() + flat.matches(&format!("({f}(")).count(), 1, "{f}\n{flat}");
+    }
+    assert_eq!(diff(&plain, &flat), Verdict::Equal);
+}
+
+#[test]
+fn translated_programs_with_outlined_accessors_compute_the_same() {
+    for c in [grouped_program(), small_loads_program(), interleaved_program()] {
+        let (plain, out) = (translate_outlined(&c, false), translate_outlined(&c, true));
+        assert!(!plain.contains("[noinline]"));
+        for f in ["xcl_mLoad", "xcl_vLoad", "xcl_mStore", "xcl_vStore", "xcl_mInterlockedAnd", "xcl_mInterlockedCompareExchange64", "xcl_loadx4", "ld_raw", "ld_raw_v", "st_bytes"] {
+            assert!(out.contains(&format!("[noinline] void {f}_n(")), "{f}");
+        }
+        assert_eq!(interp::diff(&load(&plain), &load(&out), 0..24, &Config::default()).0, Verdict::Equal);
+        // the other forms: results through statics, and the atomics inline again but for the adds, or all
+        for (statics, atomics) in [(true, OutlineAtomics::All), (false, OutlineAtomics::Add), (true, OutlineAtomics::Add), (true, OutlineAtomics::None)] {
+            let form = translate_form(&c, true, statics, atomics);
+            assert_eq!(form.contains("static uint xcl_ret_uint_0;"), statics, "{statics} {atomics:?}");
+            assert_eq!(form.contains("[noinline] void xcl_mLoad_r(uint a) {"), statics, "{statics} {atomics:?}");
+            assert_eq!(form.contains("[noinline] void xcl_mLoad_n(uint a, out uint xr0) {"), !statics, "{statics} {atomics:?}");
+            assert!(form.contains("[noinline] void xcl_mStore_n(") && form.contains("[noinline] void st_bytes_n("), "{statics} {atomics:?}");
+            assert_eq!(form.contains("[noinline] void xcl_mInterlockedAdd_"), atomics != OutlineAtomics::None, "{statics} {atomics:?}");
+            assert_eq!(form.contains("[noinline] void xcl_mInterlockedAnd_"), atomics == OutlineAtomics::All, "{statics} {atomics:?}");
+            assert_eq!(form.contains("[noinline] void xcl_mInterlockedCompareExchange64_"), atomics == OutlineAtomics::All, "{statics} {atomics:?}");
+            if statics {
+                assert!(form.lines().filter(|l| l.starts_with("[noinline] ")).all(|l| !l.split_once(')').unwrap().0.contains("out ")), "{atomics:?}\n{form}");
+            }
+            assert_eq!(interp::diff(&load(&plain), &load(&form), 0..24, &Config::default()).0, Verdict::Equal, "{statics} {atomics:?}");
+        }
+    }
+}
+
+/// DXC keeps the outlined functions and its validator accepts the container (with a DXC to find:
+/// `XCL_DXC_DIR`), and the container is smaller than the plain program's.
+#[test]
+fn dxc_keeps_outlined_functions() {
+    if std::env::var_os("XCL_DXC_DIR").is_none() {
+        println!("XCL_DXC_DIR not set");
+        return;
+    }
+    let c = grouped_program();
+    let cs = super::CsInterface { threads: [64, 1, 1], user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 1 };
+    let hlsl = |outline: bool| {
+        super::emit::OUTLINE.set(Some(outline));
+        let t = translate(&c, &Options { mode: Mode::Compute(cs.clone()), wave64: false, split_wave64: true, mem_windows: 4, ..Default::default() });
+        super::emit::OUTLINE.set(None);
+        t.unwrap().hlsl
+    };
+    let size = |src: &str| super::dxc::compile_dxc_only(src, "main", "cs_6_6").unwrap_or_else(|e| panic!("{e}")).len();
+    super::emit::OUTLINE_FORM.set(Some((false, OutlineAtomics::All)));
+    let (plain, out) = (size(&hlsl(false)), size(&hlsl(true)));
+    super::emit::OUTLINE_FORM.set(None);
+    println!("plain {plain} B, outlined {out} B");
+    assert!(out < plain);
+    // the other forms too: results through statics, and the atomics inline but for the adds
+    for (statics, atomics) in [(true, OutlineAtomics::All), (false, OutlineAtomics::Add), (true, OutlineAtomics::Add)] {
+        super::emit::OUTLINE_FORM.set(Some((statics, atomics)));
+        let form = size(&hlsl(true));
+        super::emit::OUTLINE_FORM.set(None);
+        println!("outlined, results through statics {statics}, atomics {atomics:?}: {form} B");
+        assert!(form < plain);
+    }
+}
+
+fn translate_plain(code: &[u8], plain: bool) -> String {
+    super::emit::PLAIN_LOADS.set(Some(plain));
+    let t = translate_cs(code, true);
+    super::emit::PLAIN_LOADS.set(None);
+    t
+}
+
+/// `c` with an atomic add before its end: a coherent program, its loads before its first write.
+/// Each thread adds to a word of its own that no load of the program reads (two waves race in
+/// the interpreter when one writes what the other reads).
+fn with_atomic(mut c: Vec<u8>) -> Vec<u8> {
+    let end = code(&[("S_ENDPGM", "ENC_SOPP", vec![])]);
+    assert!(c.ends_with(&end));
+    c.truncate(c.len() - end.len());
+    c.extend(code(&[
+        ("V_LSHLREV_B32", "ENC_VOP2", vec![("VDST", 47), ("SRC0", 131), ("VSRC1", 0)]),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 48), ("SRC0", 9)]),
+        ("GLOBAL_ATOMIC_ADD", "ENC_FLAT_GLBL", vec![("VDST", 46), ("ADDR", 47), ("DATA", 1), ("SADDR", 0x7D), ("OFFSET", 0x800), ("GLC", 1)]),
+        ("S_ENDPGM", "ENC_SOPP", vec![]),
+    ]));
+    c
+}
+
+/// A coherent program's loads before its first write on the view that is not coherent
+/// (`emit::plain_load_limit`): the accessors they call are the coherent ones without the qualifier, and
+/// the program computes what it computes with every load on the coherent view. The interpreter has
+/// one memory behind both views, so this shows the addresses, pages and groups of the plain
+/// accessors and that the program stores what they return; what the GPU caches it cannot show.
+#[test]
+fn plain_loads_compute_the_same() {
+    let mut mutants = std::collections::BTreeSet::new();
+    for c in [with_atomic(grouped_program()), with_atomic(small_loads_program()), with_atomic(interleaved_program())] {
+        let (coherent, plain) = (translate_plain(&c, false), translate_plain(&c, true));
+        assert!(coherent.contains("globallycoherent ") && !coherent.contains("_cached"));
+        assert!(plain.contains(" = xcl_m_cachedLoad4") && plain.contains("xcl_mStore(") && plain != coherent);
+        assert_eq!(plain, translate_cs(&c, true), "on unless switched off");
+        let reference = load(&coherent);
+        // no race and nothing undefined in the program itself
+        assert!((0..24).all(|seed| interp::run(&reference, seed, &Config::default()).ub == 0));
+        assert_eq!(interp::diff(&reference, &load(&plain), 0..24, &Config::default()).0, Verdict::Equal);
+        for (name, cached) in [("xcl_mLoad", "xcl_m_cachedLoad"), ("xcl_mLoad2", "xcl_m_cachedLoad2"), ("xcl_mLoad4", "xcl_m_cachedLoad4"), ("xcl_mLoadG", "xcl_m_cachedLoadG"), ("xcl_mLoad2G", "xcl_m_cachedLoad2G"), ("xcl_mLoad4G", "xcl_m_cachedLoad4G"), ("xcl_loadx4", "xcl_loadx4_cached"), ("xcl_loadx4G", "xcl_loadx4G_cached")] {
+            let ret = if name.contains('2') { "uint2" } else if name.contains('4') { "uint4" } else { "uint" };
+            let (f, p) = (function(&plain, &format!("{ret} {name}(")), function(&plain, &format!("{ret} {cached}(")));
+            assert!(f.contains("globallycoherent RWByteAddressBuffer") && !p.contains("globallycoherent"), "{name}");
+            assert_eq!(f.replacen(&format!("{name}("), &format!("{cached}("), 1).replace("globallycoherent ", "").replace("xcl_mLoad(", "xcl_m_cachedLoad("), p, "{name}");
+            // the program stores what each plain accessor it calls returns
+            let body = &plain[plain.find("void main(").unwrap()..];
+            if !body.contains(&format!(" {cached}(")) {
+                continue;
+            }
+            let head = &p[..p.find('{').unwrap() + 1];
+            let wrong = match ret { "uint" => "77u", "uint2" => "uint2(77u, 78u)", _ => "uint4(77u, 78u, 79u, 80u)" };
+            let mutant = plain.replacen(head, &format!("{head} return {wrong};"), 1);
+            assert!(mutant != plain);
+            let v = interp::diff(&reference, &load(&mutant), 0..24, &Config::default()).0;
+            assert!(matches!(v, Verdict::Different(_)), "{cached} returning a constant: {v:?}");
+            mutants.insert(cached);
+        }
+    }
+    assert_eq!(mutants.into_iter().collect::<Vec<_>>(), ["xcl_loadx4G_cached", "xcl_m_cachedLoad2", "xcl_m_cachedLoad4", "xcl_m_cachedLoad4G", "xcl_m_cachedLoadG"]);
+    // a wrong address in a plain accessor shows
+    let plain = translate_plain(&with_atomic(grouped_program()), true);
+    let coherent = load(&translate_plain(&with_atomic(grouped_program()), false));
+    for (cached, from, to) in [
+        ("uint4 xcl_m_cachedLoad4G(", "return xcl_mb.Load4(a);", "return xcl_mb.Load4(a + 4u);"),
+        ("uint xcl_m_cachedLoadG(", "return xcl_mb.Load(a);", "return xcl_mb.Load(a + 4u);"),
+    ] {
+        let at = plain.find(cached).unwrap();
+        assert!(plain[at..].contains(from), "{cached} {from}");
+        let mutant = format!("{}{}", &plain[..at], plain[at..].replacen(from, to, 1));
+        let v = interp::diff(&coherent, &load(&mutant), 0..24, &Config::default()).0;
+        assert!(matches!(v, Verdict::Different(_)), "{cached} {to}: {v:?}");
+    }
 }

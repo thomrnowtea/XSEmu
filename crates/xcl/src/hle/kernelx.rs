@@ -340,6 +340,22 @@ unsafe fn virtual_alloc(addr: *const c_void, size: usize, t: u32, p: u32, gdk: O
             return q as *mut c_void;
         }
     }
+    // (opt-in, `XCL_COHERENT_HEAPS_MAX_MB`; nothing changes unless it is set) A GPU heap of the
+    // title's larger than that many MB goes to the sparse windows instead of the coherent window.
+    // The window is a heap D3D12 opened, so every page of it is pinned RAM whether the title ever
+    // writes it (play-97: 2,075 of its 3,360 MB were zero pages in the world); a sparse block's
+    // CPU pages are resident only once written. The price is video memory for the tiles of the
+    // block that are written, placed on or written by a GPU command (`sparse::alloc_diverted`; for
+    // the whole block with `XCL_SPARSE_LAZY_TILES=0`) and the copy of what the CPU wrote there before
+    // each submit. Meant for the heaps `memdiag`'s coherent-window line shows as large and mostly
+    // zeros; `XCL_COHERENT_MB` then sizes the window for what stays in it.
+    if addr.is_null() && t & 0x1000 != 0 && p & PAGE_GRAPHICS_ANY != 0 && coherent_heap_max().is_some_and(|max| size > max) {
+        if let Some((q, rounded)) = sparse_heap(size, t) {
+            crate::xlog_info!("UMA: a title GPU heap of {} MB goes to the sparse windows at {q:#x} (XCL_COHERENT_HEAPS_MAX_MB)", size >> 20);
+            trace_mem("VirtualAlloc (graphics, sparse VRAM by XCL_COHERENT_HEAPS_MAX_MB)", 0, rounded, t as u64, p, q);
+            return q as *mut c_void;
+        }
+    }
     // the title's GPU heaps (committed with a PAGE_GRAPHICS_* protection, write-combined: memory
     // the CPU writes and the GPU reads, as a PC game's upload heaps): in the coherent window, which
     // the GPU reads where it is – one copy (a retail game's 4.4 GB; as plain memory its shaders
@@ -358,6 +374,10 @@ unsafe fn virtual_alloc(addr: *const c_void, size: usize, t: u32, p: u32, gdk: O
             crate::gpu::uma::note_coherent_need(u.peak().max(if got.is_some() { 0 } else { u.used().saturating_add(size) }));
             if let Some(q) = got {
                 trace_mem("VirtualAlloc (graphics, coherent window)", 0, size, t as u64, p, q as usize);
+                return q as *mut c_void;
+            }
+            if let Some((q, rounded)) = coherent_overflow(u, size, t) {
+                trace_mem("VirtualAlloc (graphics, sparse VRAM: no room in the coherent window)", 0, rounded, t as u64, p, q);
                 return q as *mut c_void;
             }
         }
@@ -469,6 +489,49 @@ pub(crate) fn writable_span(base: usize, bytes: usize) -> bool {
         at = info.BaseAddress as usize + info.RegionSize;
     }
     true
+}
+
+/// `XCL_COHERENT_HEAPS_MAX_MB` in bytes: the largest GPU heap of the title's that the coherent
+/// window takes (None, when it is not set: any).
+fn coherent_heap_max() -> Option<usize> {
+    static MAX: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| std::env::var("XCL_COHERENT_HEAPS_MAX_MB").ok().and_then(|v| v.trim().parse::<usize>().ok()).map(|mb| mb << 20))
+}
+
+/// A GPU heap of the title's of `size` bytes in the sparse windows, for the heaps the coherent
+/// window does not take (`XCL_COHERENT_HEAPS_MAX_MB`, `coherent_overflow`): (address, bytes).
+unsafe fn sparse_heap(size: usize, t: u32) -> Option<(usize, usize)> {
+    let align = if t & 0x2000_0000 != 0 && t & 0x0040_0000 == 0 { 2 << 20 } else { crate::gpu::uma::GRAIN };
+    let rounded = size.max(1).div_ceil(align) * align;
+    crate::hle::d3d12x::sparse::alloc_diverted(rounded, align).map(|(q, _)| (q, rounded))
+}
+
+/// A GPU heap of the title's that has no room in the coherent window `u` – the window is full,
+/// or was made smaller than the title needs (a first run, `XCL_COHERENT_MB`, a short commit in
+/// `uma::coherent_hint`) – goes to the sparse windows, where the GPU sees it too: as plain memory
+/// its shaders read zeros. (address, bytes); None: the sparse windows have no room either, or
+/// `XCL_COHERENT_OVERFLOW_SPARSE=0` (off: plain memory, as before). Each heap is logged with its
+/// size – the first 32, then when their number doubles.
+unsafe fn coherent_overflow(u: &crate::gpu::uma::Uma, size: usize, t: u32) -> Option<(usize, usize)> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static HEAPS: AtomicUsize = AtomicUsize::new(0);
+    static MOVED: AtomicUsize = AtomicUsize::new(0);
+    let on = *ON.get_or_init(|| std::env::var("XCL_COHERENT_OVERFLOW_SPARSE").map_or(true, |v| v != "0"));
+    let got = if on { sparse_heap(size, t) } else { None };
+    let n = HEAPS.fetch_add(1, Ordering::Relaxed) + 1;
+    let moved = MOVED.fetch_add(got.map_or(0, |(_, bytes)| bytes), Ordering::Relaxed) + got.map_or(0, |(_, bytes)| bytes);
+    if n <= 32 || n.is_power_of_two() {
+        let (mb, used, window) = (size as f64 / 1048576.0, u.used() >> 20, u.size() >> 20);
+        match got {
+            Some((q, _)) => crate::xlog_info!(
+                "UMA: a title GPU heap of {mb:.1} MB has no room in the coherent window ({used} of {window} MB in use): it goes to the sparse windows at {q:#x} (heap {n} without room, {} MB of them in the sparse windows; XCL_COHERENT_OVERFLOW_SPARSE=0: plain memory)",
+                moved >> 20
+            ),
+            None if on => crate::xlog_warn!("UMA: a title GPU heap of {mb:.1} MB has no room in the coherent window ({used} of {window} MB in use) nor in the sparse windows: plain memory, its shaders read zeros (heap {n} without room)"),
+            None => crate::xlog_warn!("UMA: a title GPU heap of {mb:.1} MB has no room in the coherent window ({used} of {window} MB in use): plain memory, its shaders read zeros (heap {n} without room; XCL_COHERENT_OVERFLOW_SPARSE=0)"),
+        }
+    }
+    got
 }
 
 /// Whether a VirtualAlloc that reached the plain-memory fallback is GPU-visible title memory

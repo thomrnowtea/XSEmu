@@ -3,6 +3,7 @@
 #include "DevFixtures.h"
 #include "EmulatorBuild.h"
 #include "EmulatorController.h"
+#include "LaunchConfig.h"
 #include "Library.h"
 #include "Paths.h"
 #include "ProcessGate.h"
@@ -47,6 +48,7 @@ private slots:
     void silentPrecacheIsNotFinished();
     void coolfoxRunsWithItsOwnEnvironment();
     void gameRunPauseResumeStop();
+    void playAndWarmupShareTheRunEnvironment();
     void gameCrash();
     void gameFilesMissing();
     void oneProcessAtATime();
@@ -90,6 +92,7 @@ void TestControllers::init()
     qputenv("FAKE_XSEMU_SCENARIO", "ok");
     m_settings = std::make_unique<AppSettings>(m_dir->filePath(QStringLiteral("settings.ini")));
     m_settings->setLaunchNeedMb(0);
+    m_settings->setXsemuWarmup(true);
     m_gate = std::make_unique<ProcessGate>();
 }
 
@@ -546,6 +549,55 @@ void TestControllers::gameRunPauseResumeStop()
     QCOMPARE(emu.state(), EmulatorController::State::Idle);
     QVERIFY(m_gate->isFree());
     QVERIFY(m_settings->lastPlayed(game.titleId()).isValid());
+}
+
+// fake-xsemu writes the XCL_* environment it was started with (FAKE_XSEMU_ENV_DUMP); the warm-up must
+// see exactly what Play sees, or it fills a shader cache generation the game never reads
+void TestControllers::playAndWarmupShareTheRunEnvironment()
+{
+    const QString dumps = m_dir->filePath(QStringLiteral("env"));
+    QVERIFY(QDir().mkpath(dumps));
+    qputenv("FAKE_XSEMU_ENV_DUMP", dumps.toUtf8());
+    const auto cleanup = qScopeGuard([] { qunsetenv("FAKE_XSEMU_ENV_DUMP"); });
+    const auto read = [&dumps](const QString& mode) {
+        QFile f(QDir(dumps).filePath(mode + QStringLiteral(".env")));
+        return f.open(QIODevice::ReadOnly) ? QString::fromUtf8(f.readAll()).split(QLatin1Char('\n')) : QStringList();
+    };
+    const auto runBoth = [&](const Game& game) {
+        QFile::remove(QDir(dumps).filePath(QStringLiteral("warm-up.env")));
+        QFile::remove(QDir(dumps).filePath(QStringLiteral("run.env")));
+        WarmupController warmup(*m_settings, *m_gate);
+        QSignalSpy finished(&warmup, &WarmupController::finished);
+        QString error;
+        QVERIFY2(warmup.start(false, game, &error), qPrintable(error));
+        QVERIFY(finished.wait(20000));
+        EmulatorController emu(*m_settings, *m_gate);
+        QSignalSpy exited(&emu, &EmulatorController::exited);
+        QVERIFY2(emu.start(game, 0, &error), qPrintable(error));
+        QTRY_COMPARE_WITH_TIMEOUT(emu.state(), EmulatorController::State::Running, 10000);
+        emu.stop();
+        QVERIFY(exited.wait(10000));
+    };
+
+    const Game garden = fixtureGame(QStringLiteral("Signal Garden"));
+    runBoth(garden);
+    const QString defaults = LaunchConfig::profileIdentity(*m_settings, garden.titleId());
+    QCOMPARE(m_settings->recentWarmups().first().profile, defaults);
+    const QStringList played = read(QStringLiteral("run"));
+    QCOMPARE(read(QStringLiteral("warm-up")), played);
+    for (const QString& line : AppSettings::defaultRunProfile())
+        QVERIFY2(played.contains(line), qPrintable(line));
+    QVERIFY(played.contains(QStringLiteral("XCL_NETWORK=0")));
+
+    // the game's own profile replaces the global one in both
+    m_settings->setGameOverride(garden.titleId(), QStringLiteral("runProfile"), QStringList{QStringLiteral("XCL_LOOP_GUARD=4096")});
+    QVERIFY(LaunchConfig::profileIdentity(*m_settings, garden.titleId()) != defaults);
+    runBoth(garden);
+    QCOMPARE(m_settings->recentWarmups().first().profile, LaunchConfig::profileIdentity(*m_settings, garden.titleId()));
+    const QStringList own = read(QStringLiteral("run"));
+    QCOMPARE(read(QStringLiteral("warm-up")), own);
+    QVERIFY(own.contains(QStringLiteral("XCL_LOOP_GUARD=4096")));
+    QVERIFY(!own.contains(QStringLiteral("XCL_SHADER_BACKEND=dxil")));
 }
 
 void TestControllers::gameCrash()

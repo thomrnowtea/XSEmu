@@ -80,6 +80,13 @@ pub(super) fn get(res: usize) -> Option<Backing> {
     BUFFERS.lock().unwrap().as_ref()?.buffers.get(&res).copied()
 }
 
+/// (diagnostics, `memdiag`) (mirrors, the bytes they mirror, the bytes of their seen copies).
+pub(super) fn diag_bytes() -> (usize, usize, usize) {
+    BUFFERS.lock().unwrap().as_ref().map_or((0, 0, 0), |t| {
+        t.mirrors.values().fold((0, 0, 0), |(n, all, seen), (b, _)| (n + 1, all + b.bytes, seen + if b.seen != 0 { b.bytes } else { 0 }))
+    })
+}
+
 /// Why a title buffer outside unified memory cannot be mirrored (None: it can).
 pub(super) fn unsupported(title: usize, bytes: usize) -> Option<&'static str> {
     let Some(end) = title.checked_add(bytes) else {

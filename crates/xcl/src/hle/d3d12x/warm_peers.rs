@@ -35,12 +35,29 @@ impl Usage {
     }
 }
 
+/// The cold giants the other children run (`Held::others_giants`): their estimates, how much of
+/// that their processes have taken so far (and so shows in the memory available already), and
+/// the largest of them, for the log of a held compile.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct PeerGiants {
+    pub reserved: u64,
+    pub used: u64,
+    /// (slot, pid, estimate, in use)
+    pub largest: Option<(usize, u32, u64, u64)>,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct Slot {
     running: u32,
     giants: u32,
     reserved: u64,
+    pid: u32,
+    _pad: u32,
+    /// the estimates of its cold giants running
+    giant_reserved: u64,
+    /// its private bytes when the first of them started
+    giant_base: u64,
 }
 
 impl Slot {
@@ -159,6 +176,25 @@ impl Held<'_> {
         (0..SLOTS).filter(|&i| Some(i) != self.peers.mine).map(|i| self.slot(i).usage()).fold(Usage::default(), Usage::add)
     }
 
+    /// The cold giants of every slot but this process's own, each counted in use for its
+    /// process's private bytes over what they were when it started, at most its estimate.
+    pub(super) fn others_giants(&self) -> PeerGiants {
+        let mut out = PeerGiants::default();
+        for i in (0..SLOTS).filter(|&i| Some(i) != self.peers.mine) {
+            let slot = self.slot(i);
+            if slot.giant_reserved == 0 || slot.pid == 0 {
+                continue;
+            }
+            let used = private_bytes(slot.pid).map_or(0, |now| now.saturating_sub(slot.giant_base).min(slot.giant_reserved));
+            out.reserved = out.reserved.saturating_add(slot.giant_reserved);
+            out.used = out.used.saturating_add(used);
+            if out.largest.is_none_or(|(_, _, most, _)| slot.giant_reserved > most) {
+                out.largest = Some((i, slot.pid, slot.giant_reserved, used));
+            }
+        }
+        out
+    }
+
     /// Every slot.
     pub(super) fn total(&self) -> Usage {
         (0..SLOTS).map(|i| self.slot(i).usage()).fold(Usage::default(), Usage::add)
@@ -167,7 +203,16 @@ impl Held<'_> {
     /// This child's own compiles in flight now (nothing for the parent).
     pub(super) fn publish(&self, usage: Usage) {
         if let Some(i) = self.peers.mine {
-            let slot = Slot { running: usage.running as u32, giants: usage.giants as u32, reserved: usage.reserved };
+            let slot = Slot { running: usage.running as u32, giants: usage.giants as u32, reserved: usage.reserved, ..self.slot(i) };
+            unsafe { self.peers.table.add(i).write_volatile(slot) };
+        }
+    }
+
+    /// This child's cold giants running now: their estimates, and its private bytes when the
+    /// first of them started (`others_giants`).
+    pub(super) fn publish_giants(&self, reserved: u64, base: u64) {
+        if let Some(i) = self.peers.mine {
+            let slot = Slot { pid: std::process::id(), giant_reserved: reserved, giant_base: base, ..self.slot(i) };
             unsafe { self.peers.table.add(i).write_volatile(slot) };
         }
     }
@@ -183,6 +228,23 @@ impl Held<'_> {
 impl Drop for Held<'_> {
     fn drop(&mut self) {
         unsafe { ReleaseMutex(self.peers.lock) };
+    }
+}
+
+/// The private bytes of process `pid` (None: it is gone or cannot be asked).
+fn private_bytes(pid: u32) -> Option<u64> {
+    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return None;
+        }
+        let mut counters: PROCESS_MEMORY_COUNTERS_EX = std::mem::zeroed();
+        counters.cb = std::mem::size_of_val(&counters) as u32;
+        let ok = K32GetProcessMemoryInfo(process, &mut counters as *mut _ as *mut _, counters.cb) != 0;
+        CloseHandle(process);
+        ok.then_some(if counters.PrivateUsage != 0 { counters.PrivateUsage as u64 } else { counters.PagefileUsage as u64 })
     }
 }
 
@@ -208,6 +270,31 @@ pub(super) fn joined() -> Option<&'static Peers> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_peer_giant_counts_in_use_for_what_its_process_grew_by() {
+        let parent = std::process::id() ^ 0x5a5b_0000;
+        let table = Peers::create(parent).unwrap();
+        let (a, b) = (Peers::open(parent, 2).unwrap(), Peers::open(parent, 3).unwrap());
+        let now = private_bytes(std::process::id()).unwrap();
+        let grown = now / 2;
+        a.lock().publish(Usage { running: 1, giants: 1, reserved: 4 << 30 });
+        a.lock().publish_giants(4 << 30, now - grown);
+        let seen = b.lock().others_giants();
+        assert_eq!(seen.reserved, 4 << 30);
+        assert!(grown > 0 && seen.used >= grown && seen.used < grown + (256 << 20), "in use: {} MiB of {} grown", seen.used >> 20, grown >> 20);
+        assert_eq!(seen.largest.map(|(slot, pid, est, _)| (slot, pid, est)), Some((2, std::process::id(), 4 << 30)));
+        assert_eq!(a.lock().others_giants(), PeerGiants::default(), "its own giants are no peer's");
+        assert_eq!(b.lock().others(), Usage { running: 1, giants: 1, reserved: 4 << 30 }, "the counts stay");
+        a.lock().publish(Usage { running: 2, giants: 1, reserved: 5 << 30 });
+        assert_eq!(b.lock().others_giants().reserved, 4 << 30, "the giants stay");
+        a.lock().publish_giants(1 << 20, 0);
+        assert_eq!(b.lock().others_giants().used, 1 << 20, "never more than its estimate");
+        a.lock().publish_giants(0, 0);
+        assert_eq!(b.lock().others_giants(), PeerGiants::default());
+        table.lock().clear(2);
+        assert_eq!(b.lock().others(), Usage::default());
+    }
 
     #[test]
     fn each_child_sees_the_others_and_the_parent_sees_all() {

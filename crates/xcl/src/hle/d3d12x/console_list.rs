@@ -79,6 +79,9 @@ pub struct Layout {
     pub inline_gfx: u32,
     pub inline_ms: u32,
     pub(super) uavs: Vec<UavBinding>,
+    /// for each parameter that is a descriptor table, its slots: where the last of its ranges
+    /// ends (u32::MAX: a range without end, or ranges not read); 0 for another parameter
+    pub(super) tables: Vec<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,20 +126,27 @@ pub fn layout_from_blob(blob: &[u8]) -> Option<Layout> {
             2..=4 => Param::Descriptor { at: l.size },
             _ => Param::Table { at: l.size },
         };
+        let mut slots = if matches!(p, Param::Table { .. }) { u32::MAX } else { 0 };
         if ty == 4 {
             l.uavs.push(UavBinding::Root { param: k, at: l.size });
         } else if let (0, Some(words), Some(count), Some(off)) = (ty, range_words, r(pay), r(pay + 4)) {
             let mut append = 0u32;
+            slots = 0;
             for i in 0..count as usize {
                 let at = off as usize + i * words * 4;
-                let (Some(kind), Some(count), Some(first)) = (r(at), r(at + 4), r(at + (words - 1) * 4)) else { break };
+                let (Some(kind), Some(count), Some(first)) = (r(at), r(at + 4), r(at + (words - 1) * 4)) else {
+                    slots = u32::MAX;
+                    break;
+                };
                 let first = if first == u32::MAX { append } else { first };
                 append = first.saturating_add(count);
+                slots = slots.max(append);
                 if kind == 1 && count != 0 {
                     l.uavs.push(UavBinding::Table { param: k, at: l.size, first, count });
                 }
             }
         }
+        l.tables.push(slots);
         let bytes = match p {
             Param::Constants { count, .. } => 4 * count,
             Param::Table { .. } => 4,
@@ -1014,6 +1024,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         let raw = real as *mut c_void;
                         let pc = ID3D12PipelineState::from_raw_borrowed(&raw).ok_or("PSO")?;
                         list.SetPipelineState(pc);
+                        super::shader_code::used(st.pc, real);
                         super::residency::note_list_untracked(st.pc);
                         super::gpu_timing::op_grid(raw_list, super::gpu_timing::Kind::Dispatch, || title_pso, [x, y, z], || list.Dispatch(x, y, z));
                         super::markers::after_op(raw_list, "dispatch", title_pso);
@@ -1042,6 +1053,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                     }
                     Some(Param::Table { at: o }) => {
                         let o = o as usize;
+                        super::console_heap::table_bound(get(1), layout.as_ref().and_then(|l| l.tables.get(i).copied()).unwrap_or(u32::MAX));
                         if let Some(t) = table.get_mut(o..o + 4) {
                             t.copy_from_slice(&get(1).to_le_bytes());
                         }
@@ -1125,6 +1137,28 @@ mod tests {
         assert_eq!(inline_for(&l, Some(0)), 0, "no user SGPR at all");
         assert_eq!(user_data_for(&l, Some(4), &args, 0x7_0000_0100), vec![0x100, 7, 0, 0]);
         assert_eq!(user_data_for(&l, Some(8), &args, 0x7_0000_0100), user_data(&l, &args, 0x7_0000_0100));
+    }
+
+    /// A table's slots: where the last of its ranges ends, in descriptors from its start – a
+    /// range at offset u32::MAX starts where the one before ends, a count of u32::MAX has no
+    /// end. (RTS0 v2: three constants, then the table of `ranges`: kind, count, offset.)
+    #[test]
+    fn a_tables_slots_are_where_its_ranges_end() {
+        let tables = |ranges: &[[u32; 3]]| {
+            let mut r = vec![2u32, 2, 24, 0, 0, 0, 1, 0, 48, 0, 0, 60, 0, 0, 3, ranges.len() as u32, 68];
+            for &[kind, count, offset] in ranges {
+                r.extend([kind, count, 0, 0, 0, offset]);
+            }
+            layout_from_blob(&r.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>()).unwrap().tables
+        };
+        assert_eq!(tables(&[[0, 8, 0], [1, 4, u32::MAX]]), [0, 12]);
+        assert_eq!(tables(&[[0, 8, 0], [1, 4, u32::MAX], [2, 2, 100]]), [0, 102]);
+        assert_eq!(tables(&[[2, 2, 100], [0, 8, 0]]), [0, 102], "the range that ends last, wherever it is listed");
+        assert_eq!(tables(&[[0, 16, 4], [0, u32::MAX, u32::MAX]]), [0, u32::MAX]);
+        assert_eq!(tables(&[]), [0, 0]);
+        let mut cut = vec![2u32, 1, 24, 0, 0, 0, 0, 0, 36, 2, 44, 0, 8, 0, 0, 0, 0];
+        cut.truncate(16);
+        assert_eq!(layout_from_blob(&cut.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>()).unwrap().tables, [u32::MAX], "a range past the blob's end");
     }
 
     /// RTS0 v2 of parameters (type: 0 table, 1 constants, 2–4 CBV / SRV / UAV; constant count)

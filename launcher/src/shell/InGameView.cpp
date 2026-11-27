@@ -955,11 +955,12 @@ void InGameView::refresh()
     if (booting) {
         const ShaderCacheInfo& cache = m_s.shaderCache.snapshot();
         QString shaders;
-        switch (titleShaderState(g.titleId(), m_s.settings.recentWarmups(), cache)) {
+        switch (shownShaderState(m_s.settings, g.titleId(), m_s.settings.recentWarmups(), cache)) {
         case TitleShaderState::Ready: shaders = QStringLiteral("Shaders ready"); break;
         case TitleShaderState::NeverWarmed: shaders = QStringLiteral("Shaders not warmed up"); break;
         case TitleShaderState::LastRunIncomplete: shaders = QStringLiteral("Last warm-up didn't finish"); break;
         case TitleShaderState::LastRunFailed: shaders = QStringLiteral("Last warm-up failed"); break;
+        case TitleShaderState::ProfileChanged: shaders = QStringLiteral("Run profile changed since the warm-up"); break;
         case TitleShaderState::Unknown: break;
         }
         if (cache.pipelines > 0)

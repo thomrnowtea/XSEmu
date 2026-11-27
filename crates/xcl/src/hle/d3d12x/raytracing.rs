@@ -17,6 +17,10 @@
 //! - console compute pipelines that traverse acceleration structures (`image_bvh(64)_intersect_ray`
 //!   in their native code) are never translated or built, and their dispatches are skipped like
 //!   those of a failed build.
+//! `XCL_RT_GATE` picks what happens to those pipelines and to the title layer's
+//! (`gpu::recomp::rt_gate_miss`): "miss", the default, builds and runs them with every
+//! intersection a miss (`gpu::recomp::rt_all_miss`: no structure exists, the builder being off);
+//! "hold" leaves them out as described here. The builder is left out in both.
 //! Fences are never touched: the skipped calls are recorded work, and the queues signal as before.
 //! The title layer (`title_gta6::rt_family`) adds the title's own ray passes that do not trace
 //! themselves. VIctory forks' `--no-rt` (DexNom RayTime: builder, ray bins, activation, traversal
@@ -32,15 +36,23 @@ use std::sync::{Mutex, OnceLock};
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
 
+use crate::gpu::recomp::traces_rays;
+
 /// Ray tracing is off for this run (logged once).
 pub fn off() -> bool {
     static OFF: OnceLock<bool> = OnceLock::new();
     *OFF.get_or_init(|| {
         let off = !crate::state::config().raytracing_on();
         if off {
-            crate::xlog_info!(
-                "D3D12.X: ray tracing off (XCL_RAYTRACING=1 restores it): no ray-tracing tier reported, state objects refused, DispatchRays and acceleration-structure builds and copies skipped, the acceleration-structure builder and pipelines that traverse acceleration structures left out unbuilt"
-            );
+            if crate::gpu::recomp::rt_all_miss() {
+                crate::xlog_info!(
+                    "D3D12.X: ray tracing off (XCL_RAYTRACING=1 restores it): no ray-tracing tier reported, state objects refused, DispatchRays and acceleration-structure builds and copies skipped, the acceleration-structure builder left out unbuilt; pipelines that traverse acceleration structures and the title's ray passes are built and run with every ray a miss (XCL_RT_GATE=hold leaves them out unbuilt instead)"
+                );
+            } else {
+                crate::xlog_info!(
+                    "D3D12.X: ray tracing off (XCL_RAYTRACING=1 restores it): no ray-tracing tier reported, state objects refused, DispatchRays and acceleration-structure builds and copies skipped, the acceleration-structure builder and pipelines that traverse acceleration structures left out unbuilt (XCL_RT_GATE=hold)"
+                );
+            }
         }
         off
     })
@@ -50,33 +62,6 @@ static PIPELINES: AtomicUsize = AtomicUsize::new(0);
 static DISPATCHES: AtomicUsize = AtomicUsize::new(0);
 static LIST_CALLS: AtomicUsize = AtomicUsize::new(0);
 
-/// The console program traverses acceleration structures: an `image_bvh(64)_intersect_ray` in its
-/// native code (a driver FSPX container's too).
-fn traces_rays(blob: &[u8]) -> bool {
-    if let Some(f) = crate::gpu::recomp::pso::fspx(blob) {
-        return code_traces_rays(f.code);
-    }
-    crate::gpu::xbox::parse(blob).is_some_and(|sh| sh.fssm.iter().any(|f| f.programs.iter().any(|p| f.data.get(p.offset..p.offset + p.len).is_some_and(code_traces_rays))))
-}
-
-/// `traces_rays` of one native program: a cheap scan for the instruction's MIMG opcode words
-/// first (DexNom RayTime's filter), then the decoder confirms one.
-fn code_traces_rays(code: &[u8]) -> bool {
-    let maybe = code.chunks_exact(4).any(|b| {
-        let w = u32::from_le_bytes(b.try_into().unwrap());
-        w >> 26 == 0x3c && (w >> 18) & 0x7e == 0x66
-    });
-    let mut off = 0;
-    while maybe && off + 4 <= code.len() {
-        let Ok(d) = crate::gpu::rdna2::decode(&code[off..], off as u64) else { return false };
-        if d.inst.name.get(..9).is_some_and(|n| n.eq_ignore_ascii_case("image_bvh")) {
-            return true;
-        }
-        off += d.len;
-    }
-    false
-}
-
 const BUILDER_DLL: &str = "xboxbvhbuilder.dll";
 const BUILDER_STAGE: &str = "ray tracing off: a stage of the acceleration-structure builder (XboxBvhBuilder.dll) left out unbuilt";
 const TRAVERSAL: &str = "ray tracing off: a pipeline that traverses acceleration structures left out unbuilt";
@@ -84,11 +69,38 @@ const TITLE_PASS: &str = "ray tracing off: one of the title's ray passes left ou
 
 /// Why a console shader is left out, and its family for the log (`first_of_family`).
 fn classify(container: &[u8]) -> Option<(&'static str, String)> {
-    if traces_rays(container) {
+    classify_gated(container, crate::gpu::recomp::rt_all_miss())
+}
+
+/// `classify` with the gate as given: with every ray a miss (`miss`) nothing is left out, the
+/// traversals and the title's ray passes are built and run (the first of each kind is logged).
+fn classify_gated(container: &[u8], miss: bool) -> Option<(&'static str, String)> {
+    classify_as(traces_rays(container), container, miss)
+}
+
+/// `classify_gated` of a container that traverses acceleration structures or not (`traces`).
+fn classify_as(traces: bool, container: &[u8], miss: bool) -> Option<(&'static str, String)> {
+    if miss {
+        if traces {
+            first_miss("a pipeline that traverses acceleration structures", container);
+        } else if let Some(pass) = super::title_gta6::ray_pass(container) {
+            first_miss(&format!("title ray pass {}", String::from_utf8_lossy(pass)), container);
+        }
+        return None;
+    }
+    if traces {
         return Some((TRAVERSAL, "traversal (image_bvh*_intersect_ray in its native code)".into()));
     }
     let pass = super::title_gta6::rt_family(container)?;
     Some((TITLE_PASS, format!("title ray pass {}", String::from_utf8_lossy(pass))))
+}
+
+/// The first pipeline of each family built with every ray a miss is logged with its shader.
+fn first_miss(family: &str, container: &[u8]) {
+    static LOGGED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+    if LOGGED.lock().unwrap().get_or_insert_with(HashSet::new).insert(family.to_owned()) {
+        crate::xlog_info!("D3D12.X: ray tracing off: {family} is built and runs with every ray a miss (first: CS {:016x}; XCL_RT_GATE=hold leaves it out)", crate::gpu::shader::fnv64(container));
+    }
 }
 
 /// The first pipeline left out of each family is logged with its shader, so a false positive shows.
@@ -100,7 +112,8 @@ fn first_of_family(family: &str, shader: u64) {
 }
 
 /// Why a pipeline of these console shaders is left out unbuilt, when ray tracing is off.
-/// `builder`: made through XboxBvhBuilder.dll's pipeline extension (`building_builder`).
+/// `builder`: a stage of the acceleration-structure builder, its CS in XboxBvhBuilder.dll's image or
+/// the DLL on the call stack (`building_builder`).
 pub fn left_out<'a>(compute: bool, builder: bool, shaders: impl Iterator<Item = &'a [u8]>) -> Option<&'static str> {
     if !compute || !off() {
         return None;
@@ -132,6 +145,44 @@ pub fn left_out<'a>(compute: bool, builder: bool, shaders: impl Iterator<Item = 
     why
 }
 
+/// Ray tracing off with every ray a miss (`XCL_RT_GATE=miss`): a pipeline of these console shaders
+/// traverses acceleration structures or is one of the title's ray passes, so it is built and runs,
+/// but behind every other build (`pso_async::rt_pass_last`; `XCL_RT_PASS_LAST=0`: in its place). Its
+/// output with every ray a miss is never what a world pass waits for: play-101 queued ~1,070 of
+/// them (999 CS_RaytracingResolve permutations) beside the pipelines the frame drew with.
+pub fn miss_pass<'a>(compute: bool, shaders: impl Iterator<Item = &'a [u8]>) -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    let on = *ON.get_or_init(|| {
+        let on = std::env::var("XCL_RT_PASS_LAST").map_or(true, |v| v.trim() != "0");
+        if !on {
+            crate::xlog_info!("D3D12.X: ray tracing off: ray passes built with every ray a miss are built in their place (XCL_RT_PASS_LAST=0)");
+        }
+        on
+    });
+    if !compute || !on || !off() || !crate::gpu::recomp::rt_all_miss() {
+        return false;
+    }
+    static SEEN: Mutex<Option<HashMap<u64, bool>>> = Mutex::new(None);
+    let found = shaders.into_iter().any(|s| {
+        let id = crate::gpu::shader::fnv64(s);
+        if let Some(&found) = SEEN.lock().unwrap().as_ref().and_then(|m| m.get(&id)) {
+            return found;
+        }
+        let found = traces_rays(s) || super::title_gta6::miss_ray_pass(s).is_some();
+        SEEN.lock().unwrap().get_or_insert_with(HashMap::new).insert(id, found);
+        found
+    });
+    if found {
+        let n = MISS_PASSES.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == 1 || (n.is_power_of_two() && n >= 64) {
+            crate::xlog_info!("D3D12.X: ray tracing off: {n} ray-pass pipelines built with every ray a miss go behind every other build (XCL_RT_PASS_LAST=0 builds them in their place)");
+        }
+    }
+    found
+}
+
+static MISS_PASSES: AtomicUsize = AtomicUsize::new(0);
+
 /// A draw or dispatch with a pipeline left out (`left_out`) was skipped.
 pub fn note_dispatch() {
     DISPATCHES.fetch_add(1, Ordering::Relaxed);
@@ -154,7 +205,7 @@ fn builder_code(code: usize) -> bool {
 
 fn called_from_builder() -> bool {
     let Some(dll) = crate::modules::find_mapped_by_name(BUILDER_DLL) else { return false };
-    let mut frames = [std::ptr::null_mut::<c_void>(); 8];
+    let mut frames = [std::ptr::null_mut::<c_void>(); 32];
     let n = unsafe { windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace(0, frames.len() as u32, frames.as_mut_ptr(), std::ptr::null_mut()) };
     frames[..n as usize].iter().any(|&f| dll.contains(f as usize))
 }
@@ -366,6 +417,7 @@ mod tests {
 
     #[test]
     fn a_bvh_intersection_in_native_code_is_a_traversal() {
+        use crate::gpu::recomp::code_traces_rays;
         use crate::gpu::rdna2::encode;
         let mimg = |op: &str| encode(op, "ENC_MIMG", &[("VDATA", 100), ("VADDR", 12), ("SRSRC", 2), ("DMASK", 15)], None).unwrap();
         let end = encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap();
@@ -375,6 +427,16 @@ mod tests {
         assert!(!code_traces_rays(&[mimg("IMAGE_SAMPLE"), end.clone()].concat()));
         assert!(!code_traces_rays(&end));
         assert_eq!(classify(b"CS_Tree_BatchCull_c47eb2b0_Wrapped"), None);
+    }
+
+    #[test]
+    fn with_every_ray_a_miss_no_traversal_or_ray_pass_is_left_out() {
+        let traversal: &[u8] = b"CS_Tree_BatchCull_c47eb2b0_Wrapped";
+        assert_eq!(classify_as(true, traversal, false).map(|c| c.0), Some(TRAVERSAL));
+        assert_eq!(classify_as(true, traversal, true), None);
+        assert_eq!(classify_gated(b"CS_RaytracingResolve_0", true), None);
+        assert_eq!(classify_gated(b"CS_Tree_BatchCull_c47eb2b0_Wrapped", true), None);
+        assert_eq!(classify_gated(b"CS_Tree_BatchCull_c47eb2b0_Wrapped", false), None);
     }
 
     #[test]

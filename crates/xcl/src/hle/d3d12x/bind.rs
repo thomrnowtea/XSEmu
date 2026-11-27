@@ -40,6 +40,9 @@ struct State {
     /// (`XCL_GPU_MARKERS`) the user SGPRs `bind_abi` last built here: their first 16 words,
     /// the shader's own register count and the argument bytes passed in registers
     last_io: (Vec<u32>, Option<u32>, u32),
+    /// the next dispatch's thread limits (io[`IO_THREAD_LIMIT`]: a `DispatchX` with thread
+    /// dimensions), taken by the next compute `abi_views` so every other one gets 0
+    limits: [u32; 3],
 }
 
 static STATES: Mutex<Option<HashMap<usize, State>>> = Mutex::new(None);
@@ -58,6 +61,31 @@ static INDIRECT_REFUSED: AtomicU64 = AtomicU64::new(0);
 
 pub fn indirect_refusals() -> u64 {
     INDIRECT_REFUSED.load(Ordering::Relaxed)
+}
+
+/// The indirect calls refused since the last call, by what they waited for: the 6 ranges and
+/// producers refused most, each with its pipeline's key and why it has not run. None when none
+/// was refused.
+pub fn indirect_refusal_detail() -> Option<String> {
+    let refused = super::indirect::take_refusals();
+    if refused.is_empty() {
+        return None;
+    }
+    let shown: Vec<String> = refused.iter().take(6).map(|&((s, e, p), n)| {
+        let (key, _) = super::pso_async::key_of(p);
+        let state = if super::pso_async::is_pending(p) {
+            "still building".to_string()
+        } else if let Some(why) = super::real::why_untranslated(p) {
+            why
+        } else if super::pso_async::pending_or_built(p) {
+            "built since".into()
+        } else {
+            "its build failed or was left out".into()
+        };
+        format!("{n} reading {s:#x}..{e:#x} ({} B) wait for pipeline {p:#x} (key {key:016x}): {state}", e - s)
+    }).collect();
+    let more = refused.len().saturating_sub(shown.len());
+    Some(format!("{}{}", shown.join("; "), if more > 0 { format!("; and {more} more ranges") } else { String::new() }))
 }
 const DRAWS: usize = 0;
 const DRAWS_SKIPPED: usize = 1;
@@ -201,6 +229,32 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
     console_list::hold_until_reset(old, blocks);
     super::indirect::recording_done(to as usize, old);
     super::markers::recording_ended(to as usize);
+}
+
+/// A call whose pipeline is still being built, which would be skipped for it
+/// (`pso_async::deferrable`), is put off to the submit instead (`list_x::defer`): true when it
+/// was. What a dispatch writes is noted unwritten, as a skipped one's is (an indirect call
+/// reading it is skipped too), until it runs at the submit.
+pub(super) unsafe fn put_off(this: *mut c_void, what: super::list_x::Deferred) -> bool {
+    let pso = with(this, |s| s.pso);
+    if in_bundle(this) || (what.draws() && !super::pso_async::defer_draws()) || !super::pso_async::deferrable(pso) || !super::list_x::defer(this, what) {
+        return false;
+    }
+    if !what.draws() {
+        note_skipped_writer(this, pso, pso);
+    }
+    super::pso_async::need_by_submit(pso);
+    true
+}
+
+/// Whether `list` has a compute and a graphics root signature bound (`list_x::record_put_off`).
+pub(super) fn roots_bound(list: *mut c_void) -> (bool, bool) {
+    with(list, |s| (s.rs != 0 || s.layout.is_some(), s.rs_gfx != 0 || s.layout_gfx.is_some()))
+}
+
+/// A call put off to the submit that could not be recorded there: counted as the skip it was.
+pub(super) fn deferred_skipped(draws: bool) {
+    count(if draws { DRAWS_SKIPPED } else { DISPATCHES_SKIPPED });
 }
 
 /// The list is gone.
@@ -399,6 +453,17 @@ fn put(list: *mut c_void, i: u32, offset: u32, bytes: &[u8]) {
     put_in(list, false, i, offset, bytes)
 }
 
+/// The descriptor table at console address `addr` is bound as parameter `i`: the heap pages
+/// it reaches by the root signature are in use (`console_heap::table_bound`; no root signature:
+/// to the heap's end).
+fn table_bound(list: *mut c_void, gfx: bool, i: u32, addr: u32) {
+    if !super::console_heap::tables_followed() {
+        return;
+    }
+    let slots = with(list, |s| (if gfx { &s.layout_gfx } else { &s.layout }).as_ref().and_then(|l| l.tables.get(i as usize).copied()));
+    super::console_heap::table_bound(addr, slots.unwrap_or(u32::MAX));
+}
+
 /// #34 SetGraphicsRootSignature (PC #30)
 pub(super) unsafe extern "system" fn set_graphics_root_signature(this: *mut c_void, rs: *mut c_void) {
     // the same root signature again keeps the root arguments (D3D12: only a change of root
@@ -416,6 +481,7 @@ pub(super) unsafe extern "system" fn set_graphics_root_signature(this: *mut c_vo
 
 /// #36 SetGraphicsRootDescriptorTable (PC #32)
 pub(super) unsafe extern "system" fn set_graphics_root_table(this: *mut c_void, i: u32, handle: u64) {
+    table_bound(this, true, i, handle as u32);
     put_in(this, true, i, 0, &(handle as u32).to_le_bytes());
 }
 
@@ -750,6 +816,15 @@ fn note_depth_skip(reason: &str, context: &str) {
 /// translated pipeline, on XCL's ABI with the kept root arguments (signatures that change root
 /// arguments themselves cannot be – skipped, logged)
 pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: usize, max: u32, args: usize, args_off: u64, count_buf: usize, count_off: u64) {
+    if super::indirect::dispatches(sig) && chain_held(this, with(this, |s| s.pso)) {
+        return;
+    }
+    // (only a signature of the one call: root arguments or buffer views it set would be missing
+    // from the list after it)
+    let one_call = super::indirect::signature(sig).is_some_and(|(last, _, single)| single && [super::indirect::DRAW, super::indirect::DRAW_INDEXED, super::indirect::DISPATCH].contains(&last));
+    if one_call && put_off(this, super::list_x::Deferred::Indirect(sig, max, args, args_off, count_buf, count_off)) {
+        return;
+    }
     type F = unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64);
     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
     let title_pso = with(this, |s| s.pso);
@@ -1197,6 +1272,9 @@ fn cpu_rect_expansion(pso: usize) -> bool {
 
 /// #12 DrawInstanced
 pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) {
+    if put_off(this, super::list_x::Deferred::Draw(vertices, instances, first_vertex, first_instance)) {
+        return;
+    }
     let pso = with(this, |s| s.pso);
     let skipped = shader_skip(pso);
     draw_gate_call(this, pso, "DrawInstanced", format_args!("vertices {vertices} instances {instances} first_vertex {first_vertex} first_instance {first_instance}"), skipped);
@@ -1230,6 +1308,12 @@ fn mark(this: *mut c_void, kind: &'static str) {
     if super::present::writer_trace_active() {
         trace_plane_write(this, kind);
     }
+    if super::target_dump::recording() {
+        note_target_dump(this, kind);
+    }
+    if super::submit_watch::on() {
+        super::submit_watch::op(this as usize, kind, with(this, |s| s.pso));
+    }
     if super::markers::enabled() {
         unsafe { super::markers::after_op(this, kind, with(this, |s| s.pso)) }
         // (a dispatch's arguments are kept with what they bound: `note_dispatch_snapshot`)
@@ -1239,6 +1323,43 @@ fn mark(this: *mut c_void, kind: &'static str) {
             }
         }
     }
+}
+
+/// `XCL_DUMP_TARGETS_AFTER_S`: the op just recorded on `list` – what it writes (render targets,
+/// UAV textures), what it samples and at what size, its viewport and scissor.
+fn note_target_dump(list: *mut c_void, kind: &'static str) {
+    let compute = matches!(kind, "dispatch" | "ExecuteIndirect(dispatch)");
+    let (pso, layout, args) = with(list, |s| {
+        let (layout, args) = if compute { (&s.layout, &s.args) } else { (&s.layout_gfx, &s.args_gfx) };
+        (s.pso, layout.clone(), args.clone())
+    });
+    let mut images = Vec::new();
+    if let Some(layout) = layout.as_ref() {
+        bound_resources(layout, &args, Some(&mut images));
+    }
+    let mut writes = if compute { Vec::new() } else { super::list_x::bound_color_resources(list) };
+    let mut reads = Vec::new();
+    for i in &images {
+        let Some(res) = i.resource else { continue };
+        if super::console_heap::native_uav_at(i.table.wrapping_add(32 * i.slot), i.srv) == Some(res) {
+            if !writes.contains(&res) {
+                writes.push(res);
+            }
+            continue;
+        }
+        reads.push(super::target_dump::Read {
+            resource: res, width: i.view.width, height: i.view.height, format: i.view.format, swizzle: i.view.swizzle_mode,
+            base_level: i.view.base_level, slot: format!("p{} table {:#x} slot {}", i.param, i.table, i.slot),
+        });
+    }
+    let shaders = if compute {
+        super::dispatch_timing::profile_shader(pso).map_or_else(String::new, |cs| format!("cs {cs:016x}"))
+    } else {
+        super::gpu_timing_stats::shaders(pso).map_or_else(String::new, |(vs, ps)| format!("vs {vs:016x} ps {ps:016x}"))
+    };
+    let (viewport, scissor) = if compute { (None, None) } else { super::list_x::viewport_scissor(list as usize) };
+    unsafe { super::target_dump::after_pass(list, &writes, || format!("{kind} of pipeline {pso:#x}{}{shaders}", if shaders.is_empty() { "" } else { " " })) };
+    super::target_dump::record(list as usize, super::target_dump::Op { kind, pso, shaders, writes, reads, viewport, scissor });
 }
 
 fn trace_plane_write(list: *mut c_void, kind: &'static str) {
@@ -1470,6 +1591,9 @@ thread_local! {
 
 /// #13 DrawIndexedInstanced
 pub(super) unsafe extern "system" fn draw_indexed_instanced(this: *mut c_void, indices: u32, instances: u32, first_index: u32, base_vertex: i32, first_instance: u32) {
+    if put_off(this, super::list_x::Deferred::DrawIndexed(indices, instances, first_index, base_vertex, first_instance)) {
+        return;
+    }
     let ia = super::list_x::ia_live::prepare(this, true, None);
     if let Some(list) = prepare_indexed_draw(this, indices, instances, first_index, base_vertex, first_instance) {
         if !ia.gathered() { super::list_x::sync_title_buffers(this, Some((first_index, indices, base_vertex)), 0, 0, if first_instance != 0 { instances.max(2) } else { instances }); }
@@ -1815,6 +1939,7 @@ pub(super) unsafe extern "system" fn set_compute_root_signature(this: *mut c_voi
 
 /// #35 SetComputeRootDescriptorTable (PC #31): the table's console address, 32 bits
 pub(super) unsafe extern "system" fn set_compute_root_table(this: *mut c_void, i: u32, handle: u64) {
+    table_bound(this, false, i, handle as u32);
     put(this, i, 0, &(handle as u32).to_le_bytes());
 }
 
@@ -2052,7 +2177,7 @@ pub fn mesh_counts() -> String {
 pub fn indirect_calls() -> String {
     let c = |k: usize| MESH_CALLS[k].load(Ordering::Relaxed);
     let (native, two_pass) = super::real::mesh_pipeline_counts();
-    let trips = trips(0).first().map_or(String::new(), |t| format!("; {t}"));
+    let trips: String = trips(TRIP_PIPELINES_TOLD).iter().filter(|t| t.starts_with("guard tripwire")).map(|t| format!("; {t}")).collect();
     let pending = PENDING_COMPUTE_SKIPS.lock().unwrap().as_ref().map_or_else(String::new, |counts| {
         let mut top: Vec<_> = counts.iter().collect();
         top.sort_unstable_by_key(|(&shader, &count)| (std::cmp::Reverse(count), shader));
@@ -2547,7 +2672,7 @@ pub(super) fn describe_dispatch(slot: usize, generation: u32, op: usize) -> Vec<
     out
 }
 
-/// (`XCL_GPU_MARKERS`) The guard tripwire's counters (`recomp::IO_TRIP_AT`): four words of
+/// (`config::guard_trips_enabled`) The guard tripwire's counters (`recomp::IO_TRIP_AT`): four words of
 /// committed unified memory per slot, one for each of `recomp::TRIP_KINDS` – the lanes of a translated shader in which
 /// that guard gave up. Every translated dispatch gets the next slot of a ring; a graphics
 /// pipeline keeps one slot for all its draws.
@@ -2570,6 +2695,8 @@ struct Trips {
 }
 
 const TRIP_RING: usize = 16384;
+/// the pipelines with the most lanes that the 30 s line names (`indirect_calls`)
+const TRIP_PIPELINES_TOLD: usize = 4;
 const TRIP_GFX: usize = 4096;
 const TRIP_PIECE: usize = 4096;
 static TRIPS: Mutex<Option<Trips>> = Mutex::new(None);
@@ -2717,7 +2844,7 @@ impl Trips {
 pub(super) fn trip_watch(list: *mut c_void, title_pso: usize, real_pso: usize, gfx: bool) -> (u32, u32) {
     let markers = super::markers::enabled();
     let shader = if gfx { None } else { super::dispatch_timing::loop_shader(real_pso) };
-    if !markers && shader.is_none() {
+    if !markers && shader.is_none() && !crate::config::guard_trips_enabled() {
         return (0, 0);
     }
     let Some(u) = crate::gpu::uma::get() else { return (0, 0) };
@@ -2969,8 +3096,128 @@ fn note_named_use(title_pso: usize, pso: usize, what: &str) {
 }
 
 /// #14 Dispatch: with a translated pipeline, on XCL's ABI with the kept root arguments
+/// A dispatch of the title's `title_pso` with more than 65,535 groups on an axis: the console
+/// runs it, D3D12 allows 65,535 (D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION). Passed on as
+/// it is; logged at the 1st, 2nd, 4th ... call of a pipeline, so a run shows whether the title's
+/// lists reach the limit.
+fn note_over_limit(title_pso: usize, call: &str, groups: [u32; 3]) {
+    static SEEN: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
+    let n = {
+        let mut g = SEEN.lock().unwrap();
+        let n = g.get_or_insert_with(HashMap::new).entry(title_pso).or_insert(0);
+        *n += 1;
+        *n
+    };
+    if n.is_power_of_two() {
+        let (key, _) = super::pso_async::key_of(title_pso);
+        crate::xlog_warn!("D3D12.X: {call} of pipeline {title_pso:#x} (key {key:016x}) with {}x{}x{} groups, past D3D12's 65,535 on an axis (#{n} of this pipeline); passed on as it is", groups[0], groups[1], groups[2]);
+    }
+}
+
 pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32, z: u32) {
+    dispatch_flags(this, x, y, z, None);
+}
+
+/// `DispatchX` flag USE_THREAD_DIMENSIONS: x, y, z are thread counts, not group counts; the
+/// console launches whole groups and leaves the lanes past each count out of EXEC (0x8000, the
+/// wave32 bit of 0x8020, needs nothing here: the pipeline's program has its wave size)
+const DISPATCH_THREAD_DIMENSIONS: u32 = 0x20;
+
+/// What a dispatch of `dims` with `DispatchX` `flags` launches on a pipeline whose console
+/// group shape is `threads`: its groups, and the thread limits for io[`IO_THREAD_LIMIT`] (0: that
+/// axis ends on a whole group). With thread dimensions an axis of n threads is ceil(n / numthreads)
+/// groups. None: it cannot be run as the console would (thread dimensions, group shape not
+/// known). `enabled` false (`XCL_DISPATCH_THREAD_DIMENSIONS=0`): the flags are ignored.
+/// Adapted from ivall/xcl a3e820d8 (PR #2610).
+fn dispatch_groups(dims: [u32; 3], flags: u32, threads: Option<[u32; 3]>, enabled: bool) -> Option<([u32; 3], [u32; 3])> {
+    if !enabled || flags & DISPATCH_THREAD_DIMENSIONS == 0 {
+        return Some((dims, [0; 3]));
+    }
+    let threads = threads?.map(|t| t.max(1));
+    let groups = std::array::from_fn(|k| dims[k].div_ceil(threads[k]));
+    let limits = std::array::from_fn(|k| if dims[k] % threads[k] != 0 { dims[k] } else { 0 });
+    Some((groups, limits))
+}
+
+/// Once per distinct `DispatchX` flags value: the counts, the pipeline's console group shape,
+/// what is launched, and whether thread dimensions are honoured (`XCL_DISPATCH_THREAD_DIMENSIONS`).
+fn note_dispatch_x_flags(flags: u32, dims: [u32; 3], threads: Option<[u32; 3]>, launched: Option<([u32; 3], [u32; 3])>) {
+    static SEEN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+    {
+        let mut seen = SEEN.lock().unwrap();
+        if seen.contains(&flags) {
+            return;
+        }
+        seen.push(flags);
+    }
+    let on = if crate::gpu::recomp::dispatch_thread_dimensions() { "on" } else { "off (XCL_DISPATCH_THREAD_DIMENSIONS=0)" };
+    let launched = match launched {
+        Some((groups, limits)) => format!("launched as {groups:?} groups, thread limits {limits:?}"),
+        None => "skipped: the pipeline's group shape is not known".into(),
+    };
+    crate::xlog_info!("D3D12.X: first DispatchX with flags {flags:#x}: counts {dims:?}, numthreads {threads:?}, {launched} (thread dimensions {on})");
+}
+
+/// The images the compute root arguments on `list` name, for `fsr4_standin`: those with a PC
+/// resource behind their view.
+pub(super) fn compute_images(list: *mut c_void) -> Vec<super::fsr4_standin::Image> {
+    let (layout, args) = with(list, |s| (s.layout.clone(), s.args.clone()));
+    let mut images = Vec::new();
+    if let Some(layout) = layout.as_ref() {
+        bound_resources(layout, &args, Some(&mut images));
+    }
+    images
+        .iter()
+        .filter_map(|i| {
+            let resource = i.resource?;
+            let p = resource as *mut c_void;
+            let format = unsafe { ID3D12Resource::from_raw_borrowed(&p) }.map_or(0, |r| unsafe { r.GetDesc() }.Format.0);
+            Some(super::fsr4_standin::Image {
+                resource,
+                index: i.srv,
+                uav: super::console_heap::native_uav_at(i.table.wrapping_add(32 * i.slot), i.srv) == Some(resource),
+                width: i.view.width,
+                height: i.view.height,
+                flat: i.view.ty == crate::gpu::desc::ImageType::D2,
+                format,
+            })
+        })
+        .collect()
+}
+
+/// The layout of the compute root signature on `list` and the root arguments kept for it, for
+/// `title_gta6_ambient`: what the dispatch just recorded there was bound with.
+pub(super) fn compute_arguments(list: *mut c_void) -> Option<(Arc<Layout>, Vec<u8>)> {
+    with(list, |s| s.layout.clone().map(|layout| (layout, s.args.clone())))
+}
+
+/// A dispatch with the title's `title_pso`, a pass of a chain not all built (`pass_chain`): skipped,
+/// counted as one whose pipeline is still building, and what it writes marked unwritten. One the
+/// FSR4 stand-in takes (`fsr4_standin`) is skipped the same way, and is not one that is still building.
+fn chain_held(this: *mut c_void, title_pso: usize) -> bool {
+    if unsafe { super::fsr4_standin::takes(this, title_pso) } {
+        note_skipped_writer(this, title_pso, title_pso);
+        count(DISPATCHES_SKIPPED);
+        return true;
+    }
+    if super::pass_chain::may_dispatch(title_pso) {
+        return false;
+    }
+    note_skipped_writer(this, title_pso, title_pso);
+    super::pso_async::note_pending_skip();
+    count(DISPATCHES_SKIPPED);
+    true
+}
+
+/// `Dispatch` (`flags` None) and `DispatchX(x, y, z, flags)`.
+pub(super) unsafe fn dispatch_flags(this: *mut c_void, x: u32, y: u32, z: u32, flags: Option<u32>) {
     let title_pso = with(this, |s| s.pso);
+    if chain_held(this, title_pso) {
+        return;
+    }
+    if put_off(this, super::list_x::Deferred::Dispatch(x, y, z, flags)) {
+        return;
+    }
     let pso = match super::pso_async::waiting_if(in_bundle(this), || super::pso_async::resolve_for_compute_use(title_pso)) {
         Ok(pso) => pso,
         Err(skip) => return note_pending_compute_skip(this, title_pso, "Dispatch", skip),
@@ -2995,13 +3242,36 @@ pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32,
         count(DISPATCHES_SKIPPED);
         return;
     }
+    let threads = super::real::pso_threads(pso);
+    let launched = dispatch_groups([x, y, z], flags.unwrap_or(0), threads, crate::gpu::recomp::dispatch_thread_dimensions());
+    if let Some(flags) = flags {
+        note_dispatch_x_flags(flags, [x, y, z], threads, launched);
+    }
+    let Some((groups, limits)) = launched else {
+        note_skipped_writer(this, pso, title_pso);
+        count(DISPATCHES_SKIPPED);
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+            crate::xlog_warn!("D3D12.X: DispatchX of {x}x{y}x{z} threads (flags {:#x}) with a pipeline whose group shape is not known ({pso:#x}) skipped", flags.unwrap_or(0));
+        }
+        return;
+    };
+    let [x, y, z] = groups;
     reach(this);
-    match translated_dispatch(this, list, pso, x, y, z) {
+    if x.max(y).max(z) > 65535 {
+        note_over_limit(title_pso, "Dispatch", [x, y, z]);
+    }
+    with(this, |s| s.limits = limits);
+    let done = translated_dispatch(this, list, pso, x, y, z);
+    with(this, |s| s.limits = [0; 3]);
+    match done {
         Ok(()) => {
             count(DISPATCHES);
             mark(this, "dispatch");
+            super::submit_watch::groups(this as usize, [x, y, z]);
             note_dispatch_binding(this, title_pso, Some([x, y, z]));
             note_built_writes(this, title_pso);
+            super::title_gta6_ambient::after_dispatch(this, title_pso);
         }
         Err(e) => {
             count(DISPATCHES_SKIPPED);
@@ -3194,6 +3464,11 @@ enum RootStage { Compute, Graphics, Mesh }
 unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, stage: RootStage, call: &'static str) -> Result<(Option<(usize, u64)>, Option<super::material_gate_views::writer::Snapshot>), String> {
     let gfx = !matches!(stage, RootStage::Compute);
     let (real, views, layout, args, io) = abi_views(this, pso, stage)?;
+    // (a graphics pipeline may be taken away for the code budget between the caller's look at it
+    // and this one: its stand-in has the title's root signature, not the ABI's bound below)
+    if gfx && super::real::is_standin_pso(real) {
+        return Err("its pipeline is not built (taken away for the code budget, or its build failed)".into());
+    }
     let rs = super::real::pso_root_signature(real).or_else(|| super::real::abi_rs_cached().map(|p| p as usize)).ok_or("no XCL ABI root signature")?;
     bind_views(this, list, rs, real, views, gfx)?;
     let mut writer = (call == "dispatch").then(|| super::material_gate_views::writer::snapshot(this as usize, real, &io)).flatten();
@@ -3278,6 +3553,7 @@ unsafe fn bind_views(this: *mut c_void, list: &ID3D12GraphicsCommandList, rs: us
             list.SetComputeRootUnorderedAccessView(k as u32, v);
         }
     }
+    super::shader_code::used(this as usize, pipeline);
     let pipeline = pipeline as *mut c_void;
     let pc = ID3D12PipelineState::from_raw_borrowed(&pipeline).ok_or("pipeline")?;
     list.SetPipelineState(pc);
@@ -3293,6 +3569,7 @@ unsafe fn abi_views(this: *mut c_void, pso: usize, stage: RootStage) -> Result<(
     let windows = super::real::uma_window_vas();
     let first = super::real::shader_window_base(&windows)?;
     let (layout, args) = with(this, |s| if gfx { (s.layout_gfx.clone(), s.args_gfx.clone()) } else { (s.layout.clone(), s.args.clone()) });
+    let limits = if gfx { [0; 3] } else { with(this, |s| std::mem::take(&mut s.limits)) };
     // 32-bit console addresses: window 0; pieces of the list's arena (not a 64 KiB grain each)
     let copy = |bytes: &[u8]| -> Result<usize, String> {
         let p = with(this, |s| s.arena.take(u, bytes.len().max(16), 256, &mut s.uma)).ok_or("unified memory is full")?;
@@ -3325,6 +3602,9 @@ unsafe fn abi_views(this: *mut c_void, pso: usize, stage: RootStage) -> Result<(
     io[crate::gpu::recomp::IO_MEM_VIEWS] = super::real::mem_views().ok_or("memory windows have no views")?;
     io[crate::gpu::recomp::IO_PHYSICAL_TABLE] = super::physical_directory::recordings::packet_index(this as usize);
     io[crate::gpu::recomp::IO_CARRY_AT] = carry_watch();
+    for (k, l) in limits.into_iter().enumerate() {
+        io[crate::gpu::recomp::IO_THREAD_LIMIT[k]] = l;
+    }
     (io[crate::gpu::recomp::IO_TRIP_WINDOW], io[crate::gpu::recomp::IO_TRIP_AT]) = trip_watch(this, with(this, |s| s.pso), real, gfx);
     let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
     let res_at = copy(&[0u8; 256])?;
@@ -3346,7 +3626,7 @@ pub(super) fn counts_snapshot() -> [u64; 5] {
     std::array::from_fn(|k| COUNTS[k].load(Ordering::Relaxed))
 }
 
-#[cfg(test)]
+/// The pipeline `list` has bound (as the title made it; 0: none).
 pub(super) fn tracked_pso(list: *mut c_void) -> usize {
     STATES
         .lock()
@@ -3361,6 +3641,44 @@ mod tests {
     use super::super::{device_x, list_x, pso_async, real, title_list};
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    /// `DispatchX` with thread dimensions (flag 0x20; 0x8020 with the wave32 bit): the console
+    /// launches ceil(count / numthreads) groups an axis and leaves the lanes past a count that
+    /// ends inside a group out; without the flag the counts are groups. With the flag and a
+    /// group shape not known nothing is launched (the counts as groups was the bug), and with
+    /// `XCL_DISPATCH_THREAD_DIMENSIONS=0` the flags are ignored as before.
+    #[test]
+    fn dispatch_x_with_thread_dimensions_launches_whole_groups() {
+        let line = Some([64, 1, 1]);
+        // 640 threads in groups of 64: 10 groups, the last one whole
+        assert_eq!(dispatch_groups([640, 1, 1], 0x20, line, true), Some(([10, 1, 1], [0, 0, 0])));
+        // 100 threads: 2 groups, and the lanes past 100 to leave out
+        assert_eq!(dispatch_groups([100, 1, 1], 0x20, line, true), Some(([2, 1, 1], [100, 0, 0])));
+        // one thread past a whole group, one short of one
+        assert_eq!(dispatch_groups([65, 1, 1], 0x20, line, true), Some(([2, 1, 1], [65, 0, 0])));
+        assert_eq!(dispatch_groups([63, 1, 1], 0x20, line, true), Some(([1, 1, 1], [63, 0, 0])));
+        // the wave32 bit (0x8000) changes nothing here
+        assert_eq!(dispatch_groups([100, 1, 1], 0x8020, line, true), Some(([2, 1, 1], [100, 0, 0])));
+        // a 2-D and a 3-D group shape: each axis by its own size
+        assert_eq!(dispatch_groups([20, 16, 3], 0x20, Some([8, 8, 1]), true), Some(([3, 2, 3], [20, 0, 0])));
+        assert_eq!(dispatch_groups([16, 9, 7], 0x8020, Some([4, 4, 4]), true), Some(([4, 3, 2], [0, 9, 7])));
+        // no threads: no groups (a 0 limit is "no limit", but nothing is launched on that axis)
+        assert_eq!(dispatch_groups([0, 1, 1], 0x20, line, true), Some(([0, 1, 1], [0, 0, 0])));
+        assert_eq!(dispatch_groups([100, 0, 5], 0x20, Some([8, 8, 1]), true), Some(([13, 0, 5], [100, 0, 0])));
+        // a group shape of 0 on an axis counts as 1 (no division by zero)
+        assert_eq!(dispatch_groups([5, 1, 1], 0x20, Some([0, 1, 1]), true), Some(([5, 1, 1], [0, 0, 0])));
+        // the largest counts: no overflow in the group count
+        assert_eq!(dispatch_groups([u32::MAX, 1, 1], 0x20, line, true), Some(([u32::MAX / 64 + 1, 1, 1], [u32::MAX, 0, 0])));
+        // group counts (Dispatch, DispatchX without the flag) are launched as they are
+        assert_eq!(dispatch_groups([7, 2, 1], 0, line, true), Some(([7, 2, 1], [0, 0, 0])));
+        assert_eq!(dispatch_groups([7, 2, 1], 0x8000, line, true), Some(([7, 2, 1], [0, 0, 0])));
+        // thread dimensions on a pipeline whose group shape is not known: not launched
+        assert_eq!(dispatch_groups([100, 1, 1], 0x20, None, true), None);
+        assert_eq!(dispatch_groups([100, 1, 1], 0, None, true), Some(([100, 1, 1], [0, 0, 0])));
+        // switched off: the counts are groups whatever the flags
+        assert_eq!(dispatch_groups([100, 1, 1], 0x20, line, false), Some(([100, 1, 1], [0, 0, 0])));
+        assert_eq!(dispatch_groups([100, 1, 1], 0x8020, None, false), Some(([100, 1, 1], [0, 0, 0])));
+    }
 
     #[test]
     fn pending_skip_logs_only_declared_uav_slots() {
@@ -3849,6 +4167,73 @@ void main(uint t : SV_GroupIndex) {
         (*(this as *const FakeAdoptedList)).execute_indirect_calls.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// `XCL_DEFER_TO_SUBMIT=0` keeps the skip: a dispatch whose pipeline is still being built is
+    /// skipped and counted at once, nothing reaches the PC list and nothing waits. A list that is
+    /// not a title list has nowhere to put it off to: skipped the same way with it on.
+    #[test]
+    fn with_defer_to_submit_off_a_dispatch_whose_pipeline_is_building_is_skipped() {
+        let mut orig_vt = [0usize; 64];
+        orig_vt[1] = fake_add_ref as usize;
+        orig_vt[2] = fake_release as usize;
+        orig_vt[14] = fake_dispatch as usize;
+        orig_vt[25] = fake_set_pso as usize;
+        orig_vt[29] = fake_set_compute_rs as usize;
+        orig_vt[41] = fake_set_compute_uav as usize;
+        orig_vt[59] = fake_execute_indirect as usize;
+        let mut ext_vt = vec![0usize; 65];
+        ext_vt[0] = orig_vt.as_ptr() as usize;
+        ext_vt[1..].copy_from_slice(&orig_vt);
+        let fake = Box::new(FakeAdoptedList {
+            vt: unsafe { ext_vt.as_ptr().add(1) },
+            refs: AtomicUsize::new(1),
+            dispatch_calls: AtomicUsize::new(0),
+            set_compute_rs_calls: AtomicUsize::new(0),
+            set_compute_uav_calls: AtomicUsize::new(0),
+            set_pso_calls: AtomicUsize::new(0),
+            execute_indirect_calls: AtomicUsize::new(0),
+        });
+        let list_ptr = &*fake as *const FakeAdoptedList as *mut c_void;
+        let standin = 0x7200_0D01usize;
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let g = gate.clone();
+        pso_async::submit(standin, true, Box::new(move || {
+            let mut open = g.0.lock().unwrap();
+            while !*open {
+                open = g.1.wait(open).unwrap();
+            }
+            0
+        }));
+        reset(list_ptr, 0x7200_0100, standin);
+        pso_async::SKIP_UNTIL_BUILT.with(|s| s.set(true));
+        let mut skips = Vec::new();
+        for on in [false, true] {
+            pso_async::set_defer_for_test(Some(on));
+            let before = counts_snapshot();
+            let t = std::time::Instant::now();
+            unsafe { dispatch(list_ptr, 1, 1, 1) };
+            let after = counts_snapshot();
+            skips.push((after[DISPATCHES_SKIPPED] - before[DISPATCHES_SKIPPED], after[DISPATCHES] - before[DISPATCHES], t.elapsed()));
+        }
+        pso_async::set_defer_for_test(None);
+        pso_async::SKIP_UNTIL_BUILT.with(|s| s.set(false));
+        let pending = pso_async::is_pending(standin);
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        let t = std::time::Instant::now();
+        while pso_async::is_pending(standin) && t.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let _ = pso_async::released(standin);
+        forget(list_ptr);
+        assert!(pending, "the dispatch waited for the build");
+        for (skipped, ran, took) in skips {
+            assert_eq!((skipped, ran), (1, 0));
+            assert!(took < std::time::Duration::from_millis(500), "the dispatch waited {took:?}");
+        }
+        assert_eq!(fake.dispatch_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(fake.set_pso_calls.load(Ordering::Relaxed), 0);
+    }
+
     #[test]
     fn async_compute_pso_success_and_failure_in_dispatch_and_execute_indirect() {
         let mut orig_vt = [0usize; 64];
@@ -3974,6 +4359,88 @@ void main(uint t : SV_GroupIndex) {
         let _ = pso_async::released(standin_ok);
         let _ = pso_async::released(standin_fail);
         real::forget_pso_for_test(real_ok);
+    }
+
+    /// The stand-in for the indirect light (`title_gta6_ambient`) follows a dispatch that was recorded
+    /// and no other: one skipped because its pipeline failed to build, or is still building, is
+    /// not followed, and nothing of the stand-in reaches the list.
+    #[test]
+    fn a_skipped_dispatch_is_not_followed_by_the_stand_in_for_the_indirect_light() {
+        use super::super::title_gta6_ambient as ambient;
+        let mut orig_vt = [0usize; 64];
+        orig_vt[1] = fake_add_ref as usize;
+        orig_vt[2] = fake_release as usize;
+        orig_vt[14] = fake_dispatch as usize;
+        orig_vt[25] = fake_set_pso as usize;
+        orig_vt[29] = fake_set_compute_rs as usize;
+        orig_vt[41] = fake_set_compute_uav as usize;
+        orig_vt[59] = fake_execute_indirect as usize;
+        let mut ext_vt = vec![0usize; 65];
+        ext_vt[0] = orig_vt.as_ptr() as usize;
+        ext_vt[1..].copy_from_slice(&orig_vt);
+        let fake = Box::new(FakeAdoptedList {
+            vt: unsafe { ext_vt.as_ptr().add(1) },
+            refs: AtomicUsize::new(1),
+            dispatch_calls: AtomicUsize::new(0),
+            set_compute_rs_calls: AtomicUsize::new(0),
+            set_compute_uav_calls: AtomicUsize::new(0),
+            set_pso_calls: AtomicUsize::new(0),
+            execute_indirect_calls: AtomicUsize::new(0),
+        });
+        let list_ptr = &*fake as *const FakeAdoptedList as *mut c_void;
+        let name = b"CS_ScreenProbes_TemporalResolve_a911b49c_Wrapped";
+
+        // a pipeline whose build failed: its dispatch is skipped
+        let failed = 0x7200_0E01usize;
+        pso_async::submit(failed, true, Box::new(|| 0));
+        assert_eq!(pso_async::resolve_wait(failed), failed);
+        ambient::made(failed, name);
+        reset(list_ptr, 0x7200_0100, failed);
+        let before = counts_snapshot();
+        unsafe { dispatch(list_ptr, 160, 90, 1) };
+        let after = counts_snapshot();
+        // (the counts are every list's: other tests skip dispatches at the same time)
+        assert!(after[DISPATCHES_SKIPPED] > before[DISPATCHES_SKIPPED]);
+        assert_eq!(fake.dispatch_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(ambient::followed_for_test(failed), 0, "a dispatch that was not recorded is not followed");
+
+        // a pipeline still building, with nowhere to put its dispatch off to: skipped too
+        let pending = 0x7200_0E02usize;
+        let (finish, gate) = std::sync::mpsc::channel::<()>();
+        let gate = Mutex::new(gate);
+        pso_async::submit(pending, true, Box::new(move || {
+            let _ = gate.lock().unwrap().recv();
+            0
+        }));
+        ambient::made(pending, name);
+        reset(list_ptr, 0x7200_0100, pending);
+        pso_async::SKIP_UNTIL_BUILT.with(|s| s.set(true));
+        let before = counts_snapshot();
+        unsafe { dispatch(list_ptr, 160, 90, 1) };
+        let after = counts_snapshot();
+        pso_async::SKIP_UNTIL_BUILT.with(|s| s.set(false));
+        // (the counts are every list's: other tests skip dispatches at the same time)
+        assert!(after[DISPATCHES_SKIPPED] > before[DISPATCHES_SKIPPED]);
+        assert_eq!(fake.dispatch_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(ambient::followed_for_test(pending), 0, "nor one whose pipeline is still building");
+        finish.send(()).unwrap();
+        assert_eq!(pso_async::resolve_wait(pending), pending);
+
+        // what the recorded dispatch's arm does: the pipeline's role is found and the stand-in asked
+        // (with its switch unset, and no root signature on this list, it records nothing)
+        unsafe { ambient::after_dispatch(list_ptr, failed) };
+        assert_eq!(ambient::followed_for_test(failed), 1);
+        ambient::gone(failed);
+        unsafe { ambient::after_dispatch(list_ptr, failed) };
+        assert_eq!(ambient::followed_for_test(failed), 1, "a released pipeline has no role");
+        assert_eq!(fake.dispatch_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(fake.set_compute_rs_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(fake.set_pso_calls.load(Ordering::Relaxed), 0);
+
+        ambient::gone(pending);
+        forget(list_ptr);
+        let _ = pso_async::released(failed);
+        let _ = pso_async::released(pending);
     }
 
     unsafe extern "system" fn fake_dispatch_mesh(this: *mut c_void, x: u32, y: u32, z: u32) {

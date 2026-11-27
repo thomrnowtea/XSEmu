@@ -7,8 +7,10 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QRegularExpression>
+#include <QSet>
 #include <QtEndian>
 
+#include <algorithm>
 #include <cmath>
 
 namespace SettingsProfile {
@@ -30,10 +32,17 @@ bool isXclKey(const QString& key)
     return false;
 }
 
+bool isList(const QVariant& v)
+{
+    return v.typeId() == QMetaType::QStringList || v.typeId() == QMetaType::QVariantList;
+}
+
 bool same(const QVariant& a, const QVariant& b)
 {
     if (!a.isValid() || !b.isValid())
         return a.isValid() == b.isValid();
+    if (isList(a) || isList(b))
+        return isList(a) && isList(b) && a.toStringList() == b.toStringList();
     if (a.typeId() == QMetaType::QString || b.typeId() == QMetaType::QString)
         return a.toString().compare(b.toString(), Qt::CaseInsensitive) == 0;
     if (a.typeId() == QMetaType::Bool || b.typeId() == QMetaType::Bool)
@@ -64,6 +73,8 @@ QString shown(const QVariant& v)
         return QString::number(v.toDouble(), 'g', 6);
     if (v.typeId() == QMetaType::QString)
         return v.toString().left(40);
+    if (isList(v))
+        return QStringLiteral("a list of %1").arg(v.toList().size());
     return QStringLiteral("a value of the wrong type");
 }
 
@@ -117,8 +128,82 @@ QVariant canonical(const KeySpec& spec, const QVariant& v, QString* why)
             return v.toString();
         *why = QStringLiteral("unknown runner \"%1\"; ignored").arg(shown(v));
         return {};
+    case KeySpec::Kind::RunProfile: {
+        const QVariantList items = isList(v) ? v.toList() : QVariantList();
+        if (!isList(v) || std::any_of(items.cbegin(), items.cend(), [](const QVariant& i) { return i.typeId() != QMetaType::QString; })) {
+            *why = QStringLiteral("must be a list of KEY=VALUE lines");
+            return {};
+        }
+        const LaunchConfig::ProfileParse parsed = LaunchConfig::parseProfile(v.toStringList().join(QLatin1Char('\n')));
+        if (!parsed.ok()) {
+            *why = parsed.errors.first();
+            return {};
+        }
+        return parsed.lines();
+    }
     }
     return {};
+}
+
+QList<QPair<QString, QString>> profileEntries(const QVariant& v)
+{
+    return LaunchConfig::parseProfile(v.toStringList().join(QLatin1Char('\n'))).entries;
+}
+
+// The run profile without its path lines; paths gets their keys.
+QStringList withoutPaths(const QVariant& profile, QStringList* paths = nullptr)
+{
+    QStringList out;
+    for (const auto& [key, value] : profileEntries(profile)) {
+        if (!looksLikePath(value))
+            out << key + QLatin1Char('=') + value;
+        else if (paths)
+            *paths << key;
+    }
+    return out;
+}
+
+// An imported run profile with this PC's own path lines kept where the import doesn't name them.
+QStringList withLocalPaths(const QVariant& imported, const QStringList& current)
+{
+    QStringList out = imported.toStringList();
+    QSet<QString> named;
+    for (const auto& e : profileEntries(imported))
+        named.insert(e.first);
+    for (const auto& [key, value] : profileEntries(current)) {
+        if (looksLikePath(value) && !named.contains(key))
+            out << key + QLatin1Char('=') + value;
+    }
+    return out;
+}
+
+// "changes XCL_LOOP_GUARD, adds XCL_FOO, removes XCL_BAR"
+QString profileChanges(const QVariant& from, const QVariant& to)
+{
+    QHash<QString, QString> before;
+    for (const auto& [key, value] : profileEntries(from))
+        before.insert(key, value);
+    QStringList changed, added;
+    for (const auto& [key, value] : profileEntries(to)) {
+        if (!before.contains(key))
+            added << key;
+        else if (before.take(key) != value)
+            changed << key;
+    }
+    QStringList removed = before.keys();
+    removed.sort();
+    QStringList parts;
+    const auto part = [&parts](const char* verb, const QStringList& keys) {
+        if (keys.isEmpty())
+            return;
+        const QString shownKeys = keys.size() > 3 ? QStringLiteral("%1 and %2 more").arg(keys.mid(0, 3).join(QStringLiteral(", "))).arg(keys.size() - 3)
+                                                  : keys.join(QStringLiteral(", "));
+        parts << QStringLiteral("%1 %2").arg(QLatin1String(verb), shownKeys);
+    };
+    part("changes", changed);
+    part("adds", added);
+    part("removes", removed);
+    return parts.join(QStringLiteral(", "));
 }
 
 QString forbiddenReason(const KeySpec& spec, const QVariant& v)
@@ -132,7 +217,8 @@ QString forbiddenReason(const KeySpec& spec, const QVariant& v)
     return {};
 }
 
-// Settings marks these rows unavailable while the environment sets them (Graphics section).
+// Settings marks these rows unavailable while the environment sets them (Graphics section). The run
+// profile travels with the import, so a variable it sets doesn't refuse the key here.
 QString environmentReason(const QString& key)
 {
     const char* var = key == QLatin1String("display_mode") ? "XCL_DISPLAY_MODE" : key == QLatin1String("raytracing") ? "XCL_RAYTRACING" : nullptr;
@@ -163,6 +249,8 @@ QVariant currentDefault(const AppSettings& st, const KeySpec& spec)
         return st.storeOfflineError() ? QStringLiteral("offline-error") : QStringLiteral("not-available");
     if (k == QLatin1String("crash_dumps"))
         return st.crashDumps();
+    if (k == QLatin1String("run_profile"))
+        return st.runProfile();
     if (isXclKey(k))
         return LaunchConfig::typed(k, st.xclDefault(k));
     return {};
@@ -199,6 +287,8 @@ void writeDefault(AppSettings& st, const QString& k, const QVariant& v)
         st.setStoreOfflineError(v.toString() == QLatin1String("offline-error"));
     else if (k == QLatin1String("crash_dumps"))
         st.setCrashDumps(v.toBool());
+    else if (k == QLatin1String("run_profile"))
+        st.setRunProfile(v.toStringList());
     else if (isXclKey(k))
         st.setXclDefault(k, v);
 }
@@ -283,6 +373,7 @@ const QList<KeySpec>& keys()
         {s("offline"), s("Offline mode"), K::Bool, {}, false, true},
         {s("store"), s("Store behaviour"), K::Choice, {{s("offline-error"), s("Offline error")}, {s("not-available"), s("Not available")}}, false, true},
         {s("crash_dumps"), s("Crash reports"), K::Bool, {}, false, true},
+        {s("run_profile"), s("Run profile"), K::RunProfile, {}, false, true},
     };
     return list;
 }
@@ -322,8 +413,19 @@ QString valueLabel(const QString& key, const QVariant& value)
         return parts.size() > 1 ? QStringLiteral("%1 · %2 Hz").arg(size, parts[1]) : size;
     }
     case KeySpec::Kind::Runner: return Runners::find(v.toString())->name;
+    case KeySpec::Kind::RunProfile: {
+        const qsizetype n = v.toStringList().size();
+        const QString count = n == 1 ? QStringLiteral("1 variable") : QStringLiteral("%1 variables").arg(n);
+        return v.toStringList() == AppSettings::defaultRunProfile() ? QStringLiteral("Defaults, %1").arg(count) : count;
+    }
     }
     return v.toString();
+}
+
+bool looksLikePath(const QString& value)
+{
+    static const QRegularExpression re(QStringLiteral("^(?:[A-Za-z]:[\\\\/]|[\\\\/]|~[\\\\/])"));
+    return re.match(value.trimmed()).hasMatch();
 }
 
 Profile fromGame(const AppSettings& settings, const QString& titleId, const QString& title)
@@ -352,7 +454,9 @@ Profile fromDefaults(const AppSettings& settings)
     for (const KeySpec& spec : keys()) {
         if (!spec.defaults || !spec.unavailable.isEmpty())
             continue;
-        const QVariant v = valid(spec, currentDefault(settings, spec));
+        QVariant v = valid(spec, currentDefault(settings, spec));
+        if (spec.kind == KeySpec::Kind::RunProfile && v.isValid())
+            v = withoutPaths(v);
         if (v.isValid())
             p.values.insert(spec.key, v);
     }
@@ -464,6 +568,14 @@ Parsed parse(const QByteArray& input)
             out.rejected << Note{spec->key, shown(it.value().toVariant()), why};
             continue;
         }
+        if (spec->kind == KeySpec::Kind::RunProfile) {
+            QStringList paths;
+            const QStringList kept = withoutPaths(v, &paths);
+            for (const QString& key : paths)
+                out.rejected << Note{spec->key, key, QStringLiteral("is a path on the PC it came from; left out")};
+            p.values.insert(spec->key, kept);
+            continue;
+        }
         if (const QString reason = forbiddenReason(*spec, v); !reason.isEmpty()) {
             out.forbidden << Note{spec->key, valueLabel(spec->key, v), reason};
             out.forbiddenValues.insert(spec->key, v);
@@ -501,8 +613,12 @@ QList<Line> preview(const Parsed& parsed, const AppSettings& settings, Target ta
         l.label = spec.label;
         l.value = allowed ? parsed.profile.values.value(spec.key) : parsed.forbiddenValues.value(spec.key);
         const QVariant current = valid(spec, target == Target::Game ? currentForGame(settings, titleId, spec) : currentDefault(settings, spec));
+        if (spec.kind == KeySpec::Kind::RunProfile)
+            l.value = withLocalPaths(l.value, current.toStringList());
         l.from = valueLabel(spec.key, current);
         l.to = valueLabel(spec.key, l.value);
+        if (spec.kind == KeySpec::Kind::RunProfile && target == Target::Defaults && !same(current, l.value))
+            l.to = QStringLiteral("%1 (%2)").arg(l.to, profileChanges(current, l.value));
         if (!allowed) {
             for (const Note& n : parsed.forbidden) {
                 if (n.key == spec.key)

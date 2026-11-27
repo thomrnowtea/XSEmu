@@ -139,6 +139,7 @@ QString stateSentence(const QString& name, TitleShaderState st)
     case TitleShaderState::NeverWarmed: return QStringLiteral("%1 has never been warmed up").arg(name);
     case TitleShaderState::LastRunIncomplete: return QStringLiteral("%1's last warm-up stopped part way").arg(name);
     case TitleShaderState::LastRunFailed: return QStringLiteral("%1's last warm-up failed").arg(name);
+    case TitleShaderState::ProfileChanged: return QStringLiteral("%1's run profile changed since its last warm-up").arg(name);
     case TitleShaderState::Unknown: break;
     }
     return {};
@@ -257,6 +258,8 @@ WarmupPage::WarmupPage(Services& services, QWidget* parent)
         if (key == QLatin1String(AppSettings::Key::RecentWarmups)) {
             refreshRuns();
             refresh();
+        } else if (key == QLatin1String(AppSettings::Key::RunProfile) || key == QLatin1String(AppSettings::Key::GameOverrides)) {
+            refresh();
         }
     });
     refreshGames();
@@ -317,6 +320,22 @@ void WarmupPage::refresh()
     if (runner && runner->isBuiltIn())
         runner = nullptr;
 
+    // XSEmu's own warm-up turned off: one line instead of its buttons, banner and states
+    if (!runner && !active && !m_s.settings.xsemuWarmup()) {
+        m_start->hide();
+        m_banner->hide();
+        for (Button* b : {m_warm, m_play, m_resume, m_log, m_showLog, m_dismiss, m_cancel})
+            b->hide();
+        m_block->setVisible(true);
+        m_block->setState(ProgressBlock::State::Idle);
+        m_block->setFraction(-1);
+        m_block->setColumns({});
+        m_block->setTitle(cannot);
+        m_block->setSubtitle({});
+        m_block->setNote({});
+        return;
+    }
+    m_start->show();
     m_start->setEnabled(cannot.isEmpty() && !active);
     m_start->setText(active ? (pr.runnerId.isEmpty() ? QStringLiteral("Warming up...") : QStringLiteral("Pre-caching..."))
                             : (runner ? QStringLiteral("Start pre-cache") : QStringLiteral("Start warm-up")));
@@ -493,7 +512,7 @@ void WarmupPage::refresh()
     m_block->setState(ProgressBlock::State::Idle);
     m_block->setFraction(0);
     m_block->setColumns({});
-    const TitleShaderState pickedState = picked.isValid() ? titleShaderState(picked.titleId(), recent, cache) : TitleShaderState::Unknown;
+    const TitleShaderState pickedState = picked.isValid() ? shownShaderState(m_s.settings, picked.titleId(), recent, cache) : TitleShaderState::Unknown;
     switch (pickedState) {
     case TitleShaderState::Ready:
         m_block->setTitle(QStringLiteral("%1 is warmed up").arg(pickedName));
@@ -503,6 +522,9 @@ void WarmupPage::refresh()
         break;
     case TitleShaderState::LastRunFailed:
         m_block->setTitle(QStringLiteral("%1's last warm-up failed").arg(pickedName));
+        break;
+    case TitleShaderState::ProfileChanged:
+        m_block->setTitle(QStringLiteral("%1's run profile changed since its last warm-up").arg(pickedName));
         break;
     case TitleShaderState::NeverWarmed:
     case TitleShaderState::Unknown:
@@ -538,7 +560,7 @@ void WarmupPage::refresh()
     for (const Game& g : m_s.library.games()) {
         if (g.titleId() == picked.titleId() || others.size() >= 3)
             continue;
-        const QString s = stateSentence(g.title(), titleShaderState(g.titleId(), recent, cache));
+        const QString s = stateSentence(g.title(), shownShaderState(m_s.settings, g.titleId(), recent, cache));
         if (!s.isEmpty())
             others << s;
     }

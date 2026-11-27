@@ -315,6 +315,11 @@ unsafe fn clone_resources(ptrs: &[usize]) -> Vec<ID3D12Resource> {
 
 /// PC texture → its place in the title's memory
 static TEXTURES: Mutex<Table> = Mutex::new(Table::new());
+
+/// (address in the title's memory, bytes) of each texture kept in step, for `memdiag`.
+pub(super) fn diag_ranges() -> Vec<(usize, usize)> {
+    TEXTURES.lock().unwrap_or_else(|e| e.into_inner()).by_res.values().map(|e| (e.va, e.tex.size() as usize)).collect()
+}
 // The dirty-page scan consumes write-watch state for every submission thread.
 // Keep the scan, pending-list update and GPU uploads together.
 pub(super) static REFRESH: Mutex<()> = Mutex::new(());
@@ -453,6 +458,23 @@ unsafe fn track(device: *mut c_void, res: *mut c_void, va: usize, tex: xg::Textu
         }
     }
     let in_gpu_view = crate::hle::kernelx::mirrors::source(va).is_some();
+    let placed = super::vram::is_placed_texture(res as usize);
+    // (one memory) a sampled texture that stands tile for tile on a GPU-written one, with no
+    // byte in the title's memory: what it shows is what the GPU wrote there (an R9G9B9E5 view
+    // of a buffer a compute pass writes as R32_UINT). It is the GPU's from the start – an
+    // upload of the title's zeros went over those tiles – and is kept with that texture
+    // (`vram::keep_with`). `XCL_TEXTURE_ONE_MEMORY=0`: uploaded, as before.
+    let gpus = placed && super::texture_alias::one_memory()
+        && super::vram::gpu_target_on_tiles(res as usize).is_some_and(|by| {
+            with_title_bytes(src, tex.size() as usize, |bytes| starts_as_gpus(true, bytes)) && super::vram::keep_with(by, res as usize)
+        });
+    if gpus {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 4 || n.is_power_of_two() {
+            crate::xlog_info!("D3D12.X: one memory: a sampled texture at {va:#x} ({} bytes) stands on the tiles of a GPU-written one and the title's memory there is zero: not uploaded ({n} so far)", tex.size());
+        }
+    }
     let e = Entry {
         device: device as usize,
         va,
@@ -460,9 +482,9 @@ unsafe fn track(device: *mut c_void, res: *mut c_void, va: usize, tex: xg::Textu
         in_gpu_view,
         tex: Arc::new(tex),
         states: vec![state],
-        pending: true,
-        gpu_written: false,
-        placed: super::vram::is_placed_texture(res as usize),
+        pending: !gpus,
+        gpu_written: gpus,
+        placed,
         unmapped: false,
         seq: 0,
     };
@@ -480,6 +502,15 @@ unsafe fn track(device: *mut c_void, res: *mut c_void, va: usize, tex: xg::Textu
         super::vram::unmap_superseded(r);
     }
     TEXTURES_GEN.fetch_add(1, Ordering::Release);
+}
+
+/// (one memory) Whether a sampled texture starts as the GPU's – never uploaded from the
+/// title's memory: it stands tile for tile on a mapped GPU-written texture at its address
+/// (`on_gpu_tiles`) and the title's memory under it (`title_bytes`) has no byte that is not
+/// zero. With a byte there the CPU filled it – a texture streamed into memory a target was
+/// in – and it is uploaded like any other.
+fn starts_as_gpus(on_gpu_tiles: bool, title_bytes: &[u8]) -> bool {
+    on_gpu_tiles && !super::vram::any_nonzero(title_bytes)
 }
 
 /// Where a texture at `va` is read from: the CPU view behind a GPU view (`kernelx::mirrors`)
@@ -581,20 +612,29 @@ pub fn overlapping(va: usize, len: usize) -> Vec<(usize, usize)> {
     TEXTURES.lock().unwrap().overlapping(va, len)
 }
 
-/// A GPU-owned placement (render target / depth / UAV) now occupies `[va, va + len)`: retire
-/// superseded sampled textures there so CPU dirty scans do not upload over the shared tiles and
-/// any unshared extra tiles return to the pool.
-pub(super) unsafe fn retire_overlapping(va: usize, len: usize) {
+/// A GPU-owned placement (render target / depth / UAV), `by`, now occupies `[va, va + len)`:
+/// retire superseded sampled textures there so CPU dirty scans do not upload over the shared
+/// tiles and any unshared extra tiles return to the pool. One that stands tile for tile on
+/// `by`'s pages (`vram::keep_with`: the title's view of that memory in a format of its size,
+/// made before the target was placed again) has no tile of its own and stays mapped: unmapped
+/// it read as zero from then on, and `real::resource_at` hands the same texture out for every
+/// later view of that address. It is unmapped when `by`'s pages are released and no other
+/// target is on them (`XCL_TEXTURE_ALIAS=0` and `XCL_TEXTURE_ONE_MEMORY=0`: unmapped here, as
+/// before).
+pub(super) unsafe fn retire_overlapping(va: usize, len: usize, by: usize) {
     if !any() || len == 0 {
         return;
     }
-    let (retired, to_unmap) = {
+    let (retired, mut to_unmap) = {
         let mut t = TEXTURES.lock().unwrap();
         let (delta, retired, unmap_ptrs) = t.retire_range(va, va.saturating_add(len));
         adjust_pending(delta);
         TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
         (retired, clone_resources(&unmap_ptrs))
     };
+    if super::texture_alias::enabled() || super::texture_alias::one_memory() {
+        to_unmap.retain(|r| !super::vram::keep_with(by, r.as_raw() as usize));
+    }
     for r in &to_unmap {
         super::vram::unmap_superseded(r);
     }
@@ -1297,8 +1337,20 @@ unsafe fn subresources_on(picked: &[(usize, &xg::Texture)], threads: usize) -> V
     out
 }
 
+/// A thread's scratch for `with_title_bytes`, counted in `memdiag::TITLE_SCRATCH` while it holds
+/// memory.
+struct Scratch(Vec<u8>);
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        if self.0.capacity() > 0 {
+            crate::memdiag::TITLE_SCRATCH.sub(self.0.capacity() as u64);
+        }
+    }
+}
+
 thread_local! {
-    static TITLE_BYTES: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    static TITLE_BYTES: std::cell::RefCell<Scratch> = const { std::cell::RefCell::new(Scratch(Vec::new())) };
 }
 
 /// `f` with the title's `len` bytes at `at` as a copy of XCL's own, read so that memory the
@@ -1310,11 +1362,17 @@ pub(crate) unsafe fn with_title_bytes<R>(at: usize, len: usize, f: impl FnOnce(&
     const MAX_RETAINED_BYTES: usize = 32 << 20;
     TITLE_BYTES.with(|scratch| {
         if len <= MAX_RETAINED_BYTES {
-            if let Ok(mut bytes) = scratch.try_borrow_mut() {
+            if let Ok(mut scratch) = scratch.try_borrow_mut() {
+                let bytes = &mut scratch.0;
                 if bytes.len() < len {
+                    let was = bytes.capacity();
                     let additional = len - bytes.len();
                     bytes.reserve_exact(additional);
                     bytes.resize(len, 0);
+                    if was > 0 {
+                        crate::memdiag::TITLE_SCRATCH.sub(was as u64);
+                    }
+                    crate::memdiag::TITLE_SCRATCH.add(bytes.capacity() as u64);
                 }
                 copy_title(at, &mut bytes[..len]);
                 return f(&bytes[..len]);
@@ -2062,6 +2120,35 @@ mod tests {
         assert!(tbl.by_res.contains_key(&10) && tbl.by_res.contains_key(&11));
         assert_eq!(tbl.insert(12, entry(0x20_0000, &tex_64k, true, false)), (-1, vec![]));
         assert!(!tbl.by_res.contains_key(&10) && !tbl.by_res.contains_key(&11) && tbl.by_res.contains_key(&12));
+    }
+
+    /// (one memory) A sampled texture on the tiles of a GPU-written one starts as the GPU's
+    /// only while the title's memory under it is zero, and such an entry is never pending: no
+    /// upload goes over what the GPU wrote, at its registration or at a later submit.
+    #[test]
+    fn a_sampled_texture_on_gpu_tiles_is_not_uploaded_while_its_memory_is_zero() {
+        let zeros = vec![0u8; 3 * 4096];
+        let mut texels = zeros.clone();
+        texels[2 * 4096 + 17] = 1;
+        assert!(starts_as_gpus(true, &zeros) && starts_as_gpus(true, &[]));
+        assert!(!starts_as_gpus(true, &texels), "the CPU filled it: uploaded");
+        assert!(!starts_as_gpus(false, &zeros), "on tiles of its own: uploaded (zeros read as zeros)");
+        // the entry `track` then makes: GPU-written and not pending – the upload scan passes
+        // over it (`pending` or a written page of one that is not GPU-written)
+        let tex = Arc::new(xg::Texture::new(&console_desc(3, 128, 128, 1, 1, 28, 0x105)).unwrap());
+        let entry = |gpus: bool| Entry {
+            device: 0, va: 0x30_4000, src: 0x30_4000, in_gpu_view: false, tex: Arc::clone(&tex), states: vec![D3D12_RESOURCE_STATE_COMMON],
+            pending: !gpus, gpu_written: gpus, placed: true, unmapped: false, seq: 0,
+        };
+        let mut tbl = Table::new();
+        assert_eq!(tbl.insert(1, entry(true)), (0, vec![]));
+        assert!(tbl.by_res[&1].gpu_written && !tbl.by_res[&1].pending);
+        assert_eq!(tbl.insert(2, entry(false)).0, 1, "one that starts as the CPU's is pending");
+        // a target placed over both retires them: neither is uploaded from then on
+        let (delta, retired, mut unmap) = tbl.retire_range(0x30_4000, 0x31_4000);
+        unmap.sort_unstable();
+        assert_eq!((delta, retired, unmap), (-1, 2, vec![1, 2]));
+        assert!(tbl.by_res.is_empty() && tbl.shadowed.is_empty());
     }
 
     /// Real GPU (#248): placed title textures share `vram::Pages` so streaming unreleased

@@ -4,7 +4,6 @@ mod ownership;
 mod tests;
 
 use super::{console_heap, physical_import};
-use console_heap::Owner;
 use crate::hle::kernelx::PhysicalPageRef;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -17,10 +16,10 @@ pub(super) use ownership::Plane;
 const LEAF_WORDS: usize = 65536;
 const ROOT_WORDS: usize = 2 * 65536;
 
-struct Descriptor(u32, Owner);
+struct Descriptor(u32, console_heap::Holder);
 impl Drop for Descriptor {
     fn drop(&mut self) {
-        console_heap::release_range(self.1, self.0, 1);
+        console_heap::release_held(self.0, 1, self.1);
     }
 }
 
@@ -30,8 +29,17 @@ struct ReadBuffer {
     _placed: crate::gpu::rebar::Placed,
 }
 
+/// A raw view of physical pages: of one page's own buffer, or of the buffer over a whole
+/// imported run, which every bound page of the run shares.
+struct RawView {
+    descriptor: Descriptor,
+    _run: Option<physical_import::ImportedRun>,
+}
+
 pub(super) struct PageBinding {
-    view: Descriptor,
+    view: Arc<RawView>,
+    /// the page's bytes into the view
+    offset: usize,
     run: Arc<physical_import::ImportedPage>,
     page: PhysicalPageRef,
 }
@@ -44,7 +52,8 @@ impl PageBinding {
         self.run.resource()
     }
     pub(super) fn value(&self) -> u32 {
-        ownership::mapped_pte(self.view.0, 0).expect("validated page descriptor")
+        ownership::mapped_pte(self.view.descriptor.0, self.offset)
+            .expect("validated page descriptor")
     }
 }
 
@@ -108,6 +117,8 @@ struct Backend {
     dev: ID3D12Device,
     head: Mutex<Arc<Topology>>,
     imports: Mutex<HashMap<usize, Weak<PageBinding>>>,
+    /// each imported run's view, while a page of the run is bound
+    runs: Mutex<HashMap<usize, Weak<RawView>>>,
 }
 
 static BACKEND: OnceLock<Backend> = OnceLock::new();
@@ -159,11 +170,11 @@ unsafe fn view(
     device: &ID3D12Device,
     resource: ID3D12Resource,
     placed: crate::gpu::rebar::Placed,
-    owner: Owner,
+    holder: console_heap::Holder,
 ) -> Option<ReadBuffer> {
     let words = u32::try_from(resource.GetDesc().Width / 4).ok()?;
-    let (index, cpu, _) = console_heap::reserve_own_as(owner, 1)?;
-    let guard = Descriptor(index, owner);
+    let (index, cpu) = console_heap::reserve_single(holder)?;
+    let guard = Descriptor(index, holder);
     if index == 0 || index >= 1 << 20 {
         return None;
     }
@@ -193,7 +204,11 @@ struct PrivateUpload {
     words: usize,
 }
 impl PrivateUpload {
-    unsafe fn reserve(device: &ID3D12Device, words: usize) -> Option<Self> {
+    unsafe fn reserve(
+        device: &ID3D12Device,
+        words: usize,
+        holder: console_heap::Holder,
+    ) -> Option<Self> {
         // a root or a leaf: written once here, then only read, by every translated shader
         // that takes an address through the directory
         let (resource, placed) = crate::gpu::rebar::upload_buffer(
@@ -202,7 +217,7 @@ impl PrivateUpload {
             crate::gpu::rebar::Class::Directory,
         )
         .ok()?;
-        let b = view(device, resource, placed, Owner::DirectoryTable)?;
+        let b = view(device, resource, placed, holder)?;
         let mut p = std::ptr::null_mut();
         b.resource
             .Map(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }), Some(&mut p))
@@ -244,7 +259,8 @@ pub(super) unsafe fn init(device: &ID3D12Device) -> bool {
     if !console_heap::shared_heap(device) {
         return false;
     }
-    let Some(root) = PrivateUpload::reserve(device, ROOT_WORDS) else {
+    let Some(root) = PrivateUpload::reserve(device, ROOT_WORDS, console_heap::Holder::Roots)
+    else {
         return false;
     };
     let _ = BACKEND.set(Backend {
@@ -254,6 +270,7 @@ pub(super) unsafe fn init(device: &ID3D12Device) -> bool {
             leaves: BTreeMap::new(),
         })),
         imports: Default::default(),
+        runs: Default::default(),
     });
     BACKEND
         .get()
@@ -274,41 +291,102 @@ pub(super) fn bind(page: &PhysicalPageRef) -> Result<Arc<PageBinding>, &'static 
         return Ok(p);
     }
     let run = physical_import::resolve_page(&b.dev, page).ok_or("physical section not imported")?;
-    let (index, cpu, _) =
-        console_heap::reserve_own_as(Owner::DirectoryPage, 1).ok_or("physical descriptor space exhausted")?;
-    let guard = Descriptor(index, Owner::DirectoryPage);
+    let bound = |view: Arc<RawView>, offset: usize| {
+        let bound = Arc::new(PageBinding {
+            view,
+            offset,
+            run: Arc::clone(&run),
+            page: page.clone(),
+        });
+        crate::gpu::physical_binding::BindingIndex::shared().remember(
+            bound.view.descriptor.0,
+            offset as u32,
+            crate::gpu::physical_binding::PageKey::Physical(page.id() as u64),
+            &bound,
+        )?;
+        Ok::<_, &'static str>(bound)
+    };
+    let shared = if run_views() {
+        run_view(b, &run).and_then(|(view, offset)| bound(view, offset).ok())
+    } else {
+        None
+    };
+    let bound = match shared {
+        Some(bound) => bound,
+        None => {
+            let descriptor = unsafe { raw_view(&b.dev, run.resource(), 65536) }?;
+            let own = RawView {
+                descriptor,
+                _run: None,
+            };
+            bound(Arc::new(own), 0)?
+        }
+    };
+    g.insert(page.id(), Arc::downgrade(&bound));
+    if g.len().is_power_of_two() {
+        g.retain(|_, w| w.strong_count() != 0);
+    }
+    Ok(bound)
+}
+
+/// The bound pages of an imported run (8 MiB at most) share one raw view of the run's buffer,
+/// each named by the view's index and its page in the view (`ownership::mapped_pte`), where a
+/// view of its own for every 64 KiB page took a descriptor of the shared heap each
+/// (`XCL_DESCRIPTOR_SEGMENT_VIEWS=0`: a view per page, as before).
+fn run_views() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_DESCRIPTOR_SEGMENT_VIEWS").map_or(true, |v| v != "0"))
+}
+
+/// A raw view of the first `bytes` of `resource` in a single descriptor of the shared heap.
+unsafe fn raw_view(
+    device: &ID3D12Device,
+    resource: &ID3D12Resource,
+    bytes: usize,
+) -> Result<Descriptor, &'static str> {
+    let words = u32::try_from(bytes / 4).map_err(|_| "physical view too large")?;
+    let (index, cpu) = console_heap::reserve_single(console_heap::Holder::Pages)
+        .ok_or("physical descriptor space exhausted")?;
+    let guard = Descriptor(index, console_heap::Holder::Pages);
     ownership::mapped_pte(index, 0).ok_or("descriptor index not encodable")?;
     let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
         Format: DXGI_FORMAT_R32_TYPELESS,
         ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
         Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
             Buffer: D3D12_BUFFER_UAV {
-                NumElements: 16384,
+                NumElements: words,
                 Flags: D3D12_BUFFER_UAV_FLAG_RAW,
                 ..Default::default()
             },
         },
     };
-    unsafe {
-        b.dev
-            .CreateUnorderedAccessView(run.resource(), None, Some(&desc), cpu);
+    device.CreateUnorderedAccessView(resource, None, Some(&desc), cpu);
+    Ok(guard)
+}
+
+/// The view of the run `page` is in, made if no bound page of the run has one, and the page's
+/// bytes into it. None: the run has no buffer, the page is not encodable in it, or no
+/// descriptor is left: the page then gets a view of its own.
+fn run_view(b: &Backend, page: &physical_import::ImportedPage) -> Option<(Arc<RawView>, usize)> {
+    let (run, offset) = physical_import::resolve_run(&b.dev, page)?;
+    ownership::mapped_pte(1, offset)?;
+    let mut runs = b.runs.lock().unwrap();
+    if let Some(view) = runs.get(&run.id()).and_then(Weak::upgrade) {
+        return Some((view, offset));
     }
-    let bound = Arc::new(PageBinding {
-        view: guard,
-        run,
-        page: page.clone(),
+    let descriptor = unsafe { raw_view(&b.dev, run.resource(), run.len()) }.ok()?;
+    let id = run.id();
+    let view = Arc::new(RawView {
+        descriptor,
+        _run: Some(run),
     });
-    crate::gpu::physical_binding::BindingIndex::shared().remember(
-        index,
-        0,
-        crate::gpu::physical_binding::PageKey::Physical(page.id() as u64),
-        &bound,
-    )?;
-    g.insert(page.id(), Arc::downgrade(&bound));
-    if g.len().is_power_of_two() {
-        g.retain(|_, w| w.strong_count() != 0);
+    runs.insert(id, Arc::downgrade(&view));
+    if runs.len().is_power_of_two() {
+        runs.retain(|_, w| w.strong_count() != 0);
     }
-    Ok(bound)
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| crate::xlog_info!("D3D12.X: physical directory: the bound pages of an imported run share one raw view (128 pages at most), a page table entry names the view and the page in it (XCL_DESCRIPTOR_SEGMENT_VIEWS=0: a view for every 64 KiB page)"));
+    Some((view, offset))
 }
 
 static PENDING: Mutex<BTreeMap<u32, u32>> = Mutex::new(BTreeMap::new());
@@ -410,8 +488,10 @@ pub(super) fn prepare_version(changes: Vec<Change>) -> Result<PreparedVersion, &
         let leaf = match changed.entry(((key.vpn >> 16) as u16, key.plane)) {
             std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::btree_map::Entry::Vacant(e) => {
-                let upload = unsafe { PrivateUpload::reserve(&b.dev, LEAF_WORDS) }
-                    .ok_or("cannot reserve immutable leaf")?;
+                let upload = unsafe {
+                    PrivateUpload::reserve(&b.dev, LEAF_WORDS, console_heap::Holder::Leaves)
+                }
+                .ok_or("cannot reserve immutable leaf")?;
                 e.insert(PreparedLeaf {
                     upload,
                     changes: BTreeMap::new(),
@@ -421,8 +501,9 @@ pub(super) fn prepare_version(changes: Vec<Change>) -> Result<PreparedVersion, &
         pages.push(key.vpn);
         leaf.changes.insert(key.vpn as u16, change.target);
     }
-    let root = unsafe { PrivateUpload::reserve(&b.dev, ROOT_WORDS) }
-        .ok_or("cannot reserve immutable root")?;
+    let root =
+        unsafe { PrivateUpload::reserve(&b.dev, ROOT_WORDS, console_heap::Holder::Roots) }
+            .ok_or("cannot reserve immutable root")?;
     Ok(PreparedVersion {
         backend: b,
         root,
@@ -480,5 +561,18 @@ impl PreparedVersion {
         *head = Arc::new(Topology { root, leaves });
         drop(head);
         drop(pending);
+    }
+}
+
+impl Topology {
+    /// (diagnostics, `memdiag`) Each GPU page this version maps to a page: its address and the
+    /// page's binding.
+    pub(super) fn diag_bound(&self) -> impl Iterator<Item = (u64, &PageBinding)> + '_ {
+        self.leaves.iter().flat_map(|(&(hi, _), leaf)| {
+            leaf.pages.iter().filter_map(move |(&page, m)| match m {
+                Mapping::Page(b) => Some(((u64::from(hi) << 32) | (u64::from(page) << 16), &**b)),
+                _ => None,
+            })
+        })
     }
 }

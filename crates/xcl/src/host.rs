@@ -76,9 +76,6 @@ pub fn host_main(boot_path: &Path) -> i32 {
             let mut last = snap();
             for tick in 1u64.. {
                 std::thread::sleep(std::time::Duration::from_secs(2));
-                if tick % 5 == 0 {
-                    crate::hle::d3d12x::console_heap::log_occupancy();
-                }
                 if tick % 15 == 0 {
                     let (live, idle, again) = crate::hle::d3d12x::pso_async::live();
                     crate::xlog_info!(
@@ -100,6 +97,9 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     "activity (2 s): {} presents ({} dropped as older than the frame shown), {} submits, {} draws, {} dispatches, {} indirect calls refused as reading unwritten arguments, {} frame-event waits ({} timed out), {} frame statistics ({} not flipped); DirectStorage {} requests, {} MB, {} failed, {} entries waiting for Submit",
                     d[0], d[11], d[1], d[2], d[3], d[12], d[4], d[5], d[6], d[7], d[8], d[9], d[10], crate::hle::dstorage::waiting_for_submit()
                 );
+                if let Some(refused) = crate::hle::d3d12x::bind::indirect_refusal_detail() {
+                    crate::xlog_info!("indirect calls refused (2 s), by what they wait for: {refused}");
+                }
                 // where the memory is: the process's commit, video memory, and XCL's parts of it
                 let private = crate::util::process_commit_bytes();
                 let (local, non_local) = crate::hle::d3d12x::real::video_memory().unwrap_or((0, 0));
@@ -134,6 +134,9 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     pool.1 >> 20,
                     mb(other_non_local)
                 );
+                if let Some(aliases) = crate::hle::d3d12x::texture_alias::summary() {
+                    crate::xlog_info!("{aliases}");
+                }
                 last = now;
             }
         });
@@ -150,19 +153,6 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 }
                 crate::eh::dump_threads();
             }
-        });
-    }
-    // `XCL_RUN_SECONDS=n`: the title ends itself after n seconds – the GPU drained, the log and
-    // report written (a process killed from outside with GPU work in flight can hang in the driver)
-    if let Some(secs) = std::env::var("XCL_RUN_SECONDS").ok().and_then(|v| v.parse::<u64>().ok()) {
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_secs(secs));
-            let (shown, presented) = crate::hle::d3d12x::present::counters();
-            crate::xlog_info!("XCL_RUN_SECONDS: {secs} s – ending the title ({shown} frames shown, {presented} PresentX calls)");
-            crate::hle::d3d12x::present::flush_frame_dumps();
-            crate::report::write_final(None);
-            crate::log::flush();
-            crate::hle::d3d12x::real::end_title(0);
         });
     }
     crate::stubs::init_db(&boot.config.stub_returns);
@@ -198,7 +188,24 @@ pub fn host_main(boot_path: &Path) -> i32 {
     }
     crate::eh::install_crash_handler();
     crate::eh::start_probes();
+    // the D3D12 device before any title code runs: only now may the coherent window become a
+    // driver heap at its address (`hle::d3d12x::uma_driver`)
+    crate::hle::d3d12x::backend_before_guest();
     HOST_MODE.store(true, Ordering::Release);
+
+    // `XCL_RUN_SECONDS=n`: the title ends itself after n seconds – the GPU drained, the log and
+    // report written (a process killed from outside with GPU work in flight can hang in the driver)
+    if let Some(secs) = std::env::var("XCL_RUN_SECONDS").ok().and_then(|v| v.parse::<u64>().ok()) {
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+            let (shown, presented) = crate::hle::d3d12x::present::counters();
+            crate::xlog_info!("XCL_RUN_SECONDS: {secs} s – ending the title ({shown} frames shown, {presented} PresentX calls)");
+            crate::hle::d3d12x::present::flush_frame_dumps();
+            crate::report::write_final(None);
+            crate::log::flush();
+            crate::hle::d3d12x::real::end_title(0);
+        });
+    }
 
     let main = match crate::loader::load_main(&boot.exe_path) {
         Ok(m) => m,
@@ -269,6 +276,8 @@ fn commit_breakdown() -> String {
             continue;
         }
         match m.Type {
+            // (the coherent window as a driver heap, `uma_driver`, is a mapping)
+            MEM_MAPPED if uma.is_some_and(|u| u.is_committed(base)) => unified += size,
             MEM_MAPPED => mapped += size,
             MEM_IMAGE => image += size,
             MEM_PRIVATE if uma.is_some_and(|u| u.is_sparse(base)) => sparse += size,

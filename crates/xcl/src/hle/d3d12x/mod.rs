@@ -40,7 +40,10 @@ pub mod null;
 pub mod page_mappings;
 pub mod present;
 pub mod present_order;
+pub(crate) mod texture_alias;
 pub mod pso_async;
+mod pass_chain;
+mod fsr4_standin;
 mod pso_canon;
 mod pso_library;
 pub mod pso_manifest;
@@ -60,13 +63,18 @@ pub(crate) fn placed_buffers_over(va: usize, len: usize) -> Vec<String> {
 }
 pub mod raytracing;
 pub mod title_gta6;
+mod title_gta6_ambient;
 pub mod title_list;
 pub mod title_textures;
+mod uma_driver;
 pub(crate) mod image_writeback;
 pub mod vram;
 mod wait_trace;
 mod live_status;
 pub mod console_status;
+mod submit_watch;
+mod shader_code;
+mod target_dump;
 
 use std::ffi::c_void;
 use std::sync::OnceLock;
@@ -106,17 +114,19 @@ pub enum Backend {
 }
 
 /// Decided once: the real backend unless disabled or the driver refuses.
-pub fn backend() -> Backend {
-    static B: OnceLock<Backend> = OnceLock::new();
-    *B.get_or_init(|| {
+static BACKEND: OnceLock<Backend> = OnceLock::new();
+
+fn backend_with_remap(allow_driver_remap: bool) -> Backend {
+    *BACKEND.get_or_init(|| {
         let cfg = crate::state::config();
         if cfg.graphics.eq_ignore_ascii_case("null") {
             crate::xlog_info!("D3D12.X: backend 'null' (from the config)");
             return Backend::Null;
         }
-        match real::init() {
+        match real::init_with_remap(allow_driver_remap) {
             Ok(desc) => {
                 crate::xlog_info!("D3D12.X: backend 'real' – {desc}");
+                pso_async::defer_to_submit();
                 Backend::Real
             }
             Err(e) => {
@@ -125,6 +135,16 @@ pub fn backend() -> Backend {
             }
         }
     })
+}
+
+pub fn backend() -> Backend {
+    backend_with_remap(false)
+}
+
+/// `backend` decided before any title code runs: only then may the coherent window become a
+/// driver heap (`uma_driver`) – nothing of the title is in it and none of its threads use it.
+pub(crate) fn backend_before_guest() -> Backend {
+    backend_with_remap(true)
 }
 
 /// Call a function of the system d3d12.dll by name.

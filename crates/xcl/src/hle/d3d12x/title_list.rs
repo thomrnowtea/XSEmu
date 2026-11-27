@@ -44,6 +44,10 @@ const F_RING_AT: usize = 0x2100;
 const RING: usize = 64;
 /// Maximum number of mid-list split segments per command list recording.
 const MAX_EXTRA_SEGMENTS: usize = 32;
+/// Most calls put off to the submit per command list recording (`list_x::defer`), each with two
+/// segments of its own besides those: a list making thousands of them ran a retail title out of
+/// command list memory upstream (Close: E_OUTOFMEMORY, then the device was removed).
+const MAX_DEFERRED: usize = 32;
 
 #[derive(Default)]
 struct SegmentBook {
@@ -51,6 +55,28 @@ struct SegmentBook {
     extra_active: Vec<usize>,
     /// Closed extra PC command lists from earlier recordings, kept for reuse on future splits.
     spares: Vec<usize>,
+    /// calls put off to the submit in this recording (`push_segment`)
+    deferred: usize,
+    /// the segments of those calls (`push_segment`), in `extra_active` too
+    put_off: Vec<usize>,
+    /// Closed segments of calls put off to the submit in earlier recordings, kept for the next ones
+    /// only (`pop_put_off_spare`): each was made with no recording or last recorded at a submit
+    /// that ran it (`list_x::record_put_off`), so the submit's Reset never drops a recording that
+    /// did not run. A split's segment may hold one the title never submitted.
+    put_off_spares: Vec<usize>,
+}
+
+impl SegmentBook {
+    /// The segments of this recording go back to their spare pools.
+    fn retire(&mut self) -> Vec<usize> {
+        let old = std::mem::take(&mut self.extra_active);
+        let put_off = std::mem::take(&mut self.put_off);
+        for &seg in &old {
+            if put_off.contains(&seg) { &mut self.put_off_spares } else { &mut self.spares }.push(seg);
+        }
+        self.deferred = 0;
+        old
+    }
 }
 
 /// Wrapper address -> split segment book (populated lazily only for lists that split).
@@ -201,11 +227,7 @@ unsafe extern "system" fn reset(this: *mut c_void, alloc: usize, pso: usize) -> 
             let mut sg = SEGMENTS.lock().unwrap();
             sg.as_mut()
                 .and_then(|m| m.get_mut(&(this as usize)))
-                .map(|b| {
-                    let old = std::mem::take(&mut b.extra_active);
-                    b.spares.extend(old.iter().copied());
-                    old
-                })
+                .map(SegmentBook::retire)
                 .unwrap_or_default()
         };
         if !moved.is_empty() {
@@ -293,7 +315,36 @@ pub(super) fn can_split(wrapper: *mut c_void) -> bool {
     let sg = SEGMENTS.lock().unwrap();
     sg.as_ref()
         .and_then(|m| m.get(&(wrapper as usize)))
-        .is_none_or(|b| b.extra_active.len() < MAX_EXTRA_SEGMENTS)
+        .is_none_or(|b| b.extra_active.len().saturating_sub(2 * b.deferred) < MAX_EXTRA_SEGMENTS)
+}
+
+/// Whether `wrapper` may put another call off to the submit in this recording (`MAX_DEFERRED`).
+pub(super) fn can_defer(wrapper: *mut c_void) -> bool {
+    let sg = SEGMENTS.lock().unwrap();
+    sg.as_ref().and_then(|m| m.get(&(wrapper as usize))).is_none_or(|b| b.deferred < MAX_DEFERRED)
+}
+
+/// Add the closed segment `pc` of a call put off to the submit to `wrapper`'s recording, after
+/// the ones it has (the segment the recording goes on in comes after it: `activate_segment`).
+pub(super) fn push_segment(wrapper: *mut c_void, pc: *mut c_void) {
+    let mut sg = SEGMENTS.lock().unwrap();
+    let b = sg.get_or_insert_with(HashMap::new).entry(wrapper as usize).or_default();
+    b.extra_active.push(pc as usize);
+    b.put_off.push(pc as usize);
+    b.deferred += 1;
+}
+
+/// Return the segment `pc` of a call put off to the submit to `wrapper`'s put-off spares (a
+/// split that did not happen; nothing was recorded in it).
+pub(super) fn put_off_spare(wrapper: *mut c_void, pc: *mut c_void) {
+    SEGMENTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(wrapper as usize).or_default().put_off_spares.push(pc as usize);
+}
+
+/// A closed segment of a call put off to the submit in an earlier recording of `wrapper`, for the
+/// next one (`SegmentBook::put_off_spares`).
+pub(super) fn pop_put_off_spare(wrapper: *mut c_void) -> Option<*mut c_void> {
+    let mut sg = SEGMENTS.lock().unwrap();
+    sg.as_mut()?.get_mut(&(wrapper as usize))?.put_off_spares.pop().map(|p| p as *mut c_void)
 }
 
 /// Pop a previously created closed extra PC command list from `wrapper`'s spare pool for reuse.
@@ -331,7 +382,7 @@ pub(super) unsafe fn reclaim_for_kickoff(active_pc: *mut c_void) -> Option<(*mut
     let (prior, reclaimed) = {
         let mut sg = SEGMENTS.lock().unwrap();
         let book = sg.as_mut().and_then(|m| m.get_mut(&(wrapper as usize)))?;
-        let extra = std::mem::take(&mut book.extra_active);
+        let extra = book.retire();
         let mut prior = Vec::with_capacity(extra.len());
         prior.push(primary);
         for &seg in &extra {
@@ -339,7 +390,6 @@ pub(super) unsafe fn reclaim_for_kickoff(active_pc: *mut c_void) -> Option<(*mut
                 prior.push(seg as *mut c_void);
             }
         }
-        book.spares.extend(extra.iter().copied());
         (prior, extra)
     };
     *((wrapper as usize + F_BACKING) as *mut usize) = primary as usize;
@@ -413,14 +463,14 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
             if let Some(m) = wg.as_mut() {
                 m.remove(&(pc as usize));
                 if let Some(ref b) = book {
-                    for &seg in b.extra_active.iter().chain(b.spares.iter()) {
+                    for &seg in b.extra_active.iter().chain(&b.spares).chain(&b.put_off_spares) {
                         m.remove(&seg);
                     }
                 }
             }
         }
         if let Some(b) = book {
-            for seg in b.extra_active.into_iter().chain(b.spares.into_iter()) {
+            for seg in b.extra_active.into_iter().chain(b.spares).chain(b.put_off_spares) {
                 let raw = seg as *mut c_void;
                 super::bind::forget(raw);
                 let timing = super::gpu_timing::list_token(raw);
@@ -468,6 +518,61 @@ mod tests {
 
     unsafe extern "system" fn fake_reset(_: *mut c_void, alloc: usize, pso: usize) -> HRESULT {
         if (alloc, pso) == (1, 2) { 0 } else { -1 }
+    }
+
+    /// Calls put off to the submit have a budget of their own (`MAX_DEFERRED` a recording):
+    /// their segments do not use up the mid-list Wait splits' (`can_split`), and a Reset starts
+    /// both again.
+    #[test]
+    fn put_off_calls_have_a_budget_of_their_own() {
+        let wrapper = 0x7E57_DE00usize as *mut c_void;
+        for k in 0..MAX_DEFERRED {
+            assert!(can_defer(wrapper));
+            push_segment(wrapper, (0x7E57_DF00 + 2 * k) as *mut c_void);
+            SEGMENTS.lock().unwrap().as_mut().unwrap().get_mut(&(wrapper as usize)).unwrap().extra_active.push(0x7E57_DF01 + 2 * k);
+        }
+        assert!(!can_defer(wrapper), "past the budget");
+        assert!(can_split(wrapper), "the Wait splits' budget went to put-off calls");
+        let book = SEGMENTS.lock().unwrap().as_mut().unwrap().remove(&(wrapper as usize)).unwrap();
+        assert_eq!(book.extra_active.len(), 2 * MAX_DEFERRED);
+        assert_eq!(book.deferred, MAX_DEFERRED);
+    }
+
+    /// The segments of calls put off to the submit go back to a pool of their own at a Reset: a
+    /// split never takes one, and a put-off call never takes a split's segment, which may hold a
+    /// recording the title never submitted (the submit's one Reset would drop it).
+    #[test]
+    fn put_off_segments_go_back_to_a_spare_pool_of_their_own() {
+        let mut vt = vec![0usize; LIST_SLOTS];
+        vt[2] = fake_release as usize;
+        vt[10] = fake_reset as usize;
+        let mut primary = Fake { vt: vt.as_ptr(), refs: 1 };
+        let mut put_off = Fake { vt: vt.as_ptr(), refs: 1 };
+        let mut after = Fake { vt: vt.as_ptr(), refs: 1 };
+        let primary_pc = (&mut primary as *mut Fake).cast::<c_void>();
+        let put_off_pc = (&mut put_off as *mut Fake).cast::<c_void>();
+        let after_pc = (&mut after as *mut Fake).cast::<c_void>();
+        unsafe {
+            let wrapper = wrap(primary_pc);
+            push_segment(wrapper, put_off_pc);
+            activate_segment(wrapper, primary_pc, after_pc);
+            let mut lists = Vec::new();
+            assert!(push_segments(wrapper, &mut lists));
+            assert_eq!(lists, [primary_pc, put_off_pc, after_pc]);
+            assert_eq!(reset(wrapper, 1, 2), 0);
+            {
+                let sg = SEGMENTS.lock().unwrap();
+                let b = &sg.as_ref().unwrap()[&(wrapper as usize)];
+                assert!(b.extra_active.is_empty() && b.put_off.is_empty() && b.deferred == 0);
+                assert_eq!(b.spares, [after_pc as usize]);
+                assert_eq!(b.put_off_spares, [put_off_pc as usize]);
+            }
+            assert_eq!(pop_put_off_spare(wrapper), Some(put_off_pc));
+            assert_eq!(pop_put_off_spare(wrapper), None);
+            put_off_spare(wrapper, put_off_pc);
+            assert_eq!(release(wrapper), 0);
+        }
+        assert_eq!((primary.refs, put_off.refs, after.refs), (0, 0, 0), "a segment of either pool was not released with the list");
     }
 
     #[test]

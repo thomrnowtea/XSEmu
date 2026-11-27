@@ -10,14 +10,17 @@ class Button;
 class DetailsHero;
 class InfoCard;
 class Label;
+class RunProfileEditor;
 class RunsWithSelector;
 class SegmentedControl;
 class Services;
+class Toggle;
 
 // Game details (Game details page): the hero band with cover, title and play record; the action bar
-// (Play / Warm up, shader state, Open folder, more); and four cards: the game's facts, the shader
-// cache as far as the launcher can tell, the last run, and per-game overrides that write the title's
-// own xcl.toml (or the launcher's per-game settings). Reached from a cover tile; Back returns.
+// (Play / Warm up, shader state, Open folder, more); and five cards: the game's facts, the shader
+// cache as far as the launcher can tell, the last run, per-game overrides that write the title's
+// own xcl.toml (or the launcher's per-game settings), and the game's own run profile when it has one.
+// Reached from a cover tile; Back returns.
 class GameDetailsPage : public QWidget {
     Q_OBJECT
 public:
@@ -35,6 +38,7 @@ signals:
 private:
     void refresh();
     void refreshOverrides();
+    void refreshRunProfile();
     void requestPlay();
     void onStats();
     void onExit(const EmulatorController::ExitInfo& info);
@@ -53,6 +57,10 @@ private:
     InfoCard* m_runCard;
     InfoCard* m_overrides;
     Label* m_overridesNote;
+    InfoCard* m_profileCard;
+    Toggle* m_ownProfile;
+    RunProfileEditor* m_profileEditor;
+    Label* m_profileNote;
     QList<SegmentedControl*> m_overrideSegs; // one per override row, built on the first refresh
     Label* m_overrideCount = nullptr;
     Button* m_overrideReset = nullptr;

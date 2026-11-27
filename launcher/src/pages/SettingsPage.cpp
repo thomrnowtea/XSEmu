@@ -93,6 +93,7 @@ SettingsPage::SettingsPage(Services& services, QWidget* parent)
         {QStringLiteral("Console"), QStringLiteral("gamepad")},
         {QStringLiteral("Network"), QStringLiteral("network-off")},
         {QStringLiteral("Shaders"), QStringLiteral("bolt")},
+        {QStringLiteral("Run profile"), QStringLiteral("chip")},
         {QStringLiteral("Overlay"), QStringLiteral("overlay")},
         {QStringLiteral("Game folders"), QStringLiteral("folder")},
         {QStringLiteral("Input"), QStringLiteral("keyboard")},
@@ -118,7 +119,7 @@ SettingsPage::SettingsPage(Services& services, QWidget* parent)
 
     const QList<QWidget*> pages = {
         SettingsSections::console(services), SettingsSections::network(services), SettingsSections::shaders(services),
-        SettingsSections::overlay(services), SettingsSections::gameFolders(services, [this] { emit addGamesRequested(); }),
+        SettingsSections::runProfile(services), SettingsSections::overlay(services), SettingsSections::gameFolders(services, [this] { emit addGamesRequested(); }),
         SettingsSections::input(services), SettingsSections::graphics(services), SettingsSections::logs(services),
         SettingsSections::about(services),
     };

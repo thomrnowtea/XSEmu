@@ -10,6 +10,8 @@
 #include "app/Services.h"
 #include "shell/FloatingBar.h"
 #include "shell/InGameView.h"
+#include "pages/GameDetailsPage.h"
+#include "shell/LaunchErrors.h"
 #include "shell/MainWindow.h"
 #include "theme/Theme.h"
 
@@ -20,6 +22,7 @@
 #include <QFileInfo>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QLabel>
 #include <QStandardPaths>
 #include <QTemporaryDir>
 #include <QTest>
@@ -37,6 +40,7 @@ private slots:
     void runnerKeepsItsOwnWindow();
     void crashScreen_data();
     void crashScreen();
+    void xsemuWarmupIsOff();
 
 private:
     QAbstractButton* button(const char* name) const;
@@ -233,6 +237,65 @@ void TestInGame::crashScreen()
     QVERIFY(!m_w->inGameView()->showingExit());
     m_s->emulator.stop();
     QTRY_VERIFY_WITH_TIMEOUT(!m_w->isInGame(), 10000);
+}
+
+// The XSEmu warm-up ships turned off: it can't start, Play never asks for it, and the Warm-up page and
+// Game details offer none, even for a game whose last warm-up failed (which asks once it is on).
+void TestInGame::xsemuWarmupIsOff()
+{
+    const Game garden = fixtureGame(QStringLiteral("Signal Garden"));
+    QTRY_VERIFY_WITH_TIMEOUT(m_s->library.game(garden.titleId()).isValid(), 10000);
+    QVERIFY(!m_s->settings.xsemuWarmup());
+    WarmupRun failed;
+    failed.titleId = garden.titleId();
+    failed.titleName = garden.title();
+    failed.result = WarmupRun::Result::Failed;
+    failed.finishedAt = QDateTime::currentDateTime();
+    m_s->settings.addRecentWarmup(failed);
+
+    QString error;
+    QVERIFY(!m_s->warmup.start(false, garden, &error));
+    QCOMPARE(error, QStringLiteral("The XSEmu warm-up is turned off in this build."));
+    QVERIFY(m_s->gate.isFree());
+    QCOMPARE(m_s->warmup.state(), WarmupController::State::Idle);
+
+    QVERIFY(!LaunchErrors::shadersCold(*m_s, garden));
+    bool played = false;
+    bool warmedUp = false;
+    LaunchErrors::confirmPlay(m_w.get(), *m_s, garden, [&] { played = true; }, [&] { warmedUp = true; });
+    QVERIFY(played);
+    QVERIFY(!warmedUp);
+
+    const auto visibleText = [](const QWidget* root) {
+        QStringList out;
+        for (const QAbstractButton* b : root->findChildren<QAbstractButton*>()) {
+            if (b->isVisibleTo(root))
+                out << b->text();
+        }
+        for (const QLabel* l : root->findChildren<QLabel*>()) {
+            if (l->isVisibleTo(root))
+                out << l->text();
+        }
+        return out.join(QLatin1Char('\n'));
+    };
+    m_w->showGameDetails(garden);
+    QApplication::processEvents();
+    const QString details = visibleText(m_w->gameDetailsPage());
+    QVERIFY2(!details.contains(QLatin1String("Warm up")) && !details.contains(QLatin1String("Warm-up failed")), qPrintable(details));
+    m_w->showPage(Page::Warmup);
+    QApplication::processEvents();
+    QWidget* warmupPage = nullptr;
+    for (QWidget* child : m_w->gameDetailsPage()->parentWidget()->findChildren<QWidget*>(Qt::FindDirectChildrenOnly)) {
+        if (QByteArray(child->metaObject()->className()) == "WarmupPage")
+            warmupPage = child;
+    }
+    QVERIFY(warmupPage);
+    const QString page = visibleText(warmupPage);
+    QVERIFY2(page.contains(QLatin1String("The XSEmu warm-up is turned off in this build.")), qPrintable(page));
+    QVERIFY2(!page.contains(QLatin1String("Start warm-up")) && !page.contains(QLatin1String("Warm up ")) && !page.contains(QLatin1String("Retry")), qPrintable(page));
+
+    m_s->settings.setXsemuWarmup(true);
+    QVERIFY(LaunchErrors::shadersCold(*m_s, garden));
 }
 
 int main(int argc, char** argv)

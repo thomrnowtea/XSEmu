@@ -52,10 +52,15 @@ The settings file is `settings.ini` in the app's local data folder. Set `XSEMU_L
 use another folder. The launcher reads emulator data from `%LOCALAPPDATA%\XCL` (`XCL_DATA_ROOT`
 overrides it) and the shader cache from `%LOCALAPPDATA%\xcl\dxil` (`XCL_DXIL_CACHE`).
 
+The launcher needs no wrapper script: it finds `XSEmu.exe` next to itself, or the one chosen in
+Settings, About (or from the missing-emulator dialog); `XSEMU_EMULATOR` still wins over both. The
+`XCL_*` switches XSEmu runs with are the run profile in Settings.
+
 On Linux the launcher looks for `fake-xsemu` next to itself instead of `XSEmu.exe`. Choose its
 behaviour with `FAKE_XSEMU_SCENARIO`: `ok`, `crash`, `device_removed`, `files_missing`,
 `slow_boot`, `warmup_fail`, `warmup_ram_floor` or `warmup_refuse`. `FAKE_XSEMU_TICK_MS` sets
-its speed.
+its speed, and `FAKE_XSEMU_ENV_DUMP` names a folder where it writes the `XCL_*` environment of each
+run and warm-up.
 
 ## Screenshot lever
 
@@ -88,6 +93,8 @@ variables come from `LaunchConfig::runEnvironment`.
 | Shaders | RAM floor | Read only, 1 GB (`EmulatorController::kRamFloorMb`), with the admission rule |
 | Shaders | Cache folder | `XCL_DXIL_CACHE`; a value already in the environment wins |
 | Shaders | Clear cache | Deletes the cache folder's contents when it looks like an XSEmu cache; never the driver's cache |
+| Run profile | Variables, reset to defaults | `runProfile` (`KEY=VALUE` lines, `AppSettings::defaultRunProfile` until edited), in the environment of Play and of XSEmu's warm-up alike; `XCL_NETWORK`, `XCL_STORE`, `XCL_FULL_DUMP` and `XCL_DXIL_CACHE` lines are not used |
+| Game details | Use a custom run profile for this game | The game's `runProfile` override, replacing the global profile for its Play and warm-up |
 | Overlay | Stall and performance overlay | `overlayDefault`, sent over the control pipe at launch |
 | Overlay | Position, size, metrics | Disabled: not in the protocol |
 | Game folders | Folders, rescan | `gameFolders` |
@@ -99,12 +106,13 @@ variables come from `LaunchConfig::runEnvironment`.
 | Input | Controller | XInput state (Windows only) |
 | Graphics | Theme, game bar in a window | `theme`, `ingame/windowBarAutoHide` |
 | Graphics | Show the game image | `present` (`auto` or `off`) |
-| Graphics | Display mode, D3D12 adapter, raytracing | `display_mode`, `d3d12_adapter`, `raytracing`; each is disabled while `XCL_DISPLAY_MODE`, `XCL_ADAPTER` or `XCL_RAYTRACING` sets it |
+| Graphics | Display mode, D3D12 adapter, raytracing | `display_mode`, `d3d12_adapter`, `raytracing`; each is disabled while the run profile or the launcher's environment sets `XCL_DISPLAY_MODE`, `XCL_ADAPTER` or `XCL_RAYTRACING` |
 | Graphics | Start games in, scaling, low-latency present | Disabled: not in this build |
 | Logs | Log detail | `log_level` (`info` or `debug`) |
 | Logs | Keep logs for | Disabled: XSEmu keeps `xcl.log` and `xcl.prev.log` |
 | Logs | Crash reports | `XCL_FULL_DUMP=<data root>/<title>/logs/dumps` when on |
 | About | XSEmu.exe version | `XSEmu.exe --version` |
+| About | Emulator, Choose | `emulator/path`; `XSEMU_EMULATOR` wins |
 
 ## Layout
 

@@ -201,8 +201,10 @@ pub struct Load {
     /// live demand within `LIVE_QUIET`
     pub live_recent: bool,
     /// the expected peaks among `reserved` of compiles running past their expected time
-    /// (`compile_secs`): what they take shows in the memory available by now, unless it still
-    /// falls (`Room::trend_fall`)
+    /// (`compile_secs`): what they take shows in the memory available by now. The memory check of
+    /// a waited-for compile and of a small background one leaves them out whatever the trend
+    /// (`settle_overdue`, `settle_background`); the commit check of a waited-for compile only
+    /// while the memory does not fall `SETTLE_FALL` (`Room::trend_fall`)
     pub settled: u64,
     /// the reservations among `reserved` of cold giants (`Ask::small_lane` leaves them out, and the
     /// settled ones too while the memory does not fall `SETTLE_FALL`: play-92 held every small live
@@ -227,6 +229,15 @@ pub struct Ask {
     /// reservations (play-89: one live giant's 7,226 MiB and the floor took all 8.2 GB available,
     /// and the title's small compiles waited 228 to 403 s behind it)
     pub small_lane: bool,
+    /// (in a game) a cold giant: it starts only when its estimate, the title's growth
+    /// (`Room::title_fall`) and the compiles' growth fit the memory available less the
+    /// reservations held and 1 GB, and never beside another cold giant (`hard_giants`)
+    pub hard_giant: bool,
+    /// (a giant helper's compile, `real::giant_helper`) it runs in a child process held to `cost` by
+    /// its job object and ended when the memory available falls under the helper's floor, so it
+    /// keeps no memory for the title's growth or the compiles' rise (`helper_skips_growth`); the
+    /// commit check, the one-giant rule and the floor stay
+    pub helper: bool,
 }
 
 /// The memory a compile starts in.
@@ -248,6 +259,12 @@ pub struct Room {
     pub commit_fall: u64,
     /// the faster of the two falls, measured even when no growth headroom is kept (`SETTLE_FALL`)
     pub trend_fall: u64,
+    /// how fast the memory available is falling now, kept for a cold giant even when `fall` is
+    /// not (`Ask::hard_giant`), bytes a second
+    pub title_fall: u64,
+    /// how fast the process heap less XCL's Rust heap is rising now: the driver compiles running
+    /// still taking memory (`compile_rise`), bytes a second
+    pub compile_rise: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -272,11 +289,14 @@ pub fn fits_on_machine(peak: u64, floor: u64, physical_total: u64) -> bool {
 /// headroom, less the same peaks and the title's commit growth, its peak and the urgent floor (a
 /// process out of commit fails its allocations). A compile a bind or a title thread waits for
 /// (`Ask::wanted`) keeps no growth headroom: the title is stalled on it, and the compiles running
-/// past their expected time count as the memory available shows them, not by their expected peaks,
-/// while neither the memory available nor the commit room falls `SETTLE_FALL` or faster
+/// past their expected time count as the memory available shows them, not by their expected peaks
 /// (`Load::settled`: play-88b's background giant kept 8.6 GB of estimate for 225 s, and the plain
-/// rule held every compile the world load waited for while 7 to 10 GB were available). No new background giant
-/// starts while the memory available or the commit room falls `FAST_FALL` or faster, or within
+/// rule held every compile the world load waited for while 7 to 10 GB were available). That holds
+/// whatever the trend for the memory check (`settle_overdue`: the memory available already shows
+/// them, so they are never taken off twice) and for a small background compile's
+/// (`settle_background`); for a waited-for compile's commit check, only while neither the memory
+/// available nor the commit room falls `SETTLE_FALL` or faster. No new background giant starts
+/// while the memory available or the commit room falls `FAST_FALL` or faster, or within
 /// `LIVE_QUIET` of live demand (`Load::live_recent`). A background one stays within
 /// `most` at once and the private-memory cap, and holds back while a waited-for compile waits
 /// for memory. While a blocking warm-up's giant waits, a smaller background compile starts
@@ -291,10 +311,14 @@ pub fn admit(ask: &Ask, load: &Load, room: &Room) -> Verdict {
 pub fn admit_why(ask: &Ask, load: &Load, room: &Room) -> (Verdict, &'static str) {
     let cost = ask.cost;
     let (growth, commit_growth) = if ask.wanted { (0, 0) } else { growth(room, ask.dxil_len) };
+    let growth = if ask.helper { 0 } else { growth };
     let small_background = !ask.wanted && ask.dxil_len < GIANT_DXIL && settle_background();
+    let small_lane_background = !ask.wanted && ask.dxil_len < GIANT_DXIL && background_small_lane();
     let held_back = |settle: bool| {
         if !ask.wanted {
-            if settle && small_background { load.reserved.saturating_sub(load.settled) } else { load.reserved }
+            let giants = if small_lane_background { load.giant_reserved } else { 0 };
+            let settled = if settle && small_background { load.settled } else { 0 };
+            load.reserved.saturating_sub(giants.max(settled))
         } else if ask.small_lane {
             load.reserved.saturating_sub(if settle { load.giant_reserved.max(load.settled) } else { load.giant_reserved })
         } else if settle {
@@ -306,14 +330,25 @@ pub fn admit_why(ask: &Ask, load: &Load, room: &Room) -> (Verdict, &'static str)
     let steady = room.trend_fall < SETTLE_FALL;
     let reserved = held_back(steady || settle_overdue() || small_background);
     let commit_reserved = if ask.wanted { held_back(steady) } else { load.reserved };
-    let spare = room.available.saturating_sub(reserved).saturating_sub(growth);
+    let rise = if ask.helper { 0 } else { compile_rise(room, ask.dxil_len) };
+    let spare = room.available.saturating_sub(reserved).saturating_sub(growth).saturating_sub(rise);
     if room.commit_room.saturating_sub(commit_reserved) < cost.saturating_add(room.urgent_floor).saturating_add(commit_growth) {
         return (Verdict::Hold, "commit room: the commit limit less the commit charge, the reservations and the title's commit growth is under its estimate and 1 GB");
     }
+    if ask.hard_giant {
+        if load.giant_reserved != 0 {
+            return (Verdict::Hold, "a cold giant runs: one at a time in the game");
+        }
+        let title = if ask.helper { 0 } else { room.title_fall.saturating_mul(compile_secs(ask.dxil_len)).min(GROWTH_CAP) };
+        if spare.saturating_sub(if ask.wanted { title } else { 0 }) < cost.saturating_add(room.urgent_floor) {
+            return (Verdict::Hold, "a cold giant: the memory available less the reservations held, the title's and the compiles' growth is under its estimate and 1 GB");
+        }
+    }
     if ask.wanted {
         // (a live cold giant with no other cold giant running falls back to the curve when its
-        // corrected estimate does not fit: play-91b's two waited 250 s with 7.5 GB available)
-        let cost = if !ask.small_lane && load.giant_reserved == 0 && spare < cost + room.urgent_floor { cost.min(peak(ask.dxil_len)) } else { cost };
+        // corrected estimate does not fit: play-91b's two waited 250 s with 7.5 GB available;
+        // never in a game's hard rule)
+        let cost = if !ask.small_lane && !ask.hard_giant && load.giant_reserved == 0 && spare < cost + room.urgent_floor { cost.min(peak(ask.dxil_len)) } else { cost };
         return if spare >= cost + room.urgent_floor {
             (Verdict::Urgent, "")
         } else {
@@ -349,8 +384,8 @@ pub fn admit_why(ask: &Ask, load: &Load, room: &Room) -> (Verdict, &'static str)
 /// the full verdict, which reads the system's memory each time (`real::ParkedRoom`): play-95 had
 /// 3,059 parked, and the title's binds queued on that lock until its watchdog ended the run.
 pub fn held_on_sample(dxil_len: usize, cost: u64, most: usize, load: &Load, available: u64, floor: u64, urgent_floor: u64) -> bool {
-    let room = Room { available, floor, urgent_floor, commit: 0, commit_room: u64::MAX, fall: 0, commit_fall: 0, trend_fall: 0 };
-    admit(&Ask { dxil_len, wanted: false, most, cap: None, cost, small_lane: false }, load, &room) == Verdict::Hold
+    let room = Room { available, floor, urgent_floor, commit: 0, commit_room: u64::MAX, fall: 0, commit_fall: 0, trend_fall: 0, title_fall: 0, compile_rise: 0 };
+    admit(&Ask { dxil_len, wanted: false, most, cap: None, cost, small_lane: false, hard_giant: false, helper: false }, load, &room) == Verdict::Hold
 }
 
 /// A background compile under `GIANT_DXIL` counts the compiles past their expected time as the
@@ -367,6 +402,74 @@ fn settle_background() -> bool {
         }
         on
     })
+}
+
+/// A giant helper's compile (`Ask::helper`) keeps no memory for the title's growth or the measured
+/// rise of the compiles running (`XCL_HELPER_SKIPS_GROWTH=0`: it keeps both, as a compile in this
+/// process does): its child is held to its reservation and ended when the memory available falls
+/// under the helper's floor, then tried again at its measured peak. play-101's FFX_FSR4_PASS_14
+/// and 16 (est 7,810 MiB in the helper) were held 500 s with ~10 GB available and ~2 GB reserved,
+/// with the compile heap rising 57 to 258 MB/s against their ~minutes-long expected time.
+pub fn helper_skips_growth() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("XCL_HELPER_SKIPS_GROWTH").map_or(true, |v| v.trim() != "0");
+        if !on {
+            crate::xlog_info!("D3D12.X: giant helper compiles keep memory for the title's growth and the compiles' rise (XCL_HELPER_SKIPS_GROWTH=0)");
+        }
+        on
+    })
+}
+
+/// A small background compile (under `GIANT_DXIL`) leaves the cold giants' reservations out of its
+/// memory check, as a small live one does (`Ask::small_lane`), and keeps the title's growth, the
+/// floor and its slot count (`XCL_BACKGROUND_SMALL_LANE=0`: they hold it back). A cold giant is
+/// reserved at `GIANT_FACTOR` times the curve for its whole expected time: play-97 held 1,786
+/// background compiles of 9 to 612 KB with 5 to 9.5 GB available behind 5.4 to 7.5 GB of giants'
+/// reservation, about 850 builds pending with the oldest 257 s old.
+fn background_small_lane() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("XCL_BACKGROUND_SMALL_LANE").map_or(true, |v| v.trim() != "0");
+        if !on {
+            crate::xlog_info!("D3D12.X: small background compiles wait on the cold giants' reservations (XCL_BACKGROUND_SMALL_LANE=0)");
+        }
+        on
+    })
+}
+
+/// A compile a bind waits for would not fit even if every running compile ended and gave back its
+/// whole estimate: `cost` and the floor exceed the memory available and the reservations.
+/// play-97's FFX_FSR4_PASS_14, 16 and 18 (4,961, 4,959 and 7,698 KB of the title's own DXIL, est
+/// 16,375 to 25,411 MiB) held three workers 310 s with 2.6 to 5 GB available and 7.5 to 11 GB
+/// reserved.
+pub fn never_fits_now(cost: u64, available: u64, reserved: u64, urgent_floor: u64) -> bool {
+    cost.saturating_add(urgent_floor) > available.saturating_add(reserved)
+}
+
+/// A compile a bind waits for that `never_fits_now` for this long without a break is refused: a
+/// loading burst may take the memory for a moment (an idle governor's waited-for compile must
+/// survive 2 s of it), but not for good.
+pub const NEVER_FIT_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `never_fits_now` for `NEVER_FIT_GRACE` refuses the compile (`XCL_REFUSE_NEVER_FIT=0`: it waits for memory).
+pub fn refuse_never_fit() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("XCL_REFUSE_NEVER_FIT").map_or(true, |v| v.trim() != "0");
+        if !on {
+            crate::xlog_info!("D3D12.X: compiles a bind waits for wait for memory even when they cannot fit with every running compile done (XCL_REFUSE_NEVER_FIT=0)");
+        }
+        on
+    })
+}
+
+/// The memory a compile of `dxil_len` bytes of DXIL keeps free for the compiles running to take
+/// while it runs: their measured rise (`Room::compile_rise`) × its expected duration. play-98's
+/// giant grew the process heap past its overdue estimate: XCL's private memory went from 21.4 to
+/// 23.6 GB and the memory available from 2,623 to 781 MB in ~40 s, and memwatch stopped the run.
+pub fn compile_rise(room: &Room, dxil_len: usize) -> u64 {
+    room.compile_rise.saturating_mul(compile_secs(dxil_len))
 }
 
 pub const IDLE_BREAK_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
@@ -422,6 +525,8 @@ pub enum Lane {
     Slow,
     /// (`Backlog::drawn_first`) no run bound it, and it is slow or heavy as `Slow`
     LaterSlow,
+    /// a ray pass built with every ray a miss (`Backlog::rt_pass`): after every other lane
+    RtPass,
 }
 
 /// Console shader bytes from which a pipeline is built ahead of the others (`Lane::Heavy`): a
@@ -486,6 +591,8 @@ pub struct Backlog<T> {
     slow_out: usize,
     /// workers building one of the later lanes now
     later_out: usize,
+    /// ray passes built with every ray a miss (`rt_pass`), oldest first: taken when nothing else is
+    rt: VecDeque<T>,
 }
 
 impl<T> Default for Backlog<T> {
@@ -510,6 +617,7 @@ impl<T> Default for Backlog<T> {
             slow_waiting: 0,
             slow_out: 0,
             later_out: 0,
+            rt: VecDeque::new(),
         }
     }
 }
@@ -607,6 +715,18 @@ impl<T> Backlog<T> {
         if self.waiting.get(&n).is_some_and(|(_, lane)| *lane == Lane::Graphics) {
             self.depth.push(n);
         }
+    }
+
+    /// Pipeline `n` is a ray pass built with every ray a miss while ray tracing is off
+    /// (`raytracing::miss_pass`): it is taken after every other pipeline waiting, the newest first.
+    pub fn rt_pass(&mut self, n: u64) {
+        let Some((item, lane)) = self.waiting.remove(&n) else { return };
+        match lane {
+            Lane::Heavy => self.heavy_waiting -= 1,
+            Lane::Slow | Lane::LaterSlow => self.slow_waiting -= 1,
+            _ => {}
+        }
+        self.rt.push_back(item);
     }
 
     pub fn promote(&mut self, n: u64) {
@@ -737,7 +857,7 @@ impl<T> Backlog<T> {
             }
         }
         if self.drawn_first {
-            return self.pop_drawn_first(workers);
+            return self.pop_drawn_first(workers).or_else(|| self.rt.pop_back().map(|item| (item, Lane::RtPass)));
         }
         if self.heavy_waiting > 0 && (self.heavy_waiting == self.waiting.len() || self.heavy_out < heavy_share(workers)) {
             while let Some((_, n)) = self.heavy.pop() {
@@ -761,7 +881,7 @@ impl<T> Backlog<T> {
                 return self.take(n);
             }
         }
-        None
+        self.rt.pop_back().map(|item| (item, Lane::RtPass))
     }
 
     /// A worker is done with what it took from `lane`.
@@ -780,12 +900,12 @@ impl<T> Backlog<T> {
     /// (pipelines waiting that an earlier run bound, that no run bound)
     pub fn drawn_split(&self) -> (usize, usize) {
         let later = self.waiting.values().filter(|(_, lane)| self.later(*lane)).count();
-        (self.waiting.len() - later, later)
+        (self.waiting.len() - later, later + self.rt.len())
     }
 
     /// (pipelines waiting for a worker, of them parked for memory)
     pub fn waiting(&self) -> (usize, usize) {
-        (self.parked.len() + self.waiting.len(), self.parked.len())
+        (self.parked.len() + self.waiting.len() + self.rt.len(), self.parked.len())
     }
 
     pub fn has_parked(&self) -> bool {
@@ -1120,7 +1240,7 @@ mod tests {
     }
 
     fn room(available: u64) -> Room {
-        Room { available, floor: GB, urgent_floor: GB, commit: 0, commit_room: u64::MAX, fall: 0, commit_fall: 0, trend_fall: 0 }
+        Room { available, floor: GB, urgent_floor: GB, commit: 0, commit_room: u64::MAX, fall: 0, commit_fall: 0, trend_fall: 0, title_fall: 0, compile_rise: 0 }
     }
 
     #[test]
@@ -1219,12 +1339,46 @@ mod tests {
         let loading = Room { fall: 70 * MIB, trend_fall: 70 * MIB, commit_room: 73_500 * MIB, ..room(5_059 * MIB) };
         let small = ask(2 << 10, false);
         assert_eq!(admit_why(&small, &load, &loading), (Verdict::Background, ""));
-        let fresh = Load { settled: 0, ..load };
-        assert!(admit_why(&small, &fresh, &loading).1.starts_with("memory"), "giants within their expected time keep their estimates");
+        let fresh = Load { settled: 0, giant_reserved: 0, ..load };
+        assert!(admit_why(&small, &fresh, &loading).1.starts_with("memory"), "compiles within their expected time keep their estimates");
         assert_eq!(admit(&small, &load, &Room { available: peak(2 << 10) + GB + growth(&loading, 2 << 10).0 - 1, ..loading }), Verdict::Hold, "the floor and the title's growth stay");
         assert!(admit_why(&small, &load, &Room { commit_room: 8_137 * MIB + GB, ..loading }).1.starts_with("commit room"), "the commit check counts every estimate");
         assert_eq!(admit_why(&ask(GIANT_DXIL, false), &load, &loading).1, "a background giant within 30 s of live demand");
         assert_eq!(admit_why(&small, &Load { starving: 1, ..load }, &loading).1, "a compile a bind waits for waits for memory first");
+    }
+
+    /// play-97 at 87 s: one cold giant running within its expected time (~52 s), reserved at its
+    /// corrected 7,520 MiB, 9,468 MiB available. Background compiles of 9 to 612 KB were held for
+    /// memory (1,786 lines); in the small lane they see the giant as the memory available shows it.
+    #[test]
+    fn small_background_compiles_never_wait_on_cold_giant_reservations() {
+        const MIB: u64 = 1 << 20;
+        let load = Load { running: 1, giants: 1, reserved: 7_520 * MIB, giant_reserved: 7_520 * MIB, ..Load::default() };
+        let small = ask(30 << 10, false);
+        assert_eq!(admit_why(&small, &load, &room(9_468 * MIB)), (Verdict::Background, ""));
+        assert_eq!(admit(&ask(612 << 10, false), &load, &room(9_468 * MIB)), Verdict::Background);
+        let growing = Room { fall: 400 * MIB, ..room(9_468 * MIB) };
+        assert_eq!(admit(&small, &load, &growing), Verdict::Background, "the title's growth is kept, at most GROWTH_CAP");
+        assert_eq!(admit(&small, &load, &room(peak(30 << 10) + GB - 1)), Verdict::Hold, "the floor stays");
+        let others = Load { reserved: 7_520 * MIB + 2_000 * MIB, ..load };
+        assert_eq!(admit(&small, &others, &room(3_000 * MIB)), Verdict::Hold, "other compiles' reservations stay");
+        assert_eq!(admit(&ask(1_208_312, false), &Load { live_recent: false, ..load }, &room(9_468 * MIB)), Verdict::Hold, "a background giant still counts the giant");
+    }
+
+    /// play-97: FFX_FSR4_PASS_14, 16 and 18 asked at 159 s and were held 310 s. At 170 s:
+    /// 3,691 MiB available, 11,256 MiB reserved; at 474 s: 2,614 MiB available, 7,502 MiB reserved.
+    #[test]
+    fn a_waited_for_compile_that_cannot_fit_with_every_compile_done_never_fits_now() {
+        const MIB: u64 = 1 << 20;
+        for (available, reserved) in [(3_691 * MIB, 11_256 * MIB), (2_614 * MIB, 7_502 * MIB)] {
+            for est in [16_375 * MIB, 16_370 * MIB, 25_411 * MIB] {
+                assert!(never_fits_now(est, available, reserved, GB));
+            }
+            assert!(!never_fits_now(3_992 * MIB, available, reserved, GB), "a 1,547 KB giant waits for the running compiles");
+            assert!(!never_fits_now(3_085 * MIB, available, reserved, GB));
+        }
+        assert!(!never_fits_now(16_375 * MIB, 18_004 * MIB, 0, GB), "at boot (18 GB available) the 16 GB ones wait");
+        assert!(never_fits_now(25_411 * MIB, 18_004 * MIB, 0, GB));
     }
 
     /// play-95 at `305 s as the backlog's sample saw it: 3,059 pipelines parked, 2 giants holding
@@ -1253,7 +1407,8 @@ mod tests {
                 }
             }
         }
-        assert!(held(2 << 10, &Load { settled: 0, ..load }, 5_059 * MIB), "giants within their expected time keep their estimates");
+        assert!(held(2 << 10, &Load { settled: 0, giant_reserved: 0, ..load }, 5_059 * MIB), "compiles within their expected time keep their estimates");
+        assert!(!held(2 << 10, &Load { settled: 0, ..load }, 5_059 * MIB), "a small one leaves cold giants' reservations out (XCL_BACKGROUND_SMALL_LANE)");
         assert!(held(2 << 10, &Load { starving: 1, ..load }, 5_059 * MIB), "a waited-for compile waits for memory first");
         assert!(held(2 << 10, &load, GB), "under the floor");
         assert!(held(GIANT_DXIL, &load, 5_059 * MIB), "a background giant within 30 s of live demand");
@@ -1276,8 +1431,59 @@ mod tests {
         assert_eq!(asked.get(), 2);
     }
 
+    /// play-98 at ~340 s: a giant past its expected time kept growing; the memory available fell
+    /// from 2,623 to 781 MB in ~40 s (~46 MB/s) and memwatch stopped the run. With the rise held,
+    /// a waited-for compile no longer starts into the last of the floor.
+    #[test]
+    fn admissions_keep_the_floor_against_the_compiles_measured_rise() {
+        const MIB: u64 = 1 << 20;
+        let load = Load { running: 3, giants: 1, urgent: 3, reserved: 6_000 * MIB, settled: 6_000 * MIB, giant_reserved: 4_000 * MIB, ..Load::default() };
+        let small = ask(150 << 10, true);
+        assert_eq!(admit(&small, &load, &room(1_213 * MIB)), Verdict::Urgent, "the old rule: 1,213 MiB holds 128 MiB and the floor");
+        let rising = Room { compile_rise: 46 * MIB, ..room(1_213 * MIB) };
+        assert!(admit_why(&small, &load, &rising).1.starts_with("memory"), "46 MB/s over its 5 s takes the floor");
+        assert_eq!(admit(&small, &load, &Room { compile_rise: 46 * MIB, ..room(2_623 * MIB) }), Verdict::Urgent, "with room for the rise it starts");
+        assert_eq!(admit(&ask(150 << 10, false), &Load { urgent: 0, ..load }, &rising), Verdict::Hold, "background work too");
+    }
+
+    /// The game's hard rule for cold giants: one at a time, and only when the corrected estimate,
+    /// the title's growth and the compiles' growth fit (play-91b's curve fallback is not taken).
+    #[test]
+    fn a_cold_giant_in_the_game_starts_alone_and_only_on_its_full_estimate() {
+        const MIB: u64 = 1 << 20;
+        let giant = 2_342_300;
+        let hard = |wanted| Ask { cost: cost(giant, false, 3), hard_giant: true, ..ask(giant, wanted) };
+        let one_running = Load { running: 1, giants: 1, urgent: 1, reserved: 4_000 * MIB, settled: 4_000 * MIB, giant_reserved: 4_000 * MIB, ..Load::default() };
+        assert_eq!(admit_why(&hard(true), &one_running, &room(30_000 * MIB)).1, "a cold giant runs: one at a time in the game");
+        let small = Load { running: 1, urgent: 1, reserved: 610 * MIB, ..Load::default() };
+        assert_eq!(admit(&Ask { cost: cost(giant, false, 3), ..ask(giant, true) }, &small, &room(7_178 * MIB)), Verdict::Urgent, "play-91b: the curve fallback without the hard rule");
+        assert!(admit_why(&hard(true), &small, &room(7_178 * MIB)).1.starts_with("a cold giant:"), "its corrected estimate does not fit 7,178 MiB");
+        let fits = cost(giant, false, 3) + GB + 610 * MIB;
+        assert_eq!(admit(&hard(true), &small, &room(fits)), Verdict::Urgent);
+        assert_eq!(admit(&hard(true), &small, &Room { title_fall: 20 * MIB, ..room(fits) }), Verdict::Hold, "the title's growth is kept for a waited-for giant too");
+        assert_eq!(admit(&hard(true), &small, &Room { compile_rise: 20 * MIB, ..room(fits) }), Verdict::Hold, "and the compiles' growth");
+    }
+
+    /// play-101: FFX_FSR4_PASS_14 in the giant helper (4,963 KB, reserved at 7,810 MiB) held 500 s
+    /// with ~10 GB available, ~2 GB reserved and the compile heap rising 57 to 258 MB/s. Its child
+    /// is held to the reservation and ended when the memory runs short, so a helper's compile keeps
+    /// no headroom for either growth; the one-giant rule and the floor stay.
+    #[test]
+    fn a_giant_helpers_compile_keeps_no_growth_headroom() {
+        const MIB: u64 = 1 << 20;
+        let len = 4_963 << 10;
+        let helper = |helper| Ask { cost: 7_810 * MIB, hard_giant: true, helper, ..ask(len, true) };
+        let load = Load { running: 2, urgent: 2, reserved: 1_000 * MIB, ..Load::default() };
+        let growing = Room { compile_rise: 64 * MIB, title_fall: 20 * MIB, ..room(10_000 * MIB) };
+        assert!(admit_why(&helper(false), &load, &growing).1.starts_with("a cold giant:"), "in this process the rise holds it");
+        assert_eq!(admit(&helper(true), &load, &growing), Verdict::Urgent, "in a helper it starts");
+        assert_eq!(admit(&helper(true), &load, &Room { compile_rise: 64 * MIB, ..room(9_000 * MIB) }), Verdict::Hold, "the estimate and 1 GB must still fit");
+        let giant_running = Load { giants: 1, giant_reserved: 3_000 * MIB, ..load };
+        assert_eq!(admit_why(&helper(true), &giant_running, &room(30_000 * MIB)).1, "a cold giant runs: one at a time in the game");
+    }
+
     fn ask(dxil_len: usize, wanted: bool) -> Ask {
-        Ask { dxil_len, wanted, most: 20, cap: None, cost: peak(dxil_len), small_lane: false }
+        Ask { dxil_len, wanted, most: 20, cap: None, cost: peak(dxil_len), small_lane: false, hard_giant: false, helper: false }
     }
 
     /// play-89 at ~150 s: 4 live compiles running, 3 of them cold giants (978 + 972 + 1,274 MiB of
@@ -1447,7 +1653,7 @@ mod tests {
     fn a_background_compile_keeps_its_own_floor() {
         let len = 512 << 10;
         let cost = peak(len);
-        let warm = Room { available: cost + 2 * GB, floor: 6 * GB, urgent_floor: GB, commit: 0, commit_room: u64::MAX, fall: 0, commit_fall: 0, trend_fall: 0 };
+        let warm = Room { available: cost + 2 * GB, floor: 6 * GB, urgent_floor: GB, commit: 0, commit_room: u64::MAX, fall: 0, commit_fall: 0, trend_fall: 0, title_fall: 0, compile_rise: 0 };
         assert_eq!(admit(&ask(len, false), &Load::default(), &warm), Verdict::Hold);
         assert_eq!(admit(&ask(len, true), &Load::default(), &warm), Verdict::Urgent);
         assert_eq!(admit(&ask(len, false), &Load::default(), &Room { floor: GB, ..warm }), Verdict::Background);
@@ -1563,6 +1769,30 @@ mod tests {
         }
         assert_eq!(drain(&mut b, 8), ["k1", "c1", "d2", "d1", "g2", "g1"]);
         assert_eq!(b.waiting(), (0, 0));
+    }
+
+    /// play-101: ray passes built with every ray a miss go behind every other pipeline waiting,
+    /// heavy, slow and recently bound ones included, and are still built once nothing else waits.
+    #[test]
+    fn ray_passes_built_with_every_ray_a_miss_go_last() {
+        for mut b in [Backlog::default(), Backlog::drawn_first()] {
+            let r1 = b.push(100, true, true, 7, None, "r1");
+            b.push(100, false, false, 0, None, "g1");
+            let r2 = b.push(HEAVY_SHADER_BYTES, false, true, 0, None, "r2");
+            b.push(100, true, true, 0, None, "k1");
+            let r3 = b.push(100, true, true, 0, Some(900), "r3");
+            for n in [r1, r2, r3, 99] {
+                b.rt_pass(n);
+            }
+            assert_eq!(b.waiting(), (5, 0));
+            let mut taken = Vec::new();
+            while let Some((item, lane)) = b.pop(8, &[7], |_| true, |_| true, |_| false) {
+                taken.push((item, lane == Lane::RtPass));
+                b.done(lane);
+            }
+            assert_eq!(taken, [("k1", false), ("g1", false), ("r3", true), ("r2", true), ("r1", true)]);
+            assert_eq!(b.waiting(), (0, 0));
+        }
     }
 
     /// Only a share of the workers builds heavy pipelines while small ones wait: the rest go on

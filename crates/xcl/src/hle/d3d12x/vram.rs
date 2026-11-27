@@ -8,7 +8,8 @@
 //! shows in the other. So these textures are placed in *arenas*: D3D12 default heaps (video
 //! memory) standing for ranges of the title's address space (32 MiB+), at the offset of their
 //! address in it. Resources at one address then share memory as on the console (the same
-//! description: the same PC layout, so the same texels). When the title requests the address
+//! description: the same PC layout, so the same texels – one of another layout there is told
+//! apart and has memory of its own, `texture_alias`). When the title requests the address
 //! of a supported color texture, `title_textures` also mirrors writes from its CPU storage.
 //!
 //! Arenas cost video memory for whole ranges, and a placement straddling two made a third over
@@ -53,6 +54,8 @@ struct Placement {
     host_end: usize,
     title_end: usize,
     align: usize,
+    /// `texture_alias::Shape::key` of the texture (0: not told – it shares by address alone)
+    shape: u64,
 }
 
 impl Placement {
@@ -62,7 +65,13 @@ impl Placement {
             host_end: va.checked_add(bytes)?,
             title_end: va.checked_add(console_bytes.map_or(bytes, |b| b as usize))?,
             align,
+            shape: 0,
         })
+    }
+
+    /// The placement of a texture of this shape (`texture_alias::Shape::key`).
+    fn of_shape(self, shape: u64) -> Self {
+        Self { shape, ..self }
     }
 
     fn small(self) -> bool {
@@ -92,6 +101,9 @@ struct Arena<H> {
     /// when the last of them went
     idle_since: Option<std::time::Instant>,
     id: u64,
+    /// (`texture_alias`) made for a placement whose shape differs from the one at its address,
+    /// which had joined an arena there by address: video memory the split takes (`split_bytes`)
+    split: bool,
 }
 
 /// The arenas, apart from D3D12 (`H`: the heap; numbers in the tests).
@@ -161,7 +173,43 @@ impl<H: Clone> Arenas<H> {
         if require_alias {
             return Err(());
         }
+        if p.shape != 0 && !p.small() {
+            // (`texture_alias`) the arena that holds its shape at its address is its memory; one
+            // that holds another shape there is not – each would read the other's texels as the
+            // PC lays out its own
+            let at = |a: &Arena<H>, same: bool| a.placements.iter().any(|q| q.va == p.va && q.shape != 0 && (q.shape == p.shape) == same);
+            let own = self.list.iter().rposition(|a| !a.compact && fits(a) && at(a, true));
+            return Ok(own.or_else(|| self.list.iter().rposition(|a| !a.compact && fits(a) && !at(a, false))));
+        }
         Ok(self.list.iter().rposition(|a| a.compact == p.small() && fits(a)))
+    }
+
+    /// Whether an arena holds a texture of `p`'s shape and size at `p`'s address: the PC lays
+    /// `p` out there as it does that one.
+    fn holds(&self, device: usize, p: Placement) -> bool {
+        p.shape != 0 && self.list.iter().any(|a| {
+            a.device == device && !a.compact && a.align >= p.align && a.base <= p.va
+                && p.host_end <= a.base + a.size && (p.va - a.base) % p.align == 0
+                && a.placements.iter().any(|q| q.va == p.va && q.shape == p.shape && q.host_end == p.host_end)
+        })
+    }
+
+    /// (`texture_alias`) `p` as it is placed with `room` bytes left of the budget for memory
+    /// of their own, and whether the arena made for it is one the split makes: it has no arena
+    /// by its shape and had joined one by its address. Without room for that arena it is
+    /// placed with no shape told – by address, as before.
+    fn budgeted(&self, device: usize, p: Placement, require_alias: bool, room: usize) -> (Placement, bool) {
+        if p.shape == 0 || !matches!(self.selection(device, p, require_alias), Ok(None))
+            || !matches!(self.selection(device, p.of_shape(0), require_alias), Ok(Some(_))) {
+            return (p, false);
+        }
+        if Self::new_arena(p).is_some_and(|new| new.size <= room) { (p, true) } else { (p.of_shape(0), false) }
+    }
+
+    /// bytes of the arenas the split made (`Arena::split`), those no resource uses any more
+    /// too until they go
+    fn split_bytes(&self) -> usize {
+        self.list.iter().filter(|a| a.split).map(|a| a.size).sum()
     }
 
     fn new_arena(p: Placement) -> Option<NewArena> {
@@ -171,10 +219,10 @@ impl<H: Clone> Arenas<H> {
         Some(NewArena { base, size, align })
     }
 
-    fn insert(&mut self, device: usize, p: Placement, new: NewArena, heap: H) -> (H, usize, u64, bool) {
+    fn insert(&mut self, device: usize, p: Placement, new: NewArena, heap: H, split: bool) -> (H, usize, u64, bool) {
         let NewArena { base, size, align } = new;
         self.next_id += 1;
-        self.list.push(Arena { device, base, size, align, compact: p.small(), heap, placements: Vec::new(), title_end: base, idle_since: None, id: self.next_id });
+        self.list.push(Arena { device, base, size, align, compact: p.small(), heap, placements: Vec::new(), title_end: base, idle_since: None, id: self.next_id, split });
         self.join(self.list.len() - 1, p)
     }
 
@@ -188,12 +236,19 @@ impl<H: Clone> Arenas<H> {
 
     #[cfg(test)]
     fn take(&mut self, device: usize, p: Placement, now: std::time::Instant, make: impl FnOnce(usize, usize, usize) -> Option<H>) -> Result<Option<(H, usize, u64, bool)>, ()> {
+        self.take_within(device, p, now, usize::MAX, make)
+    }
+
+    /// (tests) `take` with `room` bytes left of the budget for memory of their own.
+    #[cfg(test)]
+    fn take_within(&mut self, device: usize, p: Placement, now: std::time::Instant, room: usize, make: impl FnOnce(usize, usize, usize) -> Option<H>) -> Result<Option<(H, usize, u64, bool)>, ()> {
         self.sweep(now);
+        let (p, split) = self.budgeted(device, p, false, room);
         if let Some(i) = self.selection(device, p, false)? {
             return Ok(Some(self.join(i, p)));
         }
         let Some(new) = Self::new_arena(p) else { return Ok(None) };
-        Ok(make(new.base, new.size, new.align).map(|heap| self.insert(device, p, new, heap)))
+        Ok(make(new.base, new.size, new.align).map(|heap| self.insert(device, p, new, heap, split)))
     }
 
     /// A resource in arena `id` released.
@@ -317,6 +372,15 @@ static MADE_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsi
 pub fn arena_bytes() -> (usize, usize) {
     (ARENAS.lock().unwrap().bytes(), MADE_BYTES.load(std::sync::atomic::Ordering::Relaxed))
 }
+
+/// (diagnostics, `memdiag`) The title address ranges, as (address, bytes), of the textures placed
+/// in video memory here: in the arenas and on the title's pages (the slabs' small sampled
+/// textures aside).
+pub(super) fn diag_placed() -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize)> = ARENAS.lock().unwrap().list.iter().flat_map(|a| a.placements.iter().map(|p| (p.va, p.title_end.max(p.host_end) - p.va))).collect();
+    out.extend(PAGES.lock().unwrap().values().flatten().flat_map(|p| p.targets.values().map(|t| (t.va, t.end().saturating_sub(t.va)))));
+    out
+}
 use crate::gpu::texture::image_bridge::ownership::HostBacking;
 static PLACED_TEXTURES: Mutex<Option<std::collections::HashMap<usize, HostBacking>>> = Mutex::new(None);
 
@@ -335,6 +399,7 @@ pub(super) fn native_image_backing(resource: usize) -> HostBacking {
 }
 
 pub(super) fn forget(resource: usize) {
+    super::texture_alias::forget(resource);
     let placed = PLACED_TEXTURES.lock().unwrap().as_mut().is_some_and(|textures| textures.remove(&resource).is_some());
     if placed {
         forget_pages(resource);
@@ -539,6 +604,15 @@ struct Target {
     /// a sampled texture: the units its texels need memory for (`note_content`). None: every
     /// tile has memory while the target is mapped
     wanted: Option<Vec<bool>>,
+    /// placed as a sampled texture (`place_pages`), not as the GPU's (`place`): what it is by
+    /// its flags on the console, whatever was written to it since
+    sampled: bool,
+    /// the PC's tiles of its first mip (`texture_alias::Grid`; None: a format it does not know)
+    grid: Option<super::texture_alias::Grid>,
+    /// 0, or it is kept apart from the texture of another grid that holds the pages of its
+    /// address (`texture_alias::keying`): it has no page of the title's addresses (`own` is 0)
+    /// and this is added to its tile indices in `extra_pages`
+    apart: usize,
 }
 
 impl Target {
@@ -551,7 +625,7 @@ impl Target {
         if i < self.own {
             PageKey::Own(self.first + i * PAGE)
         } else {
-            PageKey::Extra(self.va, i)
+            PageKey::Extra(self.va, self.apart + i)
         }
     }
 
@@ -569,6 +643,95 @@ impl Target {
         let u = self.units[unit];
         u.start as usize..(u.start + u.count) as usize
     }
+
+    /// Whether both stand tile for tile on the same pages: placed at one address in one tile
+    /// grid, so each shows what the other holds.
+    fn same_tiles(&self, other: &Target) -> bool {
+        self.va == other.va && self.total == other.total && self.grid.is_some() && self.grid == other.grid
+            && (self.first, self.own, self.apart) == (other.first, other.own, other.apart)
+    }
+}
+
+/// (`texture_alias`) What is under a class of textures kept apart at an address.
+struct Class {
+    grid: super::texture_alias::Grid,
+    /// the textures under it, mapped or not
+    textures: u32,
+    /// the tiles of the largest of them so far: what the class may take of the budget
+    tiles: u32,
+}
+
+/// (`texture_alias`) The sampled textures left mapped on the pages of a target placed over
+/// them (`keep_with`), by that target. Nothing in `title_textures` unmaps them any more: they
+/// go with the target.
+#[derive(Default)]
+struct Kept {
+    of: std::collections::HashMap<usize, Vec<usize>>,
+    /// those unmapped as their last target went: the next target on their tiles has them
+    /// (`adopt`)
+    waiting: Vec<usize>,
+}
+
+impl Kept {
+    fn tie(&mut self, target: usize, view: usize) {
+        let views = self.of.entry(target).or_default();
+        if !views.contains(&view) {
+            views.push(view);
+        }
+    }
+
+    /// `resource` was released. As a kept texture it is nobody's any more. As a target, each
+    /// texture kept with it goes to `heir` – another target on its tiles – or is returned: it
+    /// is to be unmapped, its pages given back, and waits for the next target there.
+    fn released(&mut self, resource: usize, heir: impl Fn(usize) -> Option<usize>) -> Vec<usize> {
+        self.of.retain(|_, views| {
+            views.retain(|&view| view != resource);
+            !views.is_empty()
+        });
+        self.waiting.retain(|&view| view != resource);
+        let mut left = Vec::new();
+        for view in self.of.remove(&resource).unwrap_or_default() {
+            match heir(view) {
+                Some(target) => self.tie(target, view),
+                None => left.push(view),
+            }
+        }
+        self.waiting.extend(&left);
+        left
+    }
+
+    /// (one memory) `target` was placed: the waiting textures that stand on its tiles (`same`)
+    /// are kept with it, and returned – they are to be mapped again.
+    fn adopt(&mut self, target: usize, same: impl Fn(usize) -> bool) -> Vec<usize> {
+        let (taken, waiting): (Vec<usize>, Vec<usize>) = std::mem::take(&mut self.waiting).into_iter().partition(|&view| same(view));
+        self.waiting = waiting;
+        for &view in &taken {
+            self.tie(target, view);
+        }
+        taken
+    }
+}
+
+/// (one memory) How many of its tiles a new texture has on the pages of its address (`Target::own`)
+/// when textures of its tile grid and tile count are mapped there (`peers`: GPU-written,
+/// their `own`): what a GPU-written one has, else the first – tile i of each is then one page,
+/// whatever each takes its size on the console to be. None: no such texture.
+fn peer_own(peers: &[(bool, usize)]) -> Option<usize> {
+    peers.iter().find(|peer| peer.0).or(peers.first()).map(|peer| peer.1)
+}
+
+/// (one memory) Whether a texture of the GPU's with these PC flags goes on the pages of an
+/// address off the 64 KiB grid: written by unordered access only – not a render target, not a
+/// depth buffer.
+fn off_grid_on_pages(flags: i32) -> bool {
+    flags & RT_DS == 0 && flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 != 0
+}
+
+/// (one memory) Whether a GPU-written texture at an address off the 64 KiB grid stays a
+/// resource of its own: the PC has more than 4 times the tiles the console has pages for it
+/// (an array of small slices has a tile for each slice).
+fn wasteful(tiles: usize, console_bytes: u64) -> bool {
+    tiles > usize::try_from(console_bytes).unwrap_or(usize::MAX).div_ceil(PAGE).max(1).saturating_mul(4)
 }
 
 
@@ -596,6 +759,12 @@ struct Pages {
     max_target_span: usize,
     /// queue → the fence value it last waited for
     waited: std::collections::HashMap<usize, u64>,
+    /// (`texture_alias`) (address, class) → the textures kept apart under that class there
+    apart: std::collections::HashMap<(usize, usize), Class>,
+    /// the class the next grid kept apart gets (never 0, never one given before: no two grids
+    /// have the same pages)
+    next_class: u32,
+    kept: Kept,
 }
 
 // D3D12 objects are free-threaded
@@ -672,7 +841,81 @@ impl Pages {
             target_starts: BTreeSet::new(),
             max_target_span: 0,
             waited: std::collections::HashMap::new(),
+            apart: std::collections::HashMap::new(),
+            next_class: 1,
+            kept: Kept::default(),
         })
+    }
+
+    /// The mapped targets that start at `va`, as `texture_alias::keying` takes them: tile grid,
+    /// whether the GPU writes it, its own keying.
+    fn peers(&self, va: usize) -> Vec<(super::texture_alias::Grid, bool, usize)> {
+        self.target_starts.range((va, 0)..=(va, usize::MAX)).filter_map(|&(_, resource)| {
+            let t = self.targets.get(&resource)?;
+            t.grid.filter(|_| t.mapped).map(|grid| (grid, t.wanted.is_none(), t.apart))
+        }).collect()
+    }
+
+    /// (one memory) `peer_own` for `t` among the mapped textures at its address.
+    fn own_of_peer(&self, t: &Target) -> Option<usize> {
+        let peers: Vec<(bool, usize)> = self.target_starts.range((t.va, 0)..=(t.va, usize::MAX))
+            .filter_map(|&(_, resource)| self.targets.get(&resource))
+            .filter(|o| o.mapped && o.total == t.total && o.grid.is_some() && o.grid == t.grid && o.apart == t.apart)
+            .map(|o| (o.wanted.is_none(), o.own))
+            .collect();
+        peer_own(&peers)
+    }
+
+    /// (one memory) The GPU-written `target` was placed: the sampled textures unmapped when the
+    /// last target on its tiles went (`forget_pages`) are mapped on its pages and kept with it.
+    /// The references are given up after the lock.
+    unsafe fn adopt_waiting(&mut self, dev: &ID3D12Device, target: usize) -> Vec<ID3D12Resource> {
+        let Pages { kept, targets, .. } = self;
+        let Some(t) = targets.get(&target) else { return Vec::new() };
+        let views = kept.adopt(target, |view| targets.get(&view).is_some_and(|v| !v.mapped && v.same_tiles(t)));
+        let mut used = Vec::new();
+        for view in views {
+            let Some(mut v) = self.targets.remove(&view) else { continue };
+            if let Some(res) = super::real::reference(view) {
+                let all = 0..v.units.len();
+                self.acquire(dev, &res, &mut v, all, false, false);
+                v.mapped = true;
+                used.push(res);
+            }
+            self.targets.insert(view, v);
+        }
+        used
+    }
+
+    /// The classes textures at `va` are kept apart under, with their grids (`texture_alias::keying`).
+    fn classes(&self, va: usize) -> Vec<(super::texture_alias::Grid, usize)> {
+        self.apart.iter().filter(|(key, _)| key.0 == va).map(|(key, class)| (class.grid, key.1)).collect()
+    }
+
+    /// `t` is kept apart: it is under its class from here on (until `leave_class`).
+    fn join_class(&mut self, t: &Target) {
+        let Some(grid) = t.grid.filter(|_| t.apart != 0) else { return };
+        let class = self.apart.entry((t.va, t.apart)).or_insert(Class { grid, textures: 0, tiles: 0 });
+        class.textures += 1;
+        class.tiles = class.tiles.max(t.total);
+    }
+
+    fn leave_class(&mut self, t: &Target) {
+        if let Some(class) = self.apart.get_mut(&(t.va, t.apart)).filter(|_| t.apart != 0) {
+            class.textures = class.textures.saturating_sub(1);
+            if class.textures == 0 {
+                self.apart.remove(&(t.va, t.apart));
+            }
+        }
+    }
+
+    /// Bytes of pages that keeping grids apart takes, for the budget: the tiles of the largest
+    /// texture of each class, with memory or not yet, and the pages of classes no texture is
+    /// under any more until they are swept.
+    fn apart_spent(&self) -> usize {
+        let classes: usize = self.apart.values().map(|class| class.tiles as usize).sum();
+        let left = self.extra_pages.keys().filter(|&&(va, i)| i >> 32 != 0 && !self.apart.contains_key(&(va, i >> 32 << 32))).count();
+        (classes + left) * PAGE
     }
 
     fn overlapping_targets(&self, va: usize, end: usize) -> impl Iterator<Item = &Target> {
@@ -1067,6 +1310,8 @@ unsafe fn place_on_pages(
     if !supports_reserved_texture(dev, desc) {
         return None;
     }
+    // (`texture_alias`) what the split's arenas take of the budget for memory of their own
+    let split_arenas = if super::texture_alias::enabled() { ARENAS.lock().unwrap().split_bytes() } else { 0 };
     let mut g = PAGES.lock().unwrap();
     g.entry(dev.as_raw() as usize).or_insert_with(|| Pages::new(dev)).as_ref()?;
     // reserved textures have the PC's 64 KiB tiles
@@ -1077,6 +1322,12 @@ unsafe fn place_on_pages(
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
                 crate::xlog_info!("D3D12.X: GPU-owned texture at {va:#x} ({}x{}, format {}, {} samples) not reserved ({hr:#x}): in an arena", desc.Width, desc.Height, desc.Format.0, desc.SampleDesc.Count);
+            }
+        } else if !lazy {
+            // (one memory: a GPU-written texture off the 64 KiB grid – no arena takes it there)
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+                crate::xlog_info!("D3D12.X: one memory: a GPU-written texture at {va:#x} ({}x{}, format {}) not reserved ({hr:#x}): a resource of its own, as before", desc.Width, desc.Height, desc.Format.0);
             }
         }
         return None;
@@ -1109,7 +1360,22 @@ unsafe fn place_on_pages(
         return fail(g);
     };
     let shape = (desc.Format.0, desc.Width, desc.Height, desc.DepthOrArraySize, desc.MipLevels);
+    let sampled = lazy;
+    // (one memory) a GPU-written texture at an address off the 64 KiB grid (`place_impl`)
+    let off_grid = !sampled && va % PAGE != 0;
+    if off_grid && console_bytes.is_some_and(|bytes| wasteful(total as usize, bytes)) {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n <= 4 || n.is_power_of_two() {
+            crate::xlog_info!("D3D12.X: one memory: a GPU-written texture at {va:#x} ({}x{}x{}, format {}) off the 64 KiB grid has {total} tiles on the PC for {} bytes on the console: a resource of its own, as before ({n} so far)", desc.Width, desc.Height, desc.DepthOrArraySize, desc.Format.0, console_bytes.unwrap_or(0));
+        }
+        return fail(g);
+    }
     let lazy = lazy && lazy_tiles();
+    // (`texture_alias`) its tile grid: the PC's own tiles of its first mip, when that is a standard one
+    let first_mip = standard.first().filter(|_| tiling.standard_mips != 0 && n != 0)
+        .map(|t| [t.WidthInTiles, u32::from(t.HeightInTiles), u32::from(t.DepthInTiles)]);
+    let grid = super::texture_alias::Shape::of(&made).map(|s| super::texture_alias::Grid::of_tiling(&s, first_mip));
     let mut target = Target {
         va,
         shape,
@@ -1120,13 +1386,44 @@ unsafe fn place_on_pages(
         own,
         held: vec![None; total as usize],
         wanted: lazy.then(|| vec![false; units.len()]),
+        sampled,
         units,
         per_mip,
+        grid,
+        apart: 0,
     };
     let all = 0..target.units.len();
     let Some(pages) = g.get_mut(&(dev.as_raw() as usize)).and_then(Option::as_mut) else {
         return fail(g);
     };
+    // over a GPU-written texture of another tile grid it would show that one's tiles in the order
+    // of its own (a wider one: the picture twice, side by side): pages of its own
+    if let Some(grid) = grid.filter(|_| super::texture_alias::enabled()) {
+        // (a GPU-written texture whose size on the console is not known – a multisampled target:
+        // no `title_textures::retire_overlapping` follows, the sampled ones under it stay mapped)
+        let stays = !sampled && console_bytes.is_none();
+        let fresh = (pages.next_class as usize) << 32;
+        let apart = super::texture_alias::keying(grid, &pages.peers(va), &pages.classes(va), fresh, stays);
+        // the tiles it has more than its class: within the budget for memory of their own, else
+        // it shares by address, as before
+        let more = (total as usize).saturating_sub(pages.apart.get(&(va, apart)).map_or(0, |class| class.tiles as usize)) * PAGE;
+        if apart != 0 && more != 0 && !super::texture_alias::fits(split_arenas + pages.apart_spent(), more, super::texture_alias::budget()) {
+            super::texture_alias::over_budget(va);
+        } else if apart != 0 {
+            target.apart = apart;
+            target.own = 0;
+            if apart == fresh {
+                pages.next_class = pages.next_class.wrapping_add(1).max(1);
+            }
+        }
+    }
+    // (one memory) on the tiles of a texture of its grid and tile count at its address: as many
+    // of its tiles on the address's pages as that one has
+    if super::texture_alias::one_memory() {
+        if let Some(own) = pages.own_of_peer(&target) {
+            target.own = own;
+        }
+    }
     let mut shared = Vec::new();
     if lazy {
         pages.acquire(dev, res, &mut target, all, false, false);
@@ -1138,10 +1435,21 @@ unsafe fn place_on_pages(
     }
     pages.max_target_span = pages.max_target_span.max(target.end() - va);
     pages.target_starts.insert((va, raw as usize));
+    pages.join_class(&target);
     pages.targets.insert(raw as usize, target);
+    if !sampled && super::texture_alias::one_memory() {
+        shared.extend(pages.adopt_waiting(dev, raw as usize));
+    }
     report_growth(pages);
     drop(g);
     drop(shared);
+    if off_grid {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n <= 4 || n.is_power_of_two() {
+            crate::xlog_info!("D3D12.X: one memory: a GPU-written texture at {va:#x} ({}x{}x{}, format {}) is on the pages of its address, off the 64 KiB grid ({n} so far)", desc.Width, desc.Height, desc.DepthOrArraySize, desc.Format.0);
+        }
+    }
     if lazy {
         LAZY.lock().unwrap().get_or_insert_with(HashSet::new).insert(raw as usize);
     }
@@ -1223,6 +1531,7 @@ pub(super) unsafe fn note_content(res: &ID3D12Resource, texels: &[bool]) {
 /// The title's GPU work writes `resource` (a copy or a resolve into it): a sampled texture on
 /// pages has memory under every tile from here on, as a render target has.
 pub(super) unsafe fn note_gpu_write(resource: usize) {
+    super::texture_alias::note_gpu_write(resource);
     if !is_lazy(resource) {
         return;
     }
@@ -1303,13 +1612,40 @@ fn forget_pages(resource: usize) {
     if let Some(s) = LAZY.lock().unwrap().as_mut() {
         s.remove(&resource);
     }
+    // (references given up after the lock: a last one released under it came back here)
+    let mut unmapped: Vec<ID3D12Resource> = Vec::new();
     let mut g = PAGES.lock().unwrap();
     let now = std::time::Instant::now();
     for pages in g.values_mut().flatten() {
         let Some(mut t) = pages.targets.remove(&resource) else { continue };
         pages.target_starts.remove(&(t.va, resource));
+        pages.leave_class(&t);
         let total = t.total as usize;
         pages.release(&mut t, 0..total, now, false);
+        // (`texture_alias`) the sampled textures kept mapped on its pages (`keep_with`): another
+        // GPU-written target on those tiles has them from here on; with none they are unmapped
+        // and give their pages back – what happened to them when the target was placed, before
+        let Pages { kept, targets, target_starts, .. } = pages;
+        let left = kept.released(resource, |view| {
+            let v = targets.get(&view)?;
+            target_starts.range((v.va, 0)..=(v.va, usize::MAX)).map(|&(_, other)| other)
+                .find(|&other| other != view && targets.get(&other).is_some_and(|o| o.mapped && o.wanted.is_none() && o.same_tiles(v)))
+        });
+        for view in left {
+            let Some(mut v) = pages.targets.remove(&view) else { continue };
+            if v.mapped {
+                if let Some(res) = unsafe { super::real::reference(view) } {
+                    let total = v.total;
+                    v.mapped = false;
+                    unsafe { pages.unmap(&res, total) };
+                    // (its pages idle like the target's: a target made again at the address
+                    // within `IDLE` has what was rendered there, and the view with it – `adopt`)
+                    pages.release(&mut v, 0..total as usize, now, false);
+                    unmapped.push(res);
+                }
+            }
+            pages.targets.insert(view, v);
+        }
         return;
     }
 }
@@ -1360,6 +1696,93 @@ pub fn page_bytes() -> (usize, usize) {
     g.values().flatten().fold((0, 0), |(used, pools), p| {
         (used + (p.pages.len() + p.extra_pages.len()) * PAGE, pools + p.pools.len() * POOL_PAGES as usize * PAGE)
     })
+}
+
+/// Where `resource`'s video memory is, for `texture_alias`' log.
+pub(super) fn memory(resource: usize) -> super::texture_alias::Memory {
+    use super::texture_alias::Memory;
+    if let Some(apart) = PAGES.lock().unwrap().values().flatten().find_map(|p| p.targets.get(&resource).map(|t| t.apart)) {
+        return Memory::Pages(apart);
+    }
+    if let Some(id) = ARENA_OF.lock().unwrap().as_ref().and_then(|m| m.get(&resource)).map(|entry| entry.id) {
+        return Memory::Arena(id);
+    }
+    if SLABS.lock().unwrap().as_ref().is_some_and(|s| s.of.contains_key(&resource)) {
+        return Memory::Slab;
+    }
+    Memory::Own
+}
+
+/// (textures kept on pages of their own by `texture_alias::keying`, bytes of the pages under
+/// their classes) – `XCL_ACTIVITY`
+pub fn apart_bytes() -> (usize, usize) {
+    let g = PAGES.lock().unwrap();
+    g.values().flatten().fold((0, 0), |(n, bytes), p| (
+        n + p.apart.values().map(|class| class.textures as usize).sum::<usize>(),
+        bytes + p.extra_pages.keys().filter(|key| key.1 >> 32 != 0).count() * PAGE,
+    ))
+}
+
+/// Bytes of pages that keeping grids apart takes of the budget (`Pages::apart_spent`).
+fn apart_spent() -> usize {
+    PAGES.lock().unwrap().values().flatten().map(Pages::apart_spent).sum()
+}
+
+/// Bytes of the arenas made for placements kept apart from the one at their address – `XCL_ACTIVITY`
+pub fn split_arena_bytes() -> usize {
+    ARENAS.lock().unwrap().split_bytes()
+}
+
+/// Whether `a` and `b` stand tile for tile on the same pages: placed at one address in one tile
+/// grid, so each shows what the other holds.
+#[cfg(test)]
+pub(super) fn same_tiles(a: usize, b: usize) -> bool {
+    let g = PAGES.lock().unwrap();
+    g.values().flatten().any(|p| matches!((p.targets.get(&a), p.targets.get(&b)), (Some(a), Some(b)) if a.same_tiles(b)))
+}
+
+/// (one memory) The GPU-written texture the sampled texture `view` stands tile for tile on:
+/// mapped at its address in its tile grid, on the same pages.
+pub(super) fn gpu_target_on_tiles(view: usize) -> Option<usize> {
+    if !lazy_tiles() {
+        // (every texture on pages has memory under every tile: none is told to be the GPU's)
+        return None;
+    }
+    let g = PAGES.lock().unwrap();
+    g.values().flatten().find_map(|p| {
+        // (a texture placed as the GPU's that `title_textures` tracks too – a colour target the
+        // CPU writes through its address – is not a view of its neighbour: it is uploaded, and
+        // never kept with another; and only one placed as the GPU's is stood on: a sampled
+        // texture a copy went into may yet be filled by the CPU)
+        let v = p.targets.get(&view).filter(|v| v.sampled)?;
+        p.target_starts.range((v.va, 0)..=(v.va, usize::MAX)).map(|&(_, other)| other)
+            .find(|&other| other != view && p.targets.get(&other).is_some_and(|o| o.mapped && !o.sampled && o.wanted.is_none() && o.same_tiles(v)))
+    })
+}
+
+/// Whether the sampled texture `view` stays mapped as target `by` is placed over it: it stands
+/// tile for tile on `by`'s pages. It is kept with `by` from here on (`Kept`): unmapped when
+/// `by`'s pages are released and no other target is on them.
+pub(super) fn keep_with(by: usize, view: usize) -> bool {
+    let mut g = PAGES.lock().unwrap();
+    for p in g.values_mut().flatten() {
+        if let (Some(a), Some(b)) = (p.targets.get(&by), p.targets.get(&view)) {
+            // (only a sampled texture is another's view: one placed as the GPU's is unmapped
+            // at the retire, as it was)
+            let same = b.sampled && a.same_tiles(b);
+            if same {
+                p.kept.tie(by, view);
+            }
+            return same;
+        }
+    }
+    false
+}
+
+/// Whether `resource` is a texture on pages that is unmapped (`unmap_superseded`: it gave way
+/// to a placement over it).
+pub(super) fn unmapped(resource: usize) -> bool {
+    PAGES.lock().unwrap().values().flatten().any(|p| p.targets.get(&resource).is_some_and(|t| !t.mapped))
 }
 
 /// Bytes of tiles of mapped sampled textures that have no memory (`note_content`) – what a page
@@ -1509,11 +1932,14 @@ unsafe fn place_impl(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, i
             return Some(hr);
         }
     }
+    // (`texture_alias`; 0 with `XCL_TEXTURE_ALIAS=0`: arenas are shared by address alone)
+    let shape = Some(desc).filter(|_| super::texture_alias::enabled()).and_then(super::texture_alias::Shape::of).map_or(0, |s| s.key());
     let arena_placement = || {
         let info = default_info();
         let align = (info.Alignment as usize).max(PAGE);
         (info.SizeInBytes != 0 && info.SizeInBytes != u64::MAX && va % align == 0)
             .then(|| Placement::new(va, info.SizeInBytes as usize, align, console_bytes)).flatten()
+            .map(|p| p.of_shape(shape))
     };
     if has_compact_alias {
         let placed = arena_placement().and_then(|p| place_in_arena(dev, desc, p, initial, dev10.as_ref(), clear, riid, ppv, true));
@@ -1521,6 +1947,18 @@ unsafe fn place_impl(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, i
             alias_conflict(va);
         }
         return placed;
+    }
+    // a texture of the shape and size of one that is in an arena at this address (a target the
+    // title made UNDEFINED, or one the PC does not tile): in that arena, the same memory – on
+    // pages or in a slab it had memory of its own and never showed what the target holds
+    // (looked for by address first: the PC is asked for the texture's size only when one is there)
+    let in_arena = shape != 0 && ARENAS.lock().unwrap().list.iter().any(|a| {
+        a.device == device && !a.compact && a.placements.iter().any(|q| q.va == va && q.shape == shape)
+    });
+    if let Some(p) = Some(()).filter(|_| in_arena).and_then(|_| arena_placement()).filter(|&p| ARENAS.lock().unwrap().holds(device, p)) {
+        if let Some(hr) = place_in_arena(dev, desc, p, initial, dev10.as_ref(), clear, riid, ppv, false) {
+            return Some(hr);
+        }
     }
     // a sampled texture under a page on the console that nothing tiled shares addresses with: a
     // slot of a slab, not a 64 KiB tile of its own
@@ -1535,7 +1973,15 @@ unsafe fn place_impl(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, i
     }
     if std::env::var_os("XCL_VRAM_ARENAS").is_none() {
         if let TextureInitial::Legacy(state) = initial {
-            if let Some(hr) = place_on_pages(dev, this, va, desc, state, clear, console_bytes, allow_arena, !allow_arena, riid, ppv) {
+            // (one memory) a texture written by unordered access whose size on the console is
+            // known goes on the pages of its address off the 64 KiB grid too, as a sampled one
+            // does: no arena takes it there, and as a resource of its own it never showed in the
+            // sampled texture the title places at its address (`XCL_TEXTURE_ONE_MEMORY=0`: as
+            // before). A render target or depth buffer there stays a resource of its own: on
+            // pages it wants a clear or a discard first, and it is followed from the CPU's side
+            // (`title_textures::register`) only as a resource of its own.
+            let aligned = allow_arena && !(console_bytes.is_some() && off_grid_on_pages(desc.Flags.0) && super::texture_alias::one_memory());
+            if let Some(hr) = place_on_pages(dev, this, va, desc, state, clear, console_bytes, aligned, !allow_arena, riid, ppv) {
                 return Some(hr);
             }
         }
@@ -1558,20 +2004,29 @@ fn alias_conflict(va: usize) {
 unsafe fn place_in_arena(dev: &ID3D12Device, desc: &D3D12_RESOURCE_DESC, p: Placement, initial: TextureInitial, dev10: Option<&ID3D12Device10>, clear: *const c_void, riid: *const windows_sys::core::GUID, ppv: *mut *mut c_void, preserve_alias: bool) -> Option<HRESULT> {
     let now = std::time::Instant::now();
     let device = dev.as_raw() as usize;
-    let (expired, selected) = {
+    // (`texture_alias`) an arena of its own beside the one at its address is within the budget
+    // for memory of their own, arenas and pages together; past it: by address, as before
+    let apart_pages = if p.shape != 0 && ARENAS.lock().unwrap().budgeted(device, p, preserve_alias, usize::MAX).1 { apart_spent() } else { 0 };
+    let asked = p;
+    let (expired, selected, p, split) = {
         let mut arenas = ARENAS.lock().unwrap();
         let expired = arenas.sweep(now);
+        let room = super::texture_alias::budget().saturating_sub(arenas.split_bytes().saturating_add(apart_pages));
+        let (p, split) = arenas.budgeted(device, p, preserve_alias, room);
         let selected = arenas.selection(device, p, preserve_alias).map(|i| i.map(|i| arenas.join(i, p)));
-        (expired, selected)
+        (expired, selected, p, split)
     };
     drop(expired);
+    if p.shape != asked.shape {
+        super::texture_alias::over_budget(p.va);
+    }
     let prefer_local = super::residency::protected_texture(desc);
     let (heap, offset, id, compact) = if let Some(existing) = selected.ok()? {
         existing
     } else {
         let new = Arenas::<ID3D12Heap>::new_arena(p)?;
         let heap = arena_heap(dev, new.base, new.size, new.align, prefer_local)?;
-        ARENAS.lock().unwrap().insert(device, p, new, heap)
+        ARENAS.lock().unwrap().insert(device, p, new, heap, split)
     };
     let hr = match initial {
         TextureInitial::Legacy(state) => {
@@ -1895,7 +2350,7 @@ mod tests {
         let tiny = Tiling { total: 1, single_slice: true, standard_mips: 0, packed_mips: 5, packed_tiles: 1, packed_start: 0 };
         assert_eq!(units_of(tiny, &[]), (vec![Unit { sub: 0, start: 0, count: 1 }], false));
         // a subresource's unit: its mip, the tail for the packed ones, everything when not told apart
-        let target = |units: Vec<Unit>, per_mip| Target { va: 0, shape: (0, 0, 0, 0, 0), console_bytes: None, total: 22, mapped: true, first: 0, own: 22, held: vec![None; 22], units, per_mip, wanted: None };
+        let target = |units: Vec<Unit>, per_mip| Target { va: 0, shape: (0, 0, 0, 0, 0), console_bytes: None, total: 22, mapped: true, first: 0, own: 22, held: vec![None; 22], units, per_mip, wanted: None, sampled: false, grid: None, apart: 0 };
         let fine = target(per_mip.to_vec(), true);
         assert_eq!([0, 1, 2, 3, 8].map(|s| fine.units_for(s)), [0..1, 1..2, 2..3, 3..4, 3..4]);
         assert_eq!(fine.tiles(1), 16..20);
@@ -2143,6 +2598,200 @@ mod tests {
         assert_eq!(a.bytes(), MIB, "the idle arena went");
     }
 
+    /// (`texture_alias`) Placements of one shape at an address share its arena; one of another
+    /// shape there gets an arena of its own size, which those of its shape then share. A
+    /// placement no shape is told of (`XCL_TEXTURE_ALIAS=0`) goes by its addresses alone.
+    #[test]
+    fn a_placement_of_another_shape_at_an_address_gets_an_arena_of_its_own() {
+        let (t, a0) = (Instant::now(), 0x1_0000_0000);
+        let mut a = Arenas::new();
+        let take = |a: &mut Arenas<u32>, va: usize, bytes: usize, shape: u64| {
+            let n = a.list.len() as u32;
+            let p = Placement::new(va, bytes, PAGE, None).unwrap().of_shape(shape);
+            (a.take(0, p, t, |_, _, _| Some(n)).unwrap().unwrap().2, p)
+        };
+        let (full, p_full) = take(&mut a, a0, 16 * MIB, 7);
+        assert_eq!(take(&mut a, a0, 16 * MIB, 7).0, full);
+        assert!(a.holds(0, p_full) && !a.holds(1, p_full) && !a.holds(0, p_full.of_shape(9)) && !a.holds(0, p_full.of_shape(0)));
+        // (its shape in another size – fewer rows, mips or slices – is not known to be laid out alike)
+        assert!(!a.holds(0, Placement::new(a0, 8 * MIB, PAGE, None).unwrap().of_shape(7)));
+        // half the size at that address: another layout – an arena of its own, of its size
+        let (half, p_half) = take(&mut a, a0, 4 * MIB, 9);
+        assert_ne!(half, full);
+        assert_eq!(a.bytes(), 20 * MIB);
+        assert!(a.holds(0, p_half) && !a.holds(0, p_half.of_shape(11)));
+        // each shape again: the memory of its own
+        assert_eq!(take(&mut a, a0, 4 * MIB, 9).0, half);
+        assert_eq!(take(&mut a, a0, 16 * MIB, 7).0, full);
+        // a third shape is apart from both
+        let (third, _) = take(&mut a, a0, 4 * MIB, 11);
+        assert!(third != half && third != full);
+        assert_eq!(a.bytes(), 24 * MIB);
+        // inside the first arena where no texture starts: shared by address, as before
+        assert_eq!(take(&mut a, a0 + 8 * MIB, 4 * MIB, 9).0, full);
+        // no shape told: the newest arena that holds its addresses, whatever is there
+        assert_eq!(take(&mut a, a0, 4 * MIB, 0).0, third);
+        // the half-size textures released: their arena alone goes after `IDLE`
+        a.release(half, p_half, t);
+        a.release(half, p_half, t);
+        let gone = a.sweep(t + IDLE);
+        assert_eq!(gone.iter().map(|g| g.id).collect::<Vec<_>>(), [half]);
+        assert_eq!(a.bytes(), 20 * MIB);
+    }
+
+    /// (`texture_alias`) An arena of its own for another shape is made while the budget for
+    /// memory of their own has room for it. Past the budget the placement shares the arena at
+    /// its address, with no shape told, as before; the arenas the split made are counted until
+    /// they go, and then there is room again.
+    #[test]
+    fn a_split_arena_is_made_within_the_budget_and_shared_by_address_past_it() {
+        let (t, a0, budget) = (Instant::now(), 0x1_0000_0000, 6 * MIB);
+        let mut a = Arenas::new();
+        let take = |a: &mut Arenas<u32>, bytes: usize, shape: u64| {
+            let n = a.list.len() as u32;
+            let p = Placement::new(a0, bytes, PAGE, None).unwrap().of_shape(shape);
+            let room = budget.saturating_sub(a.split_bytes());
+            a.take_within(0, p, t, room, |_, _, _| Some(n)).unwrap().unwrap().2
+        };
+        // the first arena at the address is no split: it had been made anyway
+        let full = take(&mut a, 16 * MIB, 7);
+        assert_eq!((a.bytes(), a.split_bytes()), (16 * MIB, 0));
+        // another shape: an arena of its own, of the budget
+        let half = take(&mut a, 4 * MIB, 9);
+        assert_ne!(half, full);
+        assert_eq!((a.bytes(), a.split_bytes()), (20 * MIB, 4 * MIB));
+        // a third shape of 4 MiB with 2 MiB left: by address – the newest arena that holds its
+        // addresses, as a placement no shape is told of – and nothing more is taken
+        let third = take(&mut a, 4 * MIB, 11);
+        assert_eq!(third, half);
+        assert_eq!((a.bytes(), a.split_bytes()), (20 * MIB, 4 * MIB));
+        let shared = Placement::new(a0, 4 * MIB, PAGE, None).unwrap();
+        assert!(a.list.iter().any(|arena| arena.id == half && arena.placements.contains(&shared)), "placed with no shape told");
+        assert!(!a.holds(0, shared.of_shape(11)));
+        // one that fits what is left is still kept apart
+        let small = take(&mut a, 2 * MIB, 13);
+        assert!(small != half && small != full);
+        assert_eq!(a.split_bytes(), 6 * MIB);
+        // the split arenas released and gone: room again
+        a.release(half, shared.of_shape(9), t);
+        a.release(half, shared, t);
+        a.release(small, Placement::new(a0, 2 * MIB, PAGE, None).unwrap().of_shape(13), t);
+        assert_eq!(a.split_bytes(), 6 * MIB, "counted until they go");
+        assert_eq!(a.sweep(t + IDLE).len(), 2);
+        assert_eq!((a.bytes(), a.split_bytes()), (16 * MIB, 0));
+        assert_ne!(take(&mut a, 4 * MIB, 11), full);
+        assert_eq!(a.split_bytes(), 4 * MIB);
+    }
+
+    /// (`texture_alias`) A small placement over an address with targets of two shapes is
+    /// refused an arena whether those have an arena each or share one, as they did before
+    /// shapes were told: a small texture never joins an arena of large ones (`selection`), so
+    /// the split takes no arena from it.
+    #[test]
+    fn a_small_placement_over_targets_of_two_shapes_is_refused_as_before() {
+        let (t, a0) = (Instant::now(), 0x1_0000_0000);
+        for (shapes, arenas) in [((7, 9), 2), ((0, 0), 1)] {
+            let mut a = Arenas::new();
+            for (bytes, shape) in [(16 * MIB, shapes.0), (4 * MIB, shapes.1)] {
+                let n = a.list.len() as u32;
+                a.take(0, Placement::new(a0, bytes, PAGE, None).unwrap().of_shape(shape), t, |_, _, _| Some(n)).unwrap().unwrap();
+            }
+            assert_eq!(a.list.len(), arenas);
+            let small = Placement::new(a0, SMALL, SMALL, None).unwrap();
+            assert!(a.selection(0, small, false).is_err() && a.selection(0, small, true).is_err(), "{shapes:?}");
+        }
+    }
+
+    /// (`texture_alias`) A sampled texture kept mapped on a target's pages goes with that
+    /// target: to another target on those tiles while there is one, else it is to be unmapped.
+    #[test]
+    fn a_kept_texture_goes_with_its_target() {
+        let mut kept = Kept::default();
+        kept.tie(1, 10);
+        kept.tie(1, 11);
+        kept.tie(1, 10);
+        assert_eq!(kept.of[&1], [10, 11]);
+        // a kept texture released: nobody's any more
+        assert!(kept.released(11, |_| None).is_empty());
+        assert_eq!(kept.of[&1], [10]);
+        // its target released while another stands on its tiles: that one's
+        assert!(kept.released(1, |view| (view == 10).then_some(2)).is_empty());
+        assert_eq!((kept.of.len(), &kept.of[&2]), (1, &vec![10]));
+        // that one released and none left: to be unmapped, and nobody's – it waits
+        assert_eq!(kept.released(2, |_| None), [10]);
+        assert!(kept.of.is_empty());
+        assert_eq!(kept.waiting, [10]);
+        // a resource that is neither: nothing
+        assert!(kept.released(3, |_| Some(4)).is_empty() && kept.of.is_empty());
+    }
+
+    /// (one memory) A sampled texture unmapped as its last target went waits for the next
+    /// target on its tiles: that one has it from then on (it is mapped again). A target on
+    /// other tiles does not, and a texture released while it waits is forgotten.
+    #[test]
+    fn a_waiting_texture_is_kept_with_the_next_target_on_its_tiles() {
+        let mut kept = Kept::default();
+        for view in [10, 11, 12] {
+            kept.tie(1, view);
+        }
+        assert_eq!(kept.released(1, |_| None), [10, 11, 12]);
+        assert_eq!(kept.waiting, [10, 11, 12]);
+        // a target on other tiles: none of them
+        assert!(kept.adopt(2, |_| false).is_empty());
+        assert_eq!((kept.of.len(), kept.waiting.len()), (0, 3));
+        // one of them released meanwhile
+        assert!(kept.released(11, |_| None).is_empty());
+        assert_eq!(kept.waiting, [10, 12]);
+        // the next target on the tiles of 10: it has 10, and 12 still waits
+        assert_eq!(kept.adopt(3, |view| view == 10), [10]);
+        assert_eq!((&kept.of[&3], &kept.waiting), (&vec![10], &vec![12]));
+        // and goes with that target like any kept texture
+        assert_eq!(kept.released(3, |_| None), [10]);
+        assert_eq!(kept.waiting, [12, 10]);
+    }
+
+    /// (one memory) Textures of one tile grid and tile count at an address have the same
+    /// number of tiles on the address's pages – a GPU-written one's first – so tile i of each
+    /// is one page; a GPU-written texture off the 64 KiB grid goes on pages unless the PC has
+    /// many times the tiles the console has pages for it.
+    #[test]
+    fn textures_on_one_address_agree_on_their_pages() {
+        assert_eq!(peer_own(&[]), None);
+        assert_eq!(peer_own(&[(false, 14)]), Some(14));
+        assert_eq!(peer_own(&[(false, 14), (true, 15), (true, 16)]), Some(15));
+        // 640x360 of 4 bytes: 15 tiles on the PC, 15 pages on the console
+        assert!(!wasteful(15, 921_600));
+        // an 8x8 array of 40 slices with a tile for each slice, 10 KiB on the console: not on pages
+        assert!(wasteful(40, 10_240) && !wasteful(4, 10_240) && wasteful(5, 10_240));
+        assert!(!wasteful(8, 2 * PAGE as u64) && wasteful(9, 2 * PAGE as u64) && !wasteful(4, 0));
+        assert!(!wasteful(1 << 40, u64::MAX));
+        // off the grid only what unordered access alone writes goes on pages
+        let (rt, ds, ua) = (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0);
+        assert!(off_grid_on_pages(ua) && !off_grid_on_pages(0));
+        assert!(!off_grid_on_pages(rt) && !off_grid_on_pages(ds) && !off_grid_on_pages(rt | ua) && !off_grid_on_pages(ds | ua));
+    }
+
+    /// (`texture_alias`) A target kept apart stands on no page of the title's addresses: its
+    /// tiles are `extra_pages` of its address under its class, where no tile of a texture that
+    /// shares by address is, nor one of another class.
+    #[test]
+    fn a_target_kept_apart_stands_on_pages_of_its_own() {
+        let target = |own, apart| Target {
+            va: 0x10_4000, shape: (0, 0, 0, 0, 0), console_bytes: Some(0x3_0000), total: 4, mapped: true, first: 0x11_0000, own,
+            held: vec![None; 4], units: vec![Unit { sub: 0, start: 0, count: 4 }], per_mip: false, wanted: None, sampled: false, grid: None, apart,
+        };
+        let keys = |t: &Target| (0..4).map(|i| match t.key(i) {
+            PageKey::Own(page) => (0, page),
+            PageKey::Extra(va, index) => (va, index),
+        }).collect::<Vec<_>>();
+        let shared = keys(&target(3, 0));
+        assert_eq!(shared, [(0, 0x11_0000), (0, 0x12_0000), (0, 0x13_0000), (0x10_4000, 3)]);
+        let apart = keys(&target(0, 7 << 32));
+        assert_eq!(apart, [(0x10_4000, 7 << 32), (0x10_4000, (7 << 32) + 1), (0x10_4000, (7 << 32) + 2), (0x10_4000, (7 << 32) + 3)]);
+        assert!(apart.iter().all(|k| !shared.contains(k)));
+        assert!(keys(&target(0, 9 << 32)).iter().all(|k| !apart.contains(k)));
+    }
+
     /// The retail game's pattern (HANDOFF): targets packed back to back over 3.5 GB of its
     /// addresses and placed again and again, each round at the last round's addresses or a third
     /// of a target further on, so placements straddle earlier ones. Main's 256 MiB arenas merged
@@ -2262,6 +2911,83 @@ mod tests {
             }
             drop((a, b, alias));
             assert!(uma.free(base));
+        }
+    }
+
+    /// On the GPU (`texture_alias`): targets of one layout at an address are one memory – what
+    /// is written through one reads through the other, whatever its format – and a target of
+    /// another layout there has memory of its own, which the next of its layout shares. Needs a
+    /// hardware adapter (skips on WARP); the texels are compared where the targets are on pages.
+    #[test]
+    fn targets_of_another_layout_at_an_address_get_memory_of_their_own() {
+        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use crate::gpu::texture::{self, Subresource};
+        use super::super::texture_alias::Memory;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIFactory4};
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let Ok(adapter) = factory.EnumAdapters1(0) else { return };
+            if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
+                return;
+            }
+            let mut dev: Option<ID3D12Device> = None;
+            let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);
+            let Some(dev) = dev.filter(tier2) else { return };
+            if !super::super::texture_alias::enabled() {
+                return;
+            }
+            super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
+            let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
+            let state = D3D12_RESOURCE_STATE_COMMON;
+            let va = 0x5_A11A_0000usize;
+            let target = |format: DXGI_FORMAT, width: u64| {
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                    Width: width, Height: 512, DepthOrArraySize: 1, MipLevels: 1,
+                    Format: format,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                    ..Default::default()
+                };
+                let mut raw = std::ptr::null_mut();
+                let hr = place(dev.as_raw(), va, &desc, TextureInitial::Legacy(state.0 as u32), std::ptr::null(), None, riid, &mut raw);
+                assert!(hr.is_some_and(|hr| hr >= 0) && !raw.is_null(), "{width}x512 target of format {}: {hr:?}", format.0);
+                ID3D12Resource::from_raw(raw)
+            };
+            let at = |r: &ID3D12Resource| memory(r.as_raw() as usize);
+            let a = target(DXGI_FORMAT_R8G8B8A8_UNORM, 512);
+            let wide = target(DXGI_FORMAT_R8G8B8A8_UNORM, 1024);
+            let cast = target(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, 512);
+            let wide_cast = target(DXGI_FORMAT_B8G8R8A8_UNORM, 1024);
+            assert_ne!(at(&a), Memory::Own);
+            assert_eq!(at(&cast), at(&a), "a target in another format of the element is the same memory");
+            assert_ne!(at(&wide), at(&a), "a target twice as wide is not: its tiles are in another order");
+            assert_eq!(at(&wide_cast), at(&wide), "the next of its layout shares its memory");
+            if at(&a) == Memory::Pages(0) {
+                let key = |r: &ID3D12Resource| r.as_raw() as usize;
+                assert!(same_tiles(key(&a), key(&cast)) && same_tiles(key(&wide), key(&wide_cast)) && !same_tiles(key(&a), key(&wide)));
+                assert_eq!(tile_backing(key(&wide)).map(|(local, non_local, none)| (local + non_local, none)), Some((32, 0)), "all its 8x4 tiles on pages of its own");
+                let (apart, bytes) = apart_bytes();
+                assert!(apart >= 2 && bytes >= 32 * PAGE, "{apart} textures apart, {bytes} bytes of the pages the two share");
+                // texels through one target of a layout, read through the other
+                let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+                for (to, from, width, seed) in [(&a, &cast, 512usize, 5usize), (&wide_cast, &wide, 1024, 11)] {
+                    let data: Vec<u8> = (0..width * 512 * 4).map(|i| ((i / 4 % width + i / 4 / width * 3) * seed / 7) as u8).collect();
+                    let pixels = Subresource { rows: 512, row_bytes: width * 4, depth: 1, data: data.clone() };
+                    super::super::title_textures::own_work(|| {
+                        before_execute(&queue);
+                        texture::upload(&dev, &queue, to, &[pixels], state, state)
+                    }).unwrap();
+                    let got = super::super::title_textures::read_gpu_subresource(&dev, from, 0, state).unwrap();
+                    assert!(got == data, "{width}x512: the texels written through one target read through the other");
+                }
+                // and the narrow targets still hold theirs: the wide ones wrote pages of their own
+                let data: Vec<u8> = (0..512usize * 512 * 4).map(|i| ((i / 4 % 512 + i / 4 / 512 * 3) * 5 / 7) as u8).collect();
+                assert!(super::super::title_textures::read_gpu_subresource(&dev, &a, 0, state).unwrap() == data, "a write through the wide target reached the narrow one");
+            }
+            drop((a, wide, cast, wide_cast));
         }
     }
 

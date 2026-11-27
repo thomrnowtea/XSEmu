@@ -61,6 +61,15 @@ void Row::setUnavailable(const QString& why)
     m_why->show();
 }
 
+void Row::setAvailable()
+{
+    for (int i = 1; i < m_row->count(); ++i) {
+        if (QWidget* w = m_row->itemAt(i)->widget())
+            w->setEnabled(true);
+    }
+    m_why->hide();
+}
+
 void Row::setBorder(bool on)
 {
     m_border = on;

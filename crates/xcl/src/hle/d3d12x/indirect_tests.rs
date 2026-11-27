@@ -234,3 +234,44 @@ fn the_sanitiser_plans_a_mesh_call_in_two_passes() {
     assert_eq!((out, n), (vec![40, 2, 1], 1));
     assert!(kept.is_empty() || kept == [0xA5A5_A5A5; 3], "no second copy for a compute call");
 }
+
+/// play-98's pattern: a pass binds, as its own UAV, a view that starts inside a shared pool and
+/// runs to the pool's end. It is part of the pool: it is not kept as unwritten, and the pool's
+/// views that were kept before it was pooled go too, while a buffer outside the pool is kept.
+#[test]
+fn a_view_inside_a_shared_pool_is_part_of_it() {
+    const POOL: u64 = 0x4_20b1_0000;
+    const POOL_END: u64 = 0x4_2b91_0000;
+    const OUT: u64 = 0x7_94c5_4fb0;
+    let mut u = Unwritten::default();
+    u.mark(0xA0, &[(0x4_2356_aac4, POOL_END - 0x4_2356_aac4)]);
+    assert!(u.overlapping(0x4_2356_b000, 16).is_some(), "kept while the pool is not known");
+    for k in 0..SHARED_BINDERS {
+        u.bound(0xB0 + k, &[(POOL, POOL_END - POOL)]);
+    }
+    assert!(u.overlapping(0x4_2356_b000, 16).is_none(), "a view inside the pool goes when it becomes one");
+    u.mark(0xA1, &[(0x4_2356_ac00, 0x1654), (OUT, 0x14)]);
+    assert!(u.overlapping(0x4_2356_ac10, 16).is_none(), "a later skip does not mark a view inside the pool");
+    assert_eq!(u.overlapping(OUT, 0x14), Some((OUT, OUT + 0x14, 0xA1)), "its own buffer outside the pool is kept");
+    u.written(&[(0x4_2356_ac00, 0x1654), (0x4_2000_0000, 0x10_0000_0000)]);
+    assert!(u.overlapping(OUT, 0x14).is_some(), "a write through a pool or a view too large cannot be placed");
+}
+
+/// Refused calls are counted by the range they read and the producer it waits for, most first.
+#[test]
+fn refusals_are_counted_by_range_and_producer() {
+    const A: u64 = 0x7_7d95_a4b0;
+    const B: u64 = 0x7_5fcd_71d0;
+    let (pa, pb, sig) = (0x7E57_9801usize, 0x7E57_9802usize, 0x7E57_9800usize);
+    note_signature(sig, DISPATCH, 12, true);
+    skipped_producer(pa, &[(A, 0x400)]);
+    skipped_producer(pb, &[(B, 0x780)]);
+    for at in [A + 0x280, A + 0x380, B + 0x10, A] {
+        assert!(check(sig, 1, Some(at), None).is_err());
+    }
+    let mine: Vec<_> = take_refusals().into_iter().filter(|r| r.0 .2 == pa || r.0 .2 == pb).collect();
+    assert_eq!(mine, [((A, A + 0x400, pa), 3), ((B, B + 0x780, pb), 1)]);
+    produced(pa);
+    produced(pb);
+}
+

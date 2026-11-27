@@ -74,6 +74,16 @@ mod quad_read_tests;
 mod page_split_tests;
 #[cfg(test)]
 mod page_group_tests;
+#[cfg(test)]
+mod rt_miss_tests;
+#[cfg(test)]
+mod prim_index_tests;
+#[cfg(test)]
+mod permute_tests;
+#[cfg(test)]
+mod rect_corner_tests;
+#[cfg(test)]
+mod thread_limit_tests;
 pub mod upper_lanes;
 mod loop_profile;
 mod structure;
@@ -210,6 +220,14 @@ pub const IO_TRIP_WINDOW: usize = 116;
 pub const IO_NGG_USER_DISPLACEMENT: usize = 117;
 /// Raw SRV of this recording's locator. Its first dword selects the execution's topology SRV.
 pub const IO_PHYSICAL_TABLE: usize = 118;
+/// io slots (trap-temp range) of a `DispatchX` with thread dimensions (flag 0x20): the thread
+/// count of each axis when it is not a whole number of groups (0: no limit, the last group is
+/// whole). Every compute prologue reads the three at once (one 12-byte load: they must stay
+/// consecutive) and leaves a lane out of its launch EXEC when its console thread along an axis
+/// (group × group size + thread in the group) is at or past the count. Adapted from ivall/xcl
+/// a3e820d8 (PR #2610, the dispatch) and 12758ed0 (nvidia-dev, the prologue).
+pub const IO_THREAD_LIMIT: [usize; 3] = [119, 120, 121];
+const _: () = assert!(IO_THREAD_LIMIT[1] == IO_THREAD_LIMIT[0] + 1 && IO_THREAD_LIMIT[2] == IO_THREAD_LIMIT[0] + 2);
 
 /// Shader and native gather/scatter ABI. `va` is the normalized guest byte address (low, high).
 /// The result is the absolute raw UAV index and its byte offset, including on direct UMA.
@@ -562,6 +580,13 @@ pub struct Options {
     pub legacy_compute_wave64: bool,
     pub compute_per_access_coherence: bool,
     pub bvh_node_fix: bool,
+    /// ray tracing off as "every ray misses" (`rt_all_miss`): an `image_bvh(64)_intersect_ray` reads no
+    /// node and gives what a scene without an acceleration structure gives, 0xFFFFFFFF in all
+    /// four result registers
+    pub rt_all_miss: bool,
+    /// compute: the launch EXEC leaves out the lanes past a `DispatchX` with thread dimensions'
+    /// per-axis thread counts (io[`IO_THREAD_LIMIT`]; `dispatch_thread_dimensions`)
+    pub thread_limits: bool,
     pub loop_profile: bool,
     pub guard_trip_counters: bool,
     /// first register (space 1) of the program's static samplers (another stage of the same
@@ -617,7 +642,7 @@ pub fn code_data(f: &super::xbox::Fssm, p: &super::xbox::Program) -> Option<Code
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, legacy_compute_wave64: legacy_compute_wave64(), compute_per_access_coherence: compute_per_access_coherence(), bvh_node_fix: bvh_node_fix(), loop_profile: false, guard_trip_counters: true, static_sampler_base: 0, mem_windows: 1, structured: true, exec_proof: true, nan_guards: true, mesh_native: None, code_data: None }
+        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, legacy_compute_wave64: legacy_compute_wave64(), compute_per_access_coherence: compute_per_access_coherence(), bvh_node_fix: bvh_node_fix(), rt_all_miss: rt_all_miss(), thread_limits: dispatch_thread_dimensions(), loop_profile: false, guard_trip_counters: true, static_sampler_base: 0, mem_windows: 1, structured: true, exec_proof: true, nan_guards: true, mesh_native: None, code_data: None }
     }
 }
 
@@ -634,6 +659,84 @@ pub(super) fn compute_per_access_coherence() -> bool {
 pub(super) fn bvh_node_fix() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("XCL_BVH_NODE_FIX").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// `XCL_RT_GATE`, for a run with ray tracing off (`hle::d3d12x::raytracing`): "hold" leaves the
+/// pipelines that traverse acceleration structures and the title's ray passes out unbuilt;
+/// "miss", the default, builds and runs them with every intersection a miss. The
+/// acceleration-structure builder is off in both, so there is no structure a ray could hit.
+/// Upstream XCL (ivall/xcl amd-dev 1aebe666) measured a retail title dark with its ray programs
+/// held back - 707 of the 1 073 programs left out write memory that later passes and the CPU
+/// read (screen-probe ray lists, ray-traced resolves, particle collisions) - and lit with every
+/// ray a miss.
+pub fn rt_gate_miss() -> bool {
+    static MISS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *MISS.get_or_init(|| rt_gate_is_miss(std::env::var("XCL_RT_GATE").ok().as_deref()))
+}
+
+fn rt_gate_is_miss(value: Option<&str>) -> bool {
+    !value.is_some_and(|v| v.trim().eq_ignore_ascii_case("hold"))
+}
+
+/// Console programs are translated with every ray a miss (`Options::rt_all_miss`): ray tracing is
+/// off and the gate is "miss" (`rt_gate_miss`). Never in unit tests, which translate for a
+/// structure they built.
+pub fn rt_all_miss() -> bool {
+    !cfg!(test) && !crate::state::config().raytracing_on() && rt_gate_miss()
+}
+
+/// The console program traverses acceleration structures: an `image_bvh(64)_intersect_ray` in its
+/// native code (a driver FSPX container's too).
+pub fn traces_rays(blob: &[u8]) -> bool {
+    any_program(blob, code_traces_rays)
+}
+
+/// A program of the container may traverse acceleration structures: the opcode words alone,
+/// without the decoder. The translation cache keys on this (`pso::translated_identity`): the
+/// emitter writes a miss for every intersect it decodes, also behind data words that stop
+/// `code_traces_rays`' linear decode, and a program keyed as tracing without need is only
+/// translated once more.
+pub fn may_trace_rays(blob: &[u8]) -> bool {
+    any_program(blob, has_bvh_opcode)
+}
+
+fn any_program(blob: &[u8], test: fn(&[u8]) -> bool) -> bool {
+    if let Some(f) = pso::fspx(blob) {
+        return test(f.code);
+    }
+    super::xbox::parse(blob).is_some_and(|sh| sh.fssm.iter().any(|f| f.programs.iter().any(|p| f.data.get(p.offset..p.offset + p.len).is_some_and(test))))
+}
+
+fn has_bvh_opcode(code: &[u8]) -> bool {
+    code.chunks_exact(4).any(|b| {
+        let w = u32::from_le_bytes(b.try_into().unwrap());
+        w >> 26 == 0x3c && (w >> 18) & 0x7e == 0x66
+    })
+}
+
+/// `traces_rays` of one native program: a cheap scan for the instruction's MIMG opcode words
+/// first (DexNom RayTime's filter), then the decoder confirms one.
+pub fn code_traces_rays(code: &[u8]) -> bool {
+    let maybe = has_bvh_opcode(code);
+    let mut off = 0;
+    while maybe && off + 4 <= code.len() {
+        let Ok(d) = super::rdna2::decode(&code[off..], off as u64) else { return false };
+        if d.inst.name.get(..9).is_some_and(|n| n.eq_ignore_ascii_case("image_bvh")) {
+            return true;
+        }
+        off += d.len;
+    }
+    false
+}
+
+/// `DispatchX` flag 0x20 (USE_THREAD_DIMENSIONS) as the console runs it: the counts are threads,
+/// launched as whole groups with the lanes past each axis's count out of EXEC (D3D12.X writes the
+/// counts to io[`IO_THREAD_LIMIT`], every compute prologue reads them). Off with
+/// `XCL_DISPATCH_THREAD_DIMENSIONS=0`: the flags are ignored and the counts launched as groups,
+/// as before. Part of the translation cache's identity (the compute prologue differs).
+pub fn dispatch_thread_dimensions() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("XCL_DISPATCH_THREAD_DIMENSIONS").map_or(true, |v| v.trim() != "0"))
 }
 
 pub(super) fn compute_wave64_pack_max_insts() -> usize {

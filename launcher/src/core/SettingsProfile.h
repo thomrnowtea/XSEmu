@@ -18,7 +18,8 @@ class AppSettings;
 //
 // Only the keys in keys() ever leave the PC: it is an allow-list, so a setting added later stays
 // private until someone adds it here. Paths, API keys, the library, play stats, warm-up history,
-// window geometry and the D3D12 adapter (a GPU of this PC) are never in it.
+// window geometry and the D3D12 adapter (a GPU of this PC) are never in it. The global run profile is,
+// without its lines whose value is an absolute path; importing one keeps this PC's own path lines.
 namespace SettingsProfile {
 
 inline constexpr const char* kSchema = "xsemu-settings";
@@ -33,7 +34,7 @@ enum class Target { Game, Defaults };
 // One shareable key. The profile key is the store's own key: the game override key
 // (AppSettings::gameOverrides) and, for xcl.toml keys, the LaunchConfig::xclKeys() name.
 struct KeySpec {
-    enum class Kind { Choice, Bool, DisplayMode, Runner };
+    enum class Kind { Choice, Bool, DisplayMode, Runner, RunProfile };
     QString key;
     QString label;
     Kind kind;
@@ -44,7 +45,7 @@ struct KeySpec {
 };
 const QList<KeySpec>& keys();
 const KeySpec* find(const QString& key);
-// "Series S", "1920×1080 · 120 Hz", "On", "1.5×", "Kelvaroq"; "Not set" for an invalid value.
+// "Series S", "1920×1080 · 120 Hz", "On", "1.5×", "Kelvaroq", "17 variables"; "Not set" for an invalid value.
 QString valueLabel(const QString& key, const QVariant& value);
 
 struct Profile {
@@ -72,6 +73,9 @@ struct Note {
     QString value; // as the profile wrote it, for display
     QString text;
 };
+
+// A run profile line's value names a place on one PC: C:\..., \\server\..., /..., ~/...
+bool looksLikePath(const QString& value);
 
 struct Parsed {
     Profile profile;             // valid values only

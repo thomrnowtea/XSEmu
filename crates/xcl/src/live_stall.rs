@@ -113,10 +113,8 @@ pub(crate) fn job() -> (u64, u64) {
     JOB.with(Cell::get)
 }
 
+/// `f` builds `pipeline` of `shader`: named in the stall samples, and by `job` (live stall off too).
 pub(crate) fn with_job<R>(pipeline: u64, shader: u64, f: impl FnOnce() -> R) -> R {
-    if !enabled() {
-        return f();
-    }
     struct Restore((u64, u64));
     impl Drop for Restore {
         fn drop(&mut self) {

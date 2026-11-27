@@ -12,6 +12,7 @@ namespace SettingsSections {
 QWidget* console(Services& s);
 QWidget* network(Services& s);
 QWidget* shaders(Services& s);
+QWidget* runProfile(Services& s);
 QWidget* overlay(Services& s);
 QWidget* gameFolders(Services& s, std::function<void()> addFolder);
 QWidget* input(Services& s);

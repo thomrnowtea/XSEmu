@@ -10,6 +10,14 @@ pub(crate) fn gpu_markers_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("XCL_GPU_MARKERS").is_ok_and(|v| v.trim() == "1"))
 }
 
+/// The guard tripwire (`hle::d3d12x::bind::Trips`): translated compute programs count the lanes a
+/// guard gave up in (a spent loop budget first of all), and the 30 s line names the pipelines.
+/// On unless `XCL_NO_GUARD_TRIPS` is set; `XCL_GPU_MARKERS=1` always has it.
+pub(crate) fn guard_trips_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| gpu_markers_enabled() || std::env::var_os("XCL_NO_GUARD_TRIPS").is_none())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {

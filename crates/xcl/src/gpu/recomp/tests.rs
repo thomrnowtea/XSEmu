@@ -457,6 +457,425 @@ fn gpu_packed_compute_scalar_load_chain() {
     assert_eq!(out[64..160], [351; 96]);
 }
 
+/// High half of the addresses of memory window 0 in the runs of the load chain over several
+/// windows. A program with several windows drops a store through a pointer whose high half is
+/// 0 (`Em::window_write`), so the chain's pointers carry this one.
+const CHAIN_WINDOW: u32 = 16;
+
+/// `io` and memory of the load chain over several windows: its table pointer (s2, s3), its
+/// buffer descriptor and its store address are in window 0.
+fn chain_state(threads: usize) -> (Vec<u32>, Vec<u32>) {
+    let mut io = vec![0u32; 128];
+    io[0] = 0x100;
+    io[3] = CHAIN_WINDOW;
+    io[super::IO_UMA_BASE_HI] = CHAIN_WINDOW;
+    let mut mem = vec![0u32; 64 + threads];
+    mem[..6].copy_from_slice(&[64, CHAIN_WINDOW, 12, 0, 17, 23]);
+    mem[16..20].copy_from_slice(&[101, 103, 107, 1009]);
+    (io, mem)
+}
+
+/// The memory a compute program of `runner::dispatch`'s ABI leaves in window 0, in the
+/// interpreter (no GPU): what the test's state makes the program do is checked on every machine.
+fn interpreted(hlsl: &str, io: &[u32], mem: &[u32]) -> Vec<u32> {
+    use xcl_dxil::interp::{self, res, Input};
+    let hlsl = hlsl.replace("vector<uint64_t, 4>(", "uint64_t4(").replace("vector<uint, 4>(", "uint4(");
+    let p = interp::load(&xcl_dxil::compile(&hlsl, "main", "cs_6_6").unwrap_or_else(|e| panic!("{e}\n{hlsl}"))).unwrap();
+    let word = |ident: u32, w: usize| (ident as u64) << 32 | w as u64;
+    // the heap slot of the windows is the interpreter's: the program reads it from io
+    let mut patches: Vec<(u64, u32)> = io.iter().enumerate().filter(|(w, _)| *w != super::IO_MEM_VIEWS).map(|(w, v)| (word(res::IDENT_IO, w), *v)).collect();
+    let cfg = interp::Config::default();
+    let trace = interp::run_input(&p, &Input { seed: 0, patches: patches.clone() }, &cfg, true).1.unwrap();
+    let views = trace.reads.iter().find(|r| r.0 == word(res::IDENT_IO, super::IO_MEM_VIEWS)).expect("the program reads its memory views").1;
+    let window = res::IDENT_HEAP | views;
+    patches.extend(mem.iter().enumerate().map(|(w, v)| (word(window, w), *v)));
+    let run = interp::run_input(&p, &Input { seed: 0, patches }, &cfg, false).0;
+    assert!(run.stop.is_none() && run.ub == 0, "{:?} {}", run.stop, run.ub);
+    let mut after = mem.to_vec();
+    for w in run.written.iter().filter(|w| w.0 == 0 && w.1 == window) {
+        after[w.2 as usize / 4] = w.3[0];
+    }
+    after
+}
+
+/// The load chain of `gpu_packed_compute_scalar_load_chain` over four memory windows, packed and per
+/// wave, with its memory functions kept out of line (`emit::outlined`; DXC compiles such a
+/// program and keeps the calls): it leaves the memory the plain program leaves, with the results
+/// of the kept functions handed back through `out` parameters and through statics
+/// (`emit::outline_statics`).
+#[test]
+fn gpu_outlined_memory_functions_compute_the_same() {
+    let code = prog(&[
+        ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 1), ("SOFFSET", 125)], None),
+        ("S_BUFFER_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 12), ("SBASE", 4), ("SOFFSET", 125)], None),
+        ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 16), ("SBASE", 1), ("OFFSET", 16), ("SOFFSET", 125), ("GLC", 1)], None),
+        ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 17), ("SBASE", 1), ("OFFSET", 20), ("SOFFSET", 125), ("DLC", 1)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 18), ("SSRC0", 12), ("SSRC1", 13)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 18), ("SSRC0", 18), ("SSRC1", 14)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 18), ("SSRC0", 18), ("SSRC1", 15)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 18), ("SSRC0", 18), ("SSRC1", 16)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 18), ("SSRC0", 18), ("SSRC1", 17)], None),
+        ("V_LSHL_ADD_U32", "ENC_VOP3", &[("VDST", 1), ("SRC0", V), ("SRC1", 130), ("SRC2", 0)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 128 + CHAIN_WINDOW as u64)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 18)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 1), ("DATA", 3), ("SADDR", 0x7D)], None),
+    ]);
+    let forms: Vec<(bool, usize, String, [String; 2])> = [true, false]
+        .into_iter()
+        .map(|packed| {
+            let threads = if packed { 96 } else { 64 };
+            let cs = super::CsInterface { threads: [threads as u32, 1, 1], user_sgprs: 4, tgid: [false; 3], tg_size: false, tid_components: 3 };
+            let opt = if packed {
+                Options { mode: Mode::Compute(cs), wave64: true, split_wave64: true, legacy_compute_wave64: false, mem_windows: 4, ..Default::default() }
+            } else {
+                Options { mode: Mode::Compute(cs), wave64: false, split_wave64: true, mem_windows: 4, ..Default::default() }
+            };
+            let hlsl = |outline: bool, statics: bool| {
+                super::emit::OUTLINE.set(Some(outline));
+                super::emit::OUTLINE_FORM.set(Some((statics, super::emit::OutlineAtomics::All)));
+                let t = translate(&code, &opt);
+                super::emit::OUTLINE.set(None);
+                super::emit::OUTLINE_FORM.set(None);
+                let t = t.unwrap();
+                assert!(t.complete(), "{:?}", t.unsupported_why);
+                t.hlsl
+            };
+            let (plain, out, stat) = (hlsl(false, false), hlsl(true, false), hlsl(true, true));
+            assert!(!plain.contains("[noinline]"), "{plain}");
+            for (text, kept) in [(&out, ["xcl_mLoad_n", "xcl_mLoad4_n", "xcl_mStore_n"]), (&stat, ["xcl_mLoad_r", "xcl_mLoad4_r", "xcl_mStore_n"])] {
+                for f in kept {
+                    assert!(text.contains(&format!("[noinline] void {f}(")), "{f}
+{text}");
+                }
+            }
+            assert!(out.contains("out uint xr0") && !stat.contains("out uint xr0") && stat.contains("static uint xcl_ret_uint_0;"), "{stat}");
+            (packed, threads, plain, [out, stat])
+        })
+        .collect();
+    const FORMS: [&str; 2] = ["out parameters", "statics"];
+    for (packed, threads, plain, outlined) in &forms {
+        let (io, mem) = chain_state(*threads);
+        let x = interpreted(plain, &io, &mem);
+        assert_eq!(x[64..64 + threads], vec![351; *threads], "interpreted, packed {packed}: the plain program");
+        for (out, form) in outlined.iter().zip(FORMS) {
+            assert_eq!(x, interpreted(out, &io, &mem), "interpreted, packed {packed}: the outlined program, results through {form}");
+        }
+    }
+    if !gpu_ready() {
+        return;
+    }
+    for (packed, threads, plain, outlined) in forms {
+        let run = |hlsl: &str| {
+            let dxil = super::dxc::compile(hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}
+{hlsl}"));
+            let (io, mem) = chain_state(threads);
+            runner::dispatch(&dxil, [1, 1, 1], &io, &mem).unwrap()
+        };
+        let a = run(&plain);
+        assert_eq!(a[64..64 + threads], vec![351; threads], "packed {packed}: the plain program");
+        for (out, form) in outlined.iter().zip(FORMS) {
+            assert_eq!(a, run(out), "packed {packed}: the outlined program, results through {form}");
+        }
+    }
+}
+
+/// Passes of the unrolled part of `outline_gate_code` and of its loop.
+const GATE_REPS: usize = 128;
+const GATE_LOOP: u32 = 8;
+
+/// A program of the shape of the title's big batch-cull programs, for what
+/// `gpu_outlined_memory_functions_compute_the_same` leaves out: `GATE_REPS` unrolled passes, each
+/// with a four-address buffer load (`xcl_loadx4`, a kept function that calls a kept function in
+/// every second pass, where the buffer's dwords are in two 64 KiB blocks), a four-dword and a one-dword load, a load, an atomic add whose old value is used and a store on the
+/// thread's own words, and one of six atomics on words every thread shares; then a counted loop of
+/// `GATE_LOOP` passes around a load, an atomic and a load and store. Outlined, that is about 900
+/// calls in `main` and, with `out` parameters, about 1,400 results handed back through pointers.
+fn outline_gate_code() -> Vec<u8> {
+    let i = |n: &str, e: &str, f: &[(&str, u64)]| encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
+    let glbl = |n: &str, f: &[(&str, u64)]| i(n, "ENC_FLAT_GLBL", &[f, &[("SADDR", 0x7D)]].concat());
+    let mov = |d: u64, s: u64| i("V_MOV_B32", "ENC_VOP1", &[("VDST", d), ("SRC0", s)]);
+    let sadd = |d: u64, s: u64| i("S_ADD_U32", "ENC_SOP2", &[("SDST", d), ("SSRC0", d), ("SSRC1", s)]);
+    let vadd = |d: u64, s: u64| i("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", d), ("SRC0", V + s), ("VSRC1", d)]);
+    let window = 128 + CHAIN_WINDOW as u64;
+    // v[1:2]: the thread's words; v[8:9]: the shared words; v10 = 1 << (thread & 31), v11 = 1, v12 = !v10, v13 = thread + 5
+    let mut code = [
+        i("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 1), ("SOFFSET", 125)]),
+        i("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 28), ("SBASE", 1), ("OFFSET", 32), ("SOFFSET", 125)]),
+        i("V_LSHL_ADD_U32", "ENC_VOP3", &[("VDST", 1), ("SRC0", V), ("SRC1", 130), ("SRC2", 0)]),
+        mov(2, window),
+        mov(8, 128),
+        mov(9, window),
+        mov(11, 129),
+        i("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 10), ("SRC0", V), ("VSRC1", 11)]),
+        i("V_NOT_B32", "ENC_VOP1", &[("VDST", 12), ("SRC0", V + 10)]),
+        i("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 13), ("SRC0", 133), ("VSRC1", 0)]),
+        mov(6, 128),
+        i("S_MOV_B32", "ENC_SOP1", &[("SDST", 18), ("SSRC0", 128)]),
+    ]
+    .concat();
+    const SHARED: [(&str, u64); 6] = [("GLOBAL_ATOMIC_ADD", 11), ("GLOBAL_ATOMIC_OR", 10), ("GLOBAL_ATOMIC_UMIN", 13), ("GLOBAL_ATOMIC_AND", 12), ("GLOBAL_ATOMIC_UMAX", 13), ("GLOBAL_ATOMIC_XOR", 10)];
+    for r in 0..GATE_REPS {
+        let (op, data) = SHARED[r % 6];
+        code.extend(
+            [
+                // s[8:11]: a buffer in one 64 KiB block; s[28:31]: one in two, read a dword a call
+                i("S_BUFFER_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 12), ("SBASE", if r % 2 == 0 { 4 } else { 14 }), ("SOFFSET", 125)]),
+                i("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 24), ("SBASE", 1), ("SOFFSET", 125)]),
+                i("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 16), ("SBASE", 1), ("OFFSET", 16), ("SOFFSET", 125)]),
+                sadd(18, 12),
+                sadd(18, 24),
+                sadd(18, 16),
+                glbl("GLOBAL_LOAD_DWORD", &[("VDST", 4), ("ADDR", 1), ("OFFSET", 0x200)]),
+                glbl("GLOBAL_ATOMIC_ADD", &[("VDST", 5), ("ADDR", 1), ("DATA", 11), ("OFFSET", 0x200), ("GLC", 1)]),
+                vadd(6, 4),
+                vadd(6, 5),
+                glbl("GLOBAL_STORE_DWORD", &[("ADDR", 1), ("DATA", 6), ("OFFSET", 0)]),
+                glbl(op, &[("ADDR", 8), ("DATA", data), ("OFFSET", 128 + 4 * (r as u64 % 6))]),
+            ]
+            .concat(),
+        );
+    }
+    code.extend(i("S_MOV_B32", "ENC_SOP1", &[("SDST", 20), ("SSRC0", 128)]));
+    let body = [
+        i("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 17), ("SBASE", 1), ("OFFSET", 20), ("SOFFSET", 125)]),
+        sadd(18, 17),
+        glbl("GLOBAL_ATOMIC_ADD", &[("ADDR", 8), ("DATA", 11), ("OFFSET", 128)]),
+        glbl("GLOBAL_LOAD_DWORD", &[("VDST", 4), ("ADDR", 1), ("OFFSET", 0)]),
+        vadd(4, 11),
+        glbl("GLOBAL_STORE_DWORD", &[("ADDR", 1), ("DATA", 4), ("OFFSET", 0)]),
+        i("S_ADD_U32", "ENC_SOP2", &[("SDST", 20), ("SSRC0", 20), ("SSRC1", 129)]),
+        i("S_CMP_LT_U32", "ENC_SOPC", &[("SSRC0", 20), ("SSRC1", 128 + GATE_LOOP as u64)]),
+    ]
+    .concat();
+    code.extend(&body);
+    code.extend(i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", (-((body.len() as i64 + 4) / 4)) as u16 as u64)]));
+    code.extend(mov(3, 18));
+    code.extend(glbl("GLOBAL_STORE_DWORD", &[("ADDR", 1), ("DATA", 3), ("OFFSET", 0x400)]));
+    code.extend(i("S_ENDPGM", "ENC_SOPP", &[]));
+    code
+}
+
+/// `io` and memory of `outline_gate_code` (`chain_state`'s table and a second buffer at 0xFFF8; words
+/// 32..38 are the shared ones, 64.., 192.. and 320.. the threads' own), and the memory the program leaves.
+fn outline_gate_state(threads: usize) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+    let (io, mut mem) = chain_state(threads);
+    mem.resize(0x4100, 0);
+    mem[8..12].copy_from_slice(&[0xFFF8, CHAIN_WINDOW, 12, 0]);
+    mem[0x3FFE..0x4001].copy_from_slice(&[211, 223, 227]);
+    mem[34] = u32::MAX;
+    mem[35] = u32::MAX;
+    let (mut after, n) = (mem.clone(), GATE_REPS as u32);
+    for t in 0..threads {
+        let (bit, id) = (1u32 << (t & 31), t as u32 + 5);
+        for r in 0..GATE_REPS {
+            match r % 6 {
+                0 => after[32] += 1,
+                1 => after[33] |= bit,
+                2 => after[34] = after[34].min(id),
+                3 => after[35] &= !bit,
+                4 => after[36] = after[36].max(id),
+                _ => after[37] ^= bit,
+            }
+        }
+        after[32] += GATE_LOOP;
+        after[64 + t] = n * (n - 1) + GATE_LOOP;
+        after[192 + t] = n;
+        after[320 + t] = n / 2 * (101 + 211) + n * (64 + 17) + GATE_LOOP * 23;
+    }
+    (io, mem, after)
+}
+
+/// A form of outlining: `emit::outline_statics`, `emit::outline_atomics`, `emit::outline_flat`.
+type OutlineForm = (bool, super::emit::OutlineAtomics, bool);
+
+/// The forms of outlining the gate tests run, that of this run first.
+fn outline_forms() -> Vec<OutlineForm> {
+    use super::emit::OutlineAtomics::{Add, All, None};
+    let current = (super::emit::outline_statics(), super::emit::outline_atomics(), super::emit::outline_flat());
+    let mut forms = vec![current];
+    forms.extend([(false, All, false), (true, All, false), (false, Add, false), (true, Add, false), (false, None, false), (true, None, false), (false, All, true), (true, All, true), (true, None, true)].into_iter().filter(|f| *f != current));
+    forms
+}
+
+/// A form as its switches read: `XCL_RECOMP_OUTLINE_RESULTS`/`XCL_RECOMP_OUTLINE_ATOMICS`, and
+/// "/flat" for `XCL_RECOMP_OUTLINE_NESTED=flat`.
+fn outline_form_name((statics, atomics, flat): OutlineForm) -> String {
+    format!("{}/{}{}", if statics { "static" } else { "out" }, format!("{atomics:?}").to_lowercase(), if flat { "/flat" } else { "" })
+}
+
+/// `outline_gate_code` plain and in the forms of outlining (`outline_forms`) leaves the memory worked
+/// out by hand: in the interpreter on every machine, and the outlined forms on the GPU through DXC
+/// (the plain program is 1.3 MB of DXIL packed, minutes and gigabytes in a driver, and no form is
+/// compared with it). The GPU part runs this test again in a process a form, the form of this run
+/// first, so a device one form loses is not the next one's: one `outline gate:` line a program
+/// (FINISHED and its wrong words, or FAILED and the error), and the form of this run has to pass.
+/// `XCL_OUTLINE_GATE_FORMS` (e.g. "static/all,out/none/flat") keeps the test to those forms, in this
+/// process; `XCL_OUTLINE_GATE_DUMP` names a folder for the program's code and the HLSL of every form.
+#[test]
+fn gpu_outlined_calls_atomics_and_loops_compute_the_same() {
+    use super::emit::OutlineAtomics::{self, All};
+    let code = outline_gate_code();
+    // a child of this test (below) leaves the interpreter to its parent
+    let (name, child) = (outline_form_name, std::env::var_os("XCL_OUTLINE_GATE_CHILD").is_some());
+    let only: Option<Vec<String>> = std::env::var("XCL_OUTLINE_GATE_FORMS").ok().map(|v| v.split(',').map(|f| f.trim().to_string()).collect());
+    let forms: Vec<OutlineForm> = outline_forms().into_iter().filter(|f| only.as_ref().is_none_or(|o| o.contains(&name(*f)))).collect();
+    assert!(!forms.is_empty(), "XCL_OUTLINE_GATE_FORMS names none of {:?}", outline_forms().into_iter().map(name).collect::<Vec<_>>());
+    let mut programs = Vec::new();
+    for packed in [true, false] {
+        let threads = if packed { 96 } else { 64 };
+        let cs = super::CsInterface { threads: [threads as u32, 1, 1], user_sgprs: 4, tgid: [false; 3], tg_size: false, tid_components: 3 };
+        let opt = if packed {
+            Options { mode: Mode::Compute(cs), wave64: true, split_wave64: true, legacy_compute_wave64: false, mem_windows: 4, ..Default::default() }
+        } else {
+            Options { mode: Mode::Compute(cs), wave64: false, split_wave64: true, mem_windows: 4, ..Default::default() }
+        };
+        let hlsl = |form: Option<OutlineForm>| {
+            super::emit::OUTLINE.set(Some(form.is_some()));
+            super::emit::OUTLINE_FORM.set(form.map(|f| (f.0, f.1)));
+            super::emit::OUTLINE_FLAT.set(form.map(|f| f.2));
+            let t = translate(&code, &opt);
+            super::emit::OUTLINE.set(None);
+            super::emit::OUTLINE_FORM.set(None);
+            super::emit::OUTLINE_FLAT.set(None);
+            let t = t.unwrap();
+            assert!(t.complete(), "{:?}", t.unsupported_why);
+            t.hlsl
+        };
+        let (io, mem, want) = outline_gate_state(threads);
+        let plain = hlsl(None);
+        assert!(!plain.contains("[noinline]"));
+        let differ = |got: &[u32]| got.iter().zip(&want).enumerate().filter(|(_, (a, b))| a != b).map(|(w, (a, b))| format!("word {w}: {a:#x}, not {b:#x}")).take(8).collect::<Vec<_>>();
+        if !child {
+            assert_eq!(differ(&interpreted(&plain, &io, &mem)), Vec::<String>::new(), "interpreted, packed {packed}: the plain program");
+        }
+        programs.push((packed, threads, "plain".to_string(), plain));
+        for form in &forms {
+            let text = hlsl(Some(*form));
+            let kept = |f: &str| text.contains(&format!("[noinline] void {f}("));
+            let r = if form.0 { "_r" } else { "_n" };
+            // a kept function that calls a kept function, and the atomics of the form
+            assert!(kept(&format!("xcl_loadx4{r}")) && kept(&format!("xcl_mLoad{r}")) && kept("xcl_mStore_n"), "{}\n{text}", name(*form));
+            assert_eq!(kept(&format!("xcl_mInterlockedAdd{r}")), form.1 != OutlineAtomics::None, "{}", name(*form));
+            assert_eq!(kept("xcl_mInterlockedOr_n") && kept("xcl_mInterlockedMin_n") && kept("xcl_mInterlockedXor_n"), form.1 == All, "{}", name(*form));
+            assert_eq!(text.contains(" out uint xr0"), !form.0, "{}", name(*form));
+            assert_eq!(text.contains("return uint4(xcl_mLoad_i(a.x), xcl_mLoad_i(a.y), xcl_mLoad_i(a.z), xcl_mLoad_i(a.w)); }"), form.2, "{}", name(*form));
+            if !child {
+                assert_eq!(differ(&interpreted(&text, &io, &mem)), Vec::<String>::new(), "interpreted, packed {packed}: outlined, {}", name(*form));
+            }
+            programs.push((packed, threads, name(*form), text));
+        }
+    }
+    if let Some(dir) = std::env::var_os("XCL_OUTLINE_GATE_DUMP") {
+        std::fs::write(std::path::Path::new(&dir).join("gate-code.bin"), &code).unwrap();
+        for (packed, _, form, hlsl) in &programs {
+            std::fs::write(std::path::Path::new(&dir).join(format!("gate-{}-{}.hlsl", if *packed { "packed" } else { "wave" }, form.replace('/', "-"))), hlsl).unwrap();
+        }
+    }
+    if only.is_none() {
+        let mut lost = Vec::new();
+        for form in &forms {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["gpu::recomp::tests::gpu_outlined_calls_atomics_and_loops_compute_the_same", "--exact", "--nocapture", "--test-threads=1"])
+                .envs([("XCL_OUTLINE_GATE_FORMS", name(*form)), ("XCL_OUTLINE_GATE_CHILD", "1".to_string())])
+                .env_remove("XCL_OUTLINE_GATE_DUMP")
+                .output()
+                .unwrap();
+            // the harness and a panic print in front of a line
+            let text = format!("{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            let lines: Vec<&str> = text.lines().filter_map(|l| l.find("outline gate: ").map(|at| &l[at..])).collect();
+            println!("{}", if lines.is_empty() { format!("outline gate: {}: no line, the process ended with {}", name(*form), out.status) } else { lines.join("\n") });
+            if !out.status.success() {
+                lost.push(name(*form));
+            }
+        }
+        println!("outline gate: forms that failed: {lost:?}");
+        assert!(!lost.contains(&name(forms[0])), "the form of this run, {}, failed (failed: {lost:?})", name(forms[0]));
+        return;
+    }
+    let gpu = gpu_ready();
+    for (packed, threads, form, hlsl) in programs.iter().filter(|p| p.2 != "plain") {
+        if !gpu {
+            println!("outline gate: {form}, packed {packed}: no GPU, not dispatched");
+            continue;
+        }
+        let (io, mem, want) = outline_gate_state(*threads);
+        let t0 = std::time::Instant::now();
+        let dxil = super::dxc::compile(hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("outline gate: {form}, packed {packed}: NOT BUILT: {}", e.lines().next().unwrap_or_default()));
+        let (built, t1) = (t0.elapsed().as_secs_f64(), std::time::Instant::now());
+        let got = runner::dispatch(&dxil, [1, 1, 1], &io, &mem).unwrap_or_else(|e| panic!("outline gate: {form}, packed {packed}: {} B of DXIL in {built:.1} s, FAILED after {:.2} s: {}", dxil.len(), t1.elapsed().as_secs_f64(), e.replace('\n', " | ")));
+        let wrong = got.iter().zip(&want).filter(|(a, b)| a != b).count();
+        println!("outline gate: {form}, packed {packed}: {} B of DXIL in {built:.1} s, FINISHED in {:.2} s on {:?}, {wrong} words wrong", dxil.len(), t1.elapsed().as_secs_f64(), runner::adapter().unwrap_or_default());
+        assert_eq!(wrong, 0, "{form}, packed {packed}: first {:?}", got.iter().zip(&want).enumerate().find(|(_, (a, b))| a != b));
+    }
+}
+
+/// The load chain of `gpu_packed_compute_scalar_load_chain` over four memory windows, packed and per
+/// wave: its two loads before the first flagged one read through the view that is not coherent
+/// (`emit::plain_load_limit`) and the program leaves the memory it leaves with every load coherent.
+#[test]
+fn gpu_plain_loads_read_what_coherent_loads_read() {
+    let code = prog(&[
+        ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 1), ("SOFFSET", 125)], None),
+        ("S_BUFFER_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 12), ("SBASE", 4), ("SOFFSET", 125)], None),
+        ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 16), ("SBASE", 1), ("OFFSET", 16), ("SOFFSET", 125), ("GLC", 1)], None),
+        ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 17), ("SBASE", 1), ("OFFSET", 20), ("SOFFSET", 125), ("DLC", 1)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 18), ("SSRC0", 12), ("SSRC1", 13)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 18), ("SSRC0", 18), ("SSRC1", 14)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 18), ("SSRC0", 18), ("SSRC1", 15)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 18), ("SSRC0", 18), ("SSRC1", 16)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 18), ("SSRC0", 18), ("SSRC1", 17)], None),
+        ("V_LSHL_ADD_U32", "ENC_VOP3", &[("VDST", 1), ("SRC0", V), ("SRC1", 130), ("SRC2", 0)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 128 + CHAIN_WINDOW as u64)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 18)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 1), ("DATA", 3), ("SADDR", 0x7D)], None),
+    ]);
+    let forms: Vec<(bool, usize, String, String)> = [true, false]
+        .into_iter()
+        .map(|packed| {
+            let threads = if packed { 96 } else { 64 };
+            let cs = super::CsInterface { threads: [threads as u32, 1, 1], user_sgprs: 4, tgid: [false; 3], tg_size: false, tid_components: 3 };
+            let opt = if packed {
+                Options { mode: Mode::Compute(cs), wave64: true, split_wave64: true, legacy_compute_wave64: false, mem_windows: 4, ..Default::default() }
+            } else {
+                Options { mode: Mode::Compute(cs), wave64: false, split_wave64: true, mem_windows: 4, ..Default::default() }
+            };
+            let hlsl = |plain: bool| {
+                super::emit::PLAIN_LOADS.set(Some(plain));
+                let t = translate(&code, &opt);
+                super::emit::PLAIN_LOADS.set(None);
+                let t = t.unwrap();
+                assert!(t.complete(), "{:?}", t.unsupported_why);
+                t.hlsl
+            };
+            let (coherent, plain) = (hlsl(false), hlsl(true));
+            assert!(coherent.contains("globallycoherent ") && !coherent.contains("_cached"), "{coherent}");
+            let body = plain.split_once("void main(").unwrap().1;
+            assert!(body.contains(" = xcl_m_cachedLoad4") && body.contains("xcl_loadx4") && body.contains("_cached(") && body.contains(" = xcl_mLoad"), "{body}");
+            (packed, threads, coherent, plain)
+        })
+        .collect();
+    for (packed, threads, coherent, plain) in &forms {
+        let (io, mem) = chain_state(*threads);
+        let (x, y) = (interpreted(coherent, &io, &mem), interpreted(plain, &io, &mem));
+        assert_eq!(x[64..64 + threads], vec![351; *threads], "interpreted, packed {packed}: every load coherent");
+        assert_eq!(x, y, "interpreted, packed {packed}: the first loads on the view that is not coherent");
+    }
+    if !gpu_ready() {
+        return;
+    }
+    for (packed, threads, coherent, plain) in forms {
+        let run = |hlsl: &str| {
+            let dxil = super::dxc::compile(hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}
+{hlsl}"));
+            let (io, mem) = chain_state(threads);
+            runner::dispatch(&dxil, [1, 1, 1], &io, &mem).unwrap()
+        };
+        let (a, b) = (run(&coherent), run(&plain));
+        assert_eq!(a[64..64 + threads], vec![351; threads], "packed {packed}: every load coherent");
+        assert_eq!(a, b, "packed {packed}: the first loads on the view that is not coherent");
+    }
+}
+
 #[test]
 fn gpu_packed_compute_lds_orders_both_slots_at_the_guest_barrier() {
     if !gpu_ready() {
@@ -8108,13 +8527,18 @@ fn split_wave64_meet_in_a_half_divergent_branch_keeps_the_spin() {
     assert!(lower.contains("xcl_x_ballot(true)"), "{}", gs.hlsl);
     assert!(gs.hlsl.contains("#define XCL_X_SPIN 1"), "{}", gs.hlsl);
     let cs = super::CsInterface { threads: [64, 1, 1], user_sgprs: 4, tgid: [false; 3], tg_size: false, tid_components: 1 };
-    let one_wave = translate(&prog(end), &Options { mode: Mode::Compute(cs), wave64: true, split_wave64: true, legacy_compute_wave64: true, ..Default::default() }).unwrap();
+    let one_wave = translate(&prog(end), &Options { mode: Mode::Compute(cs.clone()), wave64: true, split_wave64: true, legacy_compute_wave64: true, thread_limits: false, ..Default::default() }).unwrap();
     assert!(one_wave.hlsl.contains("xcl_x_ballot(true)"), "{}", one_wave.hlsl);
+    // with the dispatch's thread limits the launch ballot is of the lanes below them, met the same way
+    let limited = translate(&prog(end), &Options { mode: Mode::Compute(cs), wave64: true, split_wave64: true, legacy_compute_wave64: true, thread_limits: true, ..Default::default() }).unwrap();
+    assert!(limited.hlsl.contains("uint2 e0 = xcl_x_ballot(all(gid * uint3(64u, 1u, 1u) + gtid <= xcl_tl));"), "{}", limited.hlsl);
     if std::env::var_os("XCL_WAVE64_SPIN").is_none() {
-        assert!(one_wave.hlsl.contains("#define XCL_X_SPIN 0\n#define XCL_X_PAIR 1"), "{}", one_wave.hlsl);
+        for t in [&one_wave, &limited] {
+            assert!(t.hlsl.contains("#define XCL_X_SPIN 0\n#define XCL_X_PAIR 1"), "{}", t.hlsl);
+        }
     }
     if super::dxc::location().is_ok() {
-        for t in [&gs, &one_wave] {
+        for t in [&gs, &one_wave, &limited] {
             super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
         }
     }
@@ -10912,4 +11336,161 @@ fn gpu_ps_mask_loop_on_a_primitive_edge_ends() {
     let bad: Vec<(usize, usize, [f32; 4])> = (0..size * size).filter(|&i| px[i][0] != 6.0 || px[i][1] != 6.0).map(|i| (i % size, i / size, px[i])).collect();
     println!("{:?}: lane counts {lanes:?}; {} of {} pixels wrong, first {:?}", runner::adapter(), bad.len(), size * size, bad.iter().take(8).collect::<Vec<_>>());
     assert!(bad.is_empty(), "{} pixels wrong (passes, steps, 1, lane count), first {:?}", bad.len(), &bad[..bad.len().min(8)]);
+}
+
+/// A program outside a title run, for what a driver does with it (a device removed at once, as
+/// with the outlined batch-cull programs of play-102). `XCL_REPRO=<file or folder>` names dumped
+/// console compute shaders (`*_cs.bin`: built the way a run builds them, so the translator's
+/// switches apply), HLSL (`*.hlsl`: a cs_6_6 program with the entry `main`, through
+/// `dxc::compile`) and DXIL (`*.dxil`: as it is, e.g. a file of the DXIL cache). Each becomes a
+/// pipeline on the test device and is dispatched once (`XCL_REPRO_GROUPS=x,y,z`, default 1,1,1)
+/// over stand-in state with no title data, in a process of its own (`XCL_REPRO_ONE`): a device one program loses is not the next one's. One
+/// `repro:` line an input; a process that gives none within `XCL_REPRO_TIMEOUT` seconds
+/// (default 600) is ended. `XCL_DXIL_CACHE` must name a scratch folder, so the emulator's cache
+/// is never written. The state (`XCL_REPRO_STATE`): "soup", the default, makes every pair of words
+/// in the user registers and in 256 KiB of window 0 read as a pointer into that window, as a
+/// count and as a buffer's base, so a title program gets past its first tests and its loads
+/// stay in the window; "zero" leaves both zeroed, and most programs leave at their first count.
+/// Without `XCL_REPRO` the test does nothing.
+#[test]
+fn gpu_repro_programs() {
+    use std::io::Write;
+    if let Some(one) = std::env::var_os("XCL_REPRO_ONE") {
+        let path = std::path::PathBuf::from(one);
+        println!("repro: {}: {}", path.file_name().unwrap_or_default().to_string_lossy(), repro_one(&path));
+        let _ = std::io::stdout().flush();
+        return;
+    }
+    let Some(input) = std::env::var_os("XCL_REPRO") else {
+        return;
+    };
+    assert!(std::env::var_os("XCL_DXIL_CACHE").is_some(), "set XCL_DXIL_CACHE to a scratch folder: this test must not write the emulator's DXIL cache");
+    let input = std::path::PathBuf::from(input);
+    let mut files: Vec<std::path::PathBuf> = if input.is_dir() {
+        std::fs::read_dir(&input).unwrap().flatten().map(|e| e.path()).filter(|p| ["bin", "hlsl", "dxil"].iter().any(|x| p.extension().is_some_and(|e| e.eq_ignore_ascii_case(x)))).collect()
+    } else {
+        vec![input.clone()]
+    };
+    files.sort();
+    assert!(!files.is_empty(), "no *.bin, *.hlsl or *.dxil in {input:?}");
+    println!("repro: {} programs, {:?} groups each", files.len(), repro_groups());
+    for f in &files {
+        println!("{}", repro_child(f, &[]));
+        let _ = std::io::stdout().flush();
+    }
+}
+
+/// One input of `gpu_repro_programs` in a process of its own, with `env` added to this one's: its
+/// `repro:` line. A process that gives none within `XCL_REPRO_TIMEOUT` seconds is ended.
+fn repro_child(f: &std::path::Path, env: &[(&str, &str)]) -> String {
+    use std::io::Read;
+    let limit = std::time::Duration::from_secs(std::env::var("XCL_REPRO_TIMEOUT").ok().and_then(|v| v.parse().ok()).unwrap_or(600));
+    let name = f.file_name().unwrap_or_default().to_string_lossy().into_owned();
+    let t0 = std::time::Instant::now();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["gpu::recomp::tests::gpu_repro_programs", "--exact", "--nocapture", "--test-threads=1"])
+        .env("XCL_REPRO_ONE", f)
+        .envs(env.iter().copied())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut pipe = child.stdout.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = pipe.read_to_string(&mut s);
+        s
+    });
+    let status = loop {
+        match child.try_wait().unwrap() {
+            Some(s) => break Some(s),
+            None if t0.elapsed() > limit => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(100)),
+        }
+    };
+    let out = reader.join().unwrap_or_default();
+    // the harness prints "test <name> ... " in front of the child's line unless something ended that line first
+    match (out.lines().find_map(|l| l.find("repro: ").map(|at| &l[at..])), status) {
+        (Some(line), _) => line.to_string(),
+        (None, Some(s)) => format!("repro: {name}: NO RESULT, the process ended with {s} after {:.1} s", t0.elapsed().as_secs_f64()),
+        (None, None) => format!("repro: {name}: NO RESULT in {:.0} s, the process was ended", t0.elapsed().as_secs_f64()),
+    }
+}
+
+/// Dumped console compute shaders (`XCL_OUTLINE_GATE_PROGRAMS=<file or folder of *_cs.bin>`, e.g.
+/// the title's big batch-cull programs) built in every form of outlining and dispatched once each
+/// the way `gpu_repro_programs` does it (its groups, state, time limit and scratch `XCL_DXIL_CACHE`),
+/// a process a program and form: one `outline gate:` line each, and the form of this run has to
+/// finish on every program. `XCL_OUTLINE_GATE_FORMS` keeps it to the forms named. A program below
+/// `XCL_RECOMP_OUTLINE_MIN_INSTS` is plain in every form. Without the variable the test does nothing.
+#[test]
+fn gpu_outlined_title_programs_finish() {
+    use std::io::Write;
+    let Some(input) = std::env::var_os("XCL_OUTLINE_GATE_PROGRAMS") else {
+        return;
+    };
+    assert!(std::env::var_os("XCL_DXIL_CACHE").is_some(), "set XCL_DXIL_CACHE to a scratch folder: this test must not write the emulator's DXIL cache");
+    let input = std::path::PathBuf::from(input);
+    let mut files: Vec<std::path::PathBuf> = if input.is_dir() { std::fs::read_dir(&input).unwrap().flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("bin"))).collect() } else { vec![input.clone()] };
+    files.sort();
+    assert!(!files.is_empty(), "no *.bin in {input:?}");
+    let only: Option<Vec<String>> = std::env::var("XCL_OUTLINE_GATE_FORMS").ok().map(|v| v.split(',').map(|f| f.trim().to_string()).collect());
+    let forms = outline_forms();
+    let mut lost = Vec::new();
+    for f in &files {
+        for form in forms.iter().filter(|f| only.as_ref().is_none_or(|o| o.contains(&outline_form_name(**f)))) {
+            let name = outline_form_name(*form);
+            let part: Vec<&str> = name.split('/').collect();
+            let line = repro_child(f, &[("XCL_RECOMP_OUTLINE_RESULTS", part[0]), ("XCL_RECOMP_OUTLINE_ATOMICS", part[1]), ("XCL_RECOMP_OUTLINE_NESTED", part.get(2).copied().unwrap_or("keep"))]);
+            println!("outline gate: {name}: {}", line.trim_start_matches("repro: "));
+            let _ = std::io::stdout().flush();
+            if *form == forms[0] && !line.contains("; FINISHED ") && !line.contains("; no GPU, not dispatched") {
+                lost.push(line);
+            }
+        }
+    }
+    assert!(lost.is_empty(), "the form of this run, {}, did not finish:\n{}", outline_form_name(forms[0]), lost.join("\n"));
+}
+
+fn repro_groups() -> [u32; 3] {
+    let v: Vec<u32> = std::env::var("XCL_REPRO_GROUPS").unwrap_or_default().split(',').filter_map(|x| x.trim().parse().ok()).collect();
+    [v.first().copied().unwrap_or(1).max(1), v.get(1).copied().unwrap_or(1).max(1), v.get(2).copied().unwrap_or(1).max(1)]
+}
+
+/// One input of `gpu_repro_programs`: what became of it, in one line.
+fn repro_one(path: &std::path::Path) -> String {
+    let t0 = std::time::Instant::now();
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => return format!("NOT READ: {e}"),
+    };
+    let is = |x: &str| path.extension().is_some_and(|e| e.eq_ignore_ascii_case(x));
+    let dxil = if is("dxil") {
+        Ok(bytes)
+    } else if is("hlsl") {
+        String::from_utf8(bytes).map_err(|e| e.to_string()).and_then(|s| super::dxc::compile(&s, "main", "cs_6_6", &[]))
+    } else {
+        super::pso::console_to_dxil_in(&bytes, super::pso::Stage::Compute, 0, true, 4).map(|c| c.dxil)
+    };
+    let dxil = match dxil {
+        Ok(d) => d,
+        Err(e) => return format!("NOT BUILT in {:.1} s: {}", t0.elapsed().as_secs_f64(), e.lines().next().unwrap_or_default()),
+    };
+    let built = format!("{} B of DXIL in {:.1} s", dxil.len(), t0.elapsed().as_secs_f64());
+    if !gpu_ready() {
+        return format!("{built}; no GPU, not dispatched");
+    }
+    let soup = std::env::var("XCL_REPRO_STATE").map_or(true, |v| v.trim() != "zero");
+    let word = |k: usize| if !soup { 0 } else if k % 2 == 0 { 0x1000 } else { CHAIN_WINDOW };
+    let mut io: Vec<u32> = (0..128).map(|k| if k < 32 { word(k) } else { 0 }).collect();
+    io[super::IO_UMA_BASE_HI] = CHAIN_WINDOW;
+    let mem: Vec<u32> = (0..1 << 16).map(word).collect();
+    let (groups, t1) = (repro_groups(), std::time::Instant::now());
+    match runner::dispatch(&dxil, groups, &io, &mem) {
+        Ok(after) => format!("{built}; FINISHED {groups:?} groups in {:.2} s on {:?} ({} memory words changed)", t1.elapsed().as_secs_f64(), runner::adapter().unwrap_or_default(), after.iter().zip(&mem).filter(|(a, b)| a != b).count()),
+        Err(e) => format!("{built}; FAILED {groups:?} groups after {:.2} s: {}", t1.elapsed().as_secs_f64(), e.replace('\n', " | ")),
+    }
 }

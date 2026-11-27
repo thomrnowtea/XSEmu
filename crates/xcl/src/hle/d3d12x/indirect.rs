@@ -392,6 +392,9 @@ pub(super) struct Unwritten {
     /// views (start, bytes) and the distinct pipelines seen with a UAV over each, up to
     /// `SHARED_BINDERS`
     binders: BTreeMap<(u64, u64), Vec<usize>>,
+    /// shared pools (start, end): views bound by `SHARED_BINDERS` pipelines; a view inside one
+    /// is part of the pool, whatever its own start and size
+    pools: Vec<(u64, u64)>,
 }
 
 impl Unwritten {
@@ -400,7 +403,7 @@ impl Unwritten {
     pub(super) fn bound(&mut self, producer: usize, ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
         let mut pooled = Vec::new();
         for &(start, bytes) in ranges.iter().filter(|r| r.1 > 0 && r.1 <= MAX_TRACKED).take(64) {
-            if self.binders.len() >= 4096 && !self.binders.contains_key(&(start, bytes)) {
+            if self.in_pool(start, bytes) || self.binders.len() >= 4096 && !self.binders.contains_key(&(start, bytes)) {
                 continue;
             }
             let b = self.binders.entry((start, bytes)).or_default();
@@ -411,15 +414,20 @@ impl Unwritten {
                 }
             }
         }
-        if !pooled.is_empty() {
-            self.ranges.retain(|&(s, e, _)| !pooled.iter().any(|&(start, bytes)| s == start && e == start.saturating_add(bytes)));
+        for &(start, bytes) in &pooled {
+            let end = start.saturating_add(bytes);
+            if self.pools.len() < 4096 {
+                self.pools.push((start, end));
+            }
+            self.ranges.retain(|&(s, e, _)| s < start || e > end);
         }
         pooled
     }
 
-    /// Whether the view (start, bytes) is a shared pool.
-    fn shared(&self, start: u64, bytes: u64) -> bool {
-        self.binders.get(&(start, bytes)).is_some_and(|b| b.len() >= SHARED_BINDERS)
+    /// Whether the view (start, bytes) lies inside a shared pool.
+    fn in_pool(&self, start: u64, bytes: u64) -> bool {
+        let end = start.saturating_add(bytes);
+        self.pools.iter().any(|&(s, e)| s <= start && end <= e)
     }
 
     /// `producer` was skipped while bound to `ranges` (start, bytes): they replace its earlier ones.
@@ -427,7 +435,7 @@ impl Unwritten {
         let pooled = self.bound(producer, ranges);
         self.ranges.retain(|r| r.2 != producer);
         for &(start, bytes) in ranges.iter().filter(|r| r.1 > 0 && r.1 <= MAX_TRACKED).take(64) {
-            if self.shared(start, bytes) {
+            if self.in_pool(start, bytes) {
                 continue;
             }
             if self.ranges.len() >= 4096 {
@@ -446,7 +454,7 @@ impl Unwritten {
     /// A dispatch ran with UAVs over `ranges` (start, bytes): what they cover is written, whoever
     /// skipped it.
     pub(super) fn written(&mut self, ranges: &[(u64, u64)]) {
-        let placed: Vec<_> = ranges.iter().copied().filter(|r| r.1 > 0 && r.1 <= MAX_TRACKED && !self.shared(r.0, r.1)).collect();
+        let placed: Vec<_> = ranges.iter().copied().filter(|r| r.1 > 0 && r.1 <= MAX_TRACKED && !self.in_pool(r.0, r.1)).collect();
         for (start, bytes) in placed {
             let end = start.saturating_add(bytes);
             if !self.ranges.iter().any(|&(s, e, _)| start < e && s < end) {
@@ -480,7 +488,24 @@ impl Unwritten {
     }
 }
 
-static UNWRITTEN: Mutex<Unwritten> = Mutex::new(Unwritten { ranges: Vec::new(), binders: BTreeMap::new() });
+static UNWRITTEN: Mutex<Unwritten> = Mutex::new(Unwritten { ranges: Vec::new(), binders: BTreeMap::new(), pools: Vec::new() });
+
+/// Indirect calls refused since the last `take_refusals`, by the unwritten range they read
+/// (start, end) and the skipped pipeline it waits for.
+static REFUSED: Mutex<BTreeMap<(u64, u64, usize), u64>> = Mutex::new(BTreeMap::new());
+
+/// The refusals since the last call, most first: ((start, end, producer), calls).
+pub(super) fn take_refusals() -> Vec<((u64, u64, usize), u64)> {
+    let mut v: Vec<_> = std::mem::take(&mut *REFUSED.lock().unwrap()).into_iter().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    v
+}
+
+/// `XCL_INDIRECT_PRODUCER_FIRST=0`: a refused call leaves its producer's build where it is.
+fn producer_first() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_INDIRECT_PRODUCER_FIRST").map_or(true, |v| v.trim() != "0"))
+}
 
 fn log_pooled(pooled: &[(u64, u64)]) {
     for &(start, bytes) in pooled {
@@ -544,18 +569,25 @@ pub(super) fn produced(pso: usize) {
 }
 
 /// Whether an indirect call with `sig` reading `max` records at console address `args` (and its
-/// count at `count`) may run: Err names the skipped producer of what it reads.
+/// count at `count`) may run: Err names the skipped producer of what it reads. A refusal is
+/// counted by range and producer (`take_refusals`), and a producer still building is built
+/// before every other pipeline (`pso_async::build_first`).
 pub(super) fn check(sig: usize, max: u32, args: Option<u64>, count: Option<u64>) -> Result<(), String> {
-    let u = UNWRITTEN.lock().unwrap();
-    if u.is_empty() {
-        return Ok(());
+    let hit = {
+        let u = UNWRITTEN.lock().unwrap();
+        if u.is_empty() {
+            return Ok(());
+        }
+        let stride = signature(sig).map_or(16, |s| s.1.max(4)) as u64;
+        let hit = |what: &'static str, at: u64, bytes: u64| u.overlapping(at, bytes).map(|r| (what, at, r));
+        args.and_then(|a| hit("arguments", a, stride * max.max(1) as u64)).or_else(|| count.and_then(|c| hit("count", c, 4)))
+    };
+    let Some((what, at, (s, e, p))) = hit else { return Ok(()) };
+    *REFUSED.lock().unwrap().entry((s, e, p)).or_insert(0) += 1;
+    if producer_first() && super::pso_async::build_first(p) {
+        crate::xlog_info!("D3D12.X: indirect guard: pipeline {p:#x} builds before every other one – an indirect call reads {s:#x}..{e:#x}, which it writes");
     }
-    let stride = signature(sig).map_or(16, |s| s.1.max(4)) as u64;
-    let hit = |what: &str, at: u64, bytes: u64| u.overlapping(at, bytes).map(|(s, e, p)| format!("its {what} at {at:#x} lie in {s:#x}..{e:#x}, unwritten since a dispatch of pipeline {p:#x} was skipped"));
-    match args.and_then(|a| hit("arguments", a, stride * max.max(1) as u64)).or_else(|| count.and_then(|c| hit("count", c, 4))) {
-        Some(why) => Err(why),
-        None => Ok(()),
-    }
+    Err(format!("its {what} at {at:#x} lie in {s:#x}..{e:#x}, unwritten since a dispatch of pipeline {p:#x} was skipped"))
 }
 
 /// XCL's sanitiser: (root signature, pipeline), raw; None when it could not be made (logged).

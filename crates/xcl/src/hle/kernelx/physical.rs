@@ -1800,6 +1800,12 @@ pub(crate) fn pages_allocated(pages: &[usize]) -> bool {
     pages.iter().all(|&p| g.block_of(p).is_some())
 }
 
+/// (diagnostics, `memdiag`) The map history: (events, bytes of one, bytes the ring holds).
+pub(crate) fn diag_map_history() -> (usize, usize, usize) {
+    let g = PHYS.lock().unwrap();
+    (g.history.len(), std::mem::size_of::<crate::alias::MapEvent>(), g.history.bytes())
+}
+
 /// `XCL_TRACE_MAPS=1`: every physical page map and unmap (`what`, the address range, the pages,
 /// the result); a failed map is logged always.
 pub(crate) fn trace_maps() -> bool {

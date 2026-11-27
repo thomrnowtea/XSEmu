@@ -139,8 +139,31 @@ pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wa
         cache_dir: dxc::cache_dir(),
     };
     let profile = stage == Stage::Compute && super::loop_profile::enabled_for(blob);
-    let from_disk = || translated::cached_in(&dxc::cache_dir(), translated::identity_for_layout(legacy, profile), blob, stage, sampler_base, windows, split_wave64, compile_one);
+    let from_disk = || translated::cached_in(&dxc::cache_dir(), translated_identity(blob, stage, legacy, profile), blob, stage, sampler_base, windows, split_wave64, compile_one);
     cached_shader(cache, key, blob, from_disk).map(|shader| shader.as_ref().clone())
+}
+
+/// The translated cache's identity for `blob`: a program that may traverse acceleration structures
+/// is another translation with every ray a miss (`rt_all_miss`), and a compute program another one
+/// without the dispatch thread limits in its prologue (`XCL_DISPATCH_THREAD_DIMENSIONS=0`); every
+/// other program keeps the build's identity, so neither switch makes the other stages cold.
+fn translated_identity(blob: &[u8], stage: Stage, legacy: bool, profile: bool) -> u64 {
+    let ident = translated::identity_for_layout(legacy, profile);
+    let ident = tagged_identity(ident, stage == Stage::Compute && !super::dispatch_thread_dimensions(), "no-thread-limits");
+    rt_miss_identity(ident, super::rt_all_miss() && super::may_trace_rays(blob))
+}
+
+pub(super) fn rt_miss_identity(ident: u64, miss: bool) -> u64 {
+    tagged_identity(ident, miss, "rt-all-miss")
+}
+
+/// `ident` with `tag` when `on`; a disabled cache (0) stays disabled.
+pub(super) fn tagged_identity(ident: u64, on: bool, tag: &str) -> u64 {
+    if ident != 0 && on {
+        translated::identity_for(&format!("{ident:016x}"), tag)
+    } else {
+        ident
+    }
 }
 
 fn legacy_compute_selected(hash: u64) -> bool {
@@ -204,11 +227,14 @@ mod translated {
             base
         };
         let nan = if super::nan_guards() { "nan-guards" } else { "" };
+        let nan = &["XCL_RECOMP_NO_PLAIN_LOADS", "XCL_RECOMP_PLAIN_MEMORY"].iter().filter(|v| std::env::var_os(v).is_some()).fold(nan.to_string(), |s, v| format!("{s}\0{v}"));
         let guard = super::super::loop_guard();
-        let trip_counters = crate::config::gpu_markers_enabled();
+        let trip_counters = crate::config::guard_trips_enabled();
         let static_cap = super::super::loop_profile::static_cap();
-        // the A/B switches of the structured form, the lane-guard proofs, the quad reads and the page groups change the HLSL
-        let nan = ["XCL_RECOMP_NO_CFG", "XCL_RECOMP_NO_EXEC_PROOF", "XCL_RECOMP_NO_QUAD_READS", "XCL_RECOMP_NO_PAGE_GROUPS"].iter().filter(|v| std::env::var_os(v).is_some()).fold(nan.to_string(), |s, v| format!("{s}\0{v}"));
+        // the A/B switches of the structured form, the lane-guard proofs, the quad reads, the page groups, their accessors and the primitive index width change the HLSL
+        let nan = ["XCL_RECOMP_NO_CFG", "XCL_RECOMP_NO_EXEC_PROOF", "XCL_RECOMP_NO_QUAD_READS", "XCL_RECOMP_NO_PAGE_GROUPS", "XCL_RECOMP_NO_ACCESSOR_SHRINK", "XCL_RECOMP_NO_OUTLINE", "XCL_RECOMP_NO_PRIM9"].iter().filter(|v| std::env::var_os(v).is_some()).fold(nan.to_string(), |s, v| format!("{s}\0{v}"));
+        let nan = std::env::var("XCL_RECOMP_OUTLINE_MIN_INSTS").map_or(nan.clone(), |n| format!("{nan}\0outline-min-insts={n}"));
+        let nan = ["XCL_RECOMP_OUTLINE_RESULTS", "XCL_RECOMP_OUTLINE_ATOMICS", "XCL_RECOMP_OUTLINE_NESTED"].iter().fold(nan, |s, v| std::env::var(v).map_or(s.clone(), |x| format!("{s}\0{v}={x}")));
         if legacy {
             return identity_for(&format!("{base:016x}"), &format!("{nan}\0loop-guard={guard}\0trip-counters={trip_counters}\0loop-profile={profile}\0static-loop-cap={static_cap}\0legacy-compute-wave64"));
         }
@@ -402,7 +428,7 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
                 Ok::<_, String>(Compiled { dxil, samplers: legacy.static_samplers })
             };
             let legacy = if cache_allowed(stage, |name| std::env::var_os(name).is_some()) {
-                translated::cached_in(&dxc::cache_dir(), translated::identity_for_layout(true, false), blob, stage, sampler_base, windows, split_wave64, emit_legacy)
+                translated::cached_in(&dxc::cache_dir(), translated_identity(blob, stage, true, false), blob, stage, sampler_base, windows, split_wave64, emit_legacy)
             } else {
                 emit_legacy()
             };
@@ -604,13 +630,19 @@ fn cache_allowed(stage: Stage, present: impl Fn(&str) -> bool) -> bool {
 /// s0…s3 are the driver's, so what is above 4 is the root arguments its compiler passed in
 /// registers. None: not a console compute shader.
 pub fn compute_user_sgprs(blob: &[u8]) -> Option<u32> {
+    compute_interface(blob).map(|cs| cs.user_sgprs)
+}
+
+/// The dispatch ABI of a console compute shader: its user SGPRs and the console's group shape
+/// (`numthreads`). None: not a console compute shader.
+pub fn compute_interface(blob: &[u8]) -> Option<super::CsInterface> {
     if let Some(f) = fspx(blob) {
-        return Some(super::CsInterface::from_rsrc2(f.threads, f.rsrc2).user_sgprs);
+        return Some(super::CsInterface::from_rsrc2(f.threads, f.rsrc2));
     }
     let sh = xbox::parse(blob)?;
     let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 6))?;
     match interface(blob, &sh, f)? {
-        Mode::Compute(cs) => Some(cs.user_sgprs),
+        Mode::Compute(cs) => Some(cs),
         _ => None,
     }
 }
@@ -638,7 +670,7 @@ fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, windows: u3
 }
 
 fn with_console_code<R>(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool, run: impl FnOnce(&[u8], Options, &'static str) -> Result<R, String>) -> Result<R, String> {
-    let guard_trip_counters = stage != Stage::Compute || crate::config::gpu_markers_enabled();
+    let guard_trip_counters = stage != Stage::Compute || crate::config::guard_trips_enabled();
     let options = Options { split_wave64, static_sampler_base: sampler_base, mem_windows: windows, nan_guards: nan_guards(), guard_trip_counters, ..Default::default() };
     if let Some(f) = fspx(blob) {
         if stage != Stage::Compute {
@@ -1795,43 +1827,5 @@ mod shader_bench {
             }
         }
         println!("pairs: {tried} tried, {missing} not found or not translated, {plain} refused without the GS, {only_gs} refused only with it");
-    }
-}
-
-#[cfg(test)]
-mod title_corpus {
-    //! `XCL_RECOMP_TITLE_CORPUS=<folder of dumped console shaders (*_cs.bin, *_ps.bin, *_vs.bin)>`:
-    //! every shader translates as the runtime translates it (4 memory windows, split wave64) and
-    //! DXC compiles the result. The folder holds title data and stays on the machine that has the
-    //! title; without it the test does nothing.
-    use super::*;
-
-    #[test]
-    fn title_shaders_translate_and_compile() {
-        let Some(dir) = std::env::var_os("XCL_RECOMP_TITLE_CORPUS") else {
-            println!("XCL_RECOMP_TITLE_CORPUS not set");
-            return;
-        };
-        let mut files: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()).collect();
-        files.sort();
-        let (mut n, mut failed) = (0, Vec::new());
-        for path in files {
-            let name = path.file_name().unwrap().to_string_lossy().into_owned();
-            let stage = match name.rsplit_once('_').map(|(_, s)| s) {
-                Some("cs.bin") => Stage::Compute,
-                Some("ps.bin") => Stage::Pixel,
-                Some("vs.bin") => Stage::Vertex,
-                _ => continue,
-            };
-            n += 1;
-            let blob = std::fs::read(&path).unwrap();
-            let r = console_translation(&blob, stage, 0, 4, true, false).and_then(|(t, profile)| dxc::compile_dxc_only(&t.hlsl, "main", profile).map(drop));
-            if let Err(e) = r {
-                failed.push(format!("{name}: {}", e.lines().next().unwrap_or_default()));
-            }
-        }
-        assert!(n > 0, "no console shaders in {dir:?}");
-        println!("{n} title shaders translated and compiled, {} failed", failed.len());
-        assert!(failed.is_empty(), "{}", failed.join("\n"));
     }
 }

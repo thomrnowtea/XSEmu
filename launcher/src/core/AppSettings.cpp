@@ -48,6 +48,7 @@ QVariantMap WarmupRun::toMap() const
         {QStringLiteral("full"), full},
         {QStringLiteral("stoppedForRam"), stoppedForRam},
         {QStringLiteral("message"), message},
+        {QStringLiteral("profile"), profile},
         {QStringLiteral("finishedAt"), finishedAt.toUTC().toString(Qt::ISODate)},
     };
 }
@@ -67,6 +68,7 @@ WarmupRun WarmupRun::fromMap(const QVariantMap& m)
     r.full = m.value(QStringLiteral("full")).toBool();
     r.stoppedForRam = m.value(QStringLiteral("stoppedForRam")).toBool();
     r.message = m.value(QStringLiteral("message")).toString();
+    r.profile = m.value(QStringLiteral("profile")).toString();
     r.finishedAt = QDateTime::fromString(m.value(QStringLiteral("finishedAt")).toString(), Qt::ISODate);
     return r;
 }
@@ -238,11 +240,15 @@ void AppSettings::setEmulatorPathOverride(const QString& path) { write(Key::Emul
 
 QString AppSettings::emulatorPath() const
 {
-    const QString env = qEnvironmentVariable("XSEMU_EMULATOR").trimmed();
-    if (!env.isEmpty())
-        return env;
+    if (emulatorPathFromEnvironment())
+        return qEnvironmentVariable("XSEMU_EMULATOR").trimmed();
     const QString o = emulatorPathOverride();
     return o.isEmpty() ? Paths::defaultEmulatorPath() : o;
+}
+
+bool AppSettings::emulatorPathFromEnvironment()
+{
+    return !qEnvironmentVariable("XSEMU_EMULATOR").trimmed().isEmpty();
 }
 
 QString AppSettings::busyMarker() const
@@ -255,6 +261,59 @@ void AppSettings::setBusyMarker(const QString& path) { write(Key::BusyMarker, pa
 
 int AppSettings::launchNeedMb() const { return read(Key::LaunchNeedMb, kDefaultLaunchNeedMb).toInt(); }
 void AppSettings::setLaunchNeedMb(int mb) { write(Key::LaunchNeedMb, mb); }
+
+const QStringList& AppSettings::defaultRunProfile()
+{
+    // the run switches of the PC's play-102 runs
+    static const QStringList lines{
+        QStringLiteral("XCL_SHADER_BACKEND=dxil"),
+        QStringLiteral("XCL_LOOP_GUARD=1024"),
+        QStringLiteral("XCL_RECOMP_OUTLINE_MIN_INSTS=4096"),
+        QStringLiteral("XCL_RECOMP_OUTLINE_RESULTS=static"),
+        QStringLiteral("XCL_RECOMP_NO_PLAIN_LOADS=1"),
+        QStringLiteral("XCL_TEXTURE_ALIAS=0"),
+        QStringLiteral("XCL_CHAIN_HOLD=0"),
+        QStringLiteral("XCL_FSR4_STANDIN=1"),
+        QStringLiteral("XCL_BVH_NODE_FIX=1"),
+        QStringLiteral("XCL_COMPUTE_PER_ACCESS_COHERENCE=0"),
+        QStringLiteral("XCL_LOOP_PROFILE=67657769b50d2f8b"),
+        QStringLiteral("XCL_PSO_LIBRARY=0"),
+        QStringLiteral("XCL_IMAGE_WRITEBACK=0"),
+        QStringLiteral("XCL_LAZY_MESH_PSO=1"),
+        QStringLiteral("XCL_DISPLAY_MODE=3840x2160"),
+        QStringLiteral("XCL_WAIT_TIMEOUT_MS=20000"),
+        QStringLiteral("XCL_ADAPTER=rtx"),
+        QStringLiteral("XCL_RT_GATE=hold"),
+        QStringLiteral("XCL_SHADER_CODE_MB=320"),
+        QStringLiteral("XCL_SHADER_CODE_IDLE_S=30"),
+    };
+    return lines;
+}
+
+QStringList AppSettings::runProfile() const
+{
+    return m_settings->contains(QLatin1String(Key::RunProfile)) ? read(Key::RunProfile).toStringList() : defaultRunProfile();
+}
+
+void AppSettings::setRunProfile(const QStringList& lines) { write(Key::RunProfile, lines); }
+
+void AppSettings::resetRunProfile()
+{
+    const QString key = QLatin1String(Key::RunProfile);
+    if (!m_settings->contains(key))
+        return;
+    m_settings->remove(key);
+    m_settings->sync();
+    emit changed(key);
+}
+
+std::optional<QStringList> AppSettings::gameRunProfile(const QString& titleId) const
+{
+    const QVariant own = gameOverrides(titleId).value(QStringLiteral("runProfile"));
+    if (!own.isValid())
+        return std::nullopt;
+    return own.toStringList();
+}
 
 QVariantMap AppSettings::gameOverrides(const QString& titleId) const
 {
@@ -281,6 +340,9 @@ void AppSettings::clearGameOverride(const QString& titleId, const QString& key)
         all.insert(titleId, one);
     write(Key::GameOverrides, QString::fromUtf8(QJsonDocument(QJsonObject::fromVariantMap(all)).toJson(QJsonDocument::Compact)));
 }
+
+bool AppSettings::xsemuWarmup() const { return read(Key::XsemuWarmup, false).toBool(); }
+void AppSettings::setXsemuWarmup(bool on) { write(Key::XsemuWarmup, on); }
 
 QList<WarmupRun> AppSettings::recentWarmups() const
 {

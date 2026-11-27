@@ -23,7 +23,16 @@ fn options(mem_windows: u32, wave64: bool, split_wave64: bool, legacy_compute_wa
 }
 
 fn hlsl(insts: &[Inst], opt: &Options) -> String {
-    let t = translate(&program(insts), opt).unwrap();
+    plain_loads_hlsl(insts, opt, false)
+}
+
+/// The per-access option's tests are of that option alone: the loads `emit::plain_load_limit` takes
+/// off the coherent view have their own test (`plain`: on).
+fn plain_loads_hlsl(insts: &[Inst], opt: &Options, plain: bool) -> String {
+    super::emit::PLAIN_LOADS.set(Some(plain));
+    let t = translate(&program(insts), opt);
+    super::emit::PLAIN_LOADS.set(None);
+    let t = t.unwrap();
     assert!(t.complete(), "{:?}", t.unsupported_why);
     t.hlsl
 }
@@ -120,5 +129,66 @@ fn compute_per_access_coherence_does_not_cache_branching_or_polling() {
         let h = hlsl(code, &opt);
         assert!(!h.contains("_cachedLoad"));
         assert!(h == legacy_hlsl(code, &opt));
+    }
+}
+
+/// The scalar loads a coherent program runs before its first memory write, atomic, flagged access,
+/// barrier or loop read through the view that is not coherent (`emit::plain_load_limit`), with their
+/// page groups; every later load and every write keeps the coherent one. A program that
+/// invalidates caches itself keeps it everywhere, and a program that is not coherent has neither.
+#[test]
+fn plain_loads_end_at_the_first_write_flag_barrier_or_loop() {
+    let second = ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 10), ("SOFFSET", 125), ("OFFSET", 8)][..]);
+    let wide = ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 12), ("SOFFSET", 125), ("OFFSET", 16)][..]);
+    let buf = ("S_BUFFER_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 16), ("SBASE", 4), ("SOFFSET", 125)][..]);
+    let buf1 = ("S_BUFFER_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 20), ("SBASE", 4), ("SOFFSET", 125), ("OFFSET", 16)][..]);
+    let store = ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("DATA", 2), ("SADDR", 0)][..]);
+    let barrier = ("S_BARRIER", "ENC_SOPP", &[][..]);
+    let cmp = ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 9), ("SSRC1", 128)][..]);
+    let back = ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xfffc)][..]);
+    let inv = ("S_DCACHE_INV", "ENC_SMEM", &[][..]);
+    for (wave64, split, legacy) in [(false, false, false), (true, true, false), (true, true, true)] {
+        let opt = Options { compute_per_access_coherence: false, ..options(4, wave64, split, legacy) };
+        // the loads of the program in their order, as the accessors they call
+        let loads = |code: &[Inst], plain: bool| -> (String, Vec<String>) {
+            let h = plain_loads_hlsl(code, &opt, plain);
+            let body = h.split_once("void main(").unwrap().1;
+            let mut calls = Vec::new();
+            for line in body.lines() {
+                let mut rest = line;
+                while let Some(i) = ["xcl_m_cachedLoad", "xcl_mLoad", "xcl_loadx4"].iter().filter_map(|k| rest.find(k)).min() {
+                    let tail = &rest[i..];
+                    let n = tail.find('(').unwrap();
+                    calls.push(tail[..n].to_string());
+                    rest = &tail[n..];
+                }
+            }
+            (h, calls)
+        };
+        // the packed form has no page groups
+        let g = if split && !legacy { "" } else { "G" };
+        let c = |n: &str| format!("xcl_m_cachedLoad{n}{g}");
+        let m = |n: &str| format!("xcl_mLoad{n}{g}");
+        let cases: [(&[Inst], Vec<String>); 5] = [
+            (&[PLAIN, second, wide, buf, buf1, ATOMIC, PLAIN, buf], vec![c(""), c(""), c("4"), format!("xcl_loadx4{g}_cached"), c(""), m(""), format!("xcl_loadx4{g}")]),
+            (&[PLAIN, wide, store, PLAIN, ATOMIC], vec![c(""), c("4"), m("")]),
+            (&[PLAIN, wide, FLAGGED, PLAIN, ATOMIC], vec![c(""), c("4"), m(""), m("")]),
+            (&[PLAIN, wide, barrier, PLAIN, ATOMIC], vec![c(""), c("4"), m("")]),
+            // the loop's head is its second load: the first runs once, before it
+            (&[PLAIN, second, cmp, back, PLAIN, ATOMIC], vec!["xcl_m_cachedLoad".into(), "xcl_mLoad".into(), "xcl_mLoad".into()]),
+        ];
+        for (code, want) in cases {
+            let (h, calls) = loads(code, true);
+            assert_eq!(calls, want, "{code:?}");
+            assert!(h.contains("globallycoherent "));
+            let (off, calls) = loads(code, false);
+            assert!(!off.contains("_cached") && calls.iter().all(|c| c.starts_with("xcl_mLoad") || c == &format!("xcl_loadx4{g}")), "{calls:?}");
+        }
+        for code in [&[PLAIN, wide, inv, ATOMIC][..], &[ATOMIC, PLAIN], &[PLAIN, wide, store]] {
+            let (h, _) = loads(code, true);
+            assert!(!h.contains("_cached"), "{code:?}");
+            assert_eq!(h, loads(code, false).0);
+            assert_eq!(h.contains("globallycoherent "), code.contains(&ATOMIC));
+        }
     }
 }

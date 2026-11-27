@@ -279,7 +279,7 @@ unsafe fn own_tls_index() -> Option<*mut u32> {
 }
 
 /// The TEBs of the process's threads (the current one first).
-unsafe fn thread_tebs() -> Vec<*mut u8> {
+pub(crate) unsafe fn thread_tebs() -> Vec<*mut u8> {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32};
     use windows_sys::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId, OpenThread, THREAD_QUERY_INFORMATION};

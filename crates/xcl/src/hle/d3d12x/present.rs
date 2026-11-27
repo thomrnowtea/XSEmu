@@ -105,25 +105,11 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
     if !enabled() {
         return;
     }
-    // each plane's first resource, bottom (the game's) to top (a UI plane over it)
-    let shown: Vec<usize> = (0..plane_count as usize)
-        .filter_map(|k| {
-            let plane = planes.add(PLANE_BYTES * k);
-            if !crate::gpu::shader::readable(plane as usize, 0x18) {
-                return None;
-            }
-            let count = (plane.add(8) as *const u32).read_unaligned();
-            let list = (plane.add(0x10) as *const usize).read_unaligned();
-            if count == 0 || !crate::gpu::shader::readable(list, 8) {
-                return None;
-            }
-            Some((list as *const usize).read_unaligned()).filter(|&r| r != 0)
-        })
-        .collect();
-    let Some(&res) = shown.first() else { return };
+    let shown = extract_planes(plane_count, planes);
+    let Some(&(res, _)) = shown.first() else { return };
     {
         let mut p = PRESENTED.lock().unwrap();
-        for &r in &shown {
+        for &(r, _) in &shown {
             if !p.contains(&r) {
                 p.push(r);
             }
@@ -163,6 +149,67 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
 /// rects @0x18, destination placement @0x20, colour space / filter / flags after them (a
 /// retail game's two planes are 0x48 bytes apart)
 const PLANE_BYTES: usize = 0x48;
+
+/// planes read from one PresentX at most
+const MAX_PLANES: usize = 8;
+
+/// A plane's whole resource as source UVs `[left, top, right, bottom]`.
+const FULL_UV: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+
+/// Each plane's first resource and its source rect (`RECT { left, top, right, bottom }` behind
+/// the pointer @0x18; None when that pointer is null or unreadable), bottom (the game's) to top
+/// (a UI plane over it). Adapted from ivall/xcl 2ca749ab `extract_planes`.
+unsafe fn extract_planes(plane_count: u32, planes: *const u8) -> Vec<(usize, Option<[i32; 4]>)> {
+    (0..(plane_count as usize).min(MAX_PLANES))
+        .filter_map(|k| {
+            let plane = planes.add(PLANE_BYTES * k);
+            if !crate::gpu::shader::readable(plane as usize, 0x18) {
+                return None;
+            }
+            let count = (plane.add(8) as *const u32).read_unaligned();
+            let list = (plane.add(0x10) as *const usize).read_unaligned();
+            if count == 0 || !crate::gpu::shader::readable(list, 8) {
+                return None;
+            }
+            let res = Some((list as *const usize).read_unaligned()).filter(|&r| r != 0)?;
+            let rect = if crate::gpu::shader::readable(plane as usize, 0x20) { (plane.add(0x18) as *const usize).read_unaligned() } else { 0 };
+            let rect = crate::gpu::shader::readable(rect, 16).then(|| std::array::from_fn(|k| (rect as *const i32).add(k).read_unaligned()));
+            Some((res, rect))
+        })
+        .collect()
+}
+
+/// The source UVs of `rect` on a `w` x `h` plane: the whole plane without a rect, or for one
+/// that is empty, inverted or reaches outside the plane. ivall/xcl 2ca749ab `source_uv_rect`.
+fn source_uv_rect(rect: Option<[i32; 4]>, w: u32, h: u32) -> [f32; 4] {
+    let Some([l, t, r, b]) = rect else { return FULL_UV };
+    if !(0 <= l && l < r && i64::from(r) <= i64::from(w) && 0 <= t && t < b && i64::from(b) <= i64::from(h)) {
+        return FULL_UV;
+    }
+    [l as f32 / w as f32, t as f32 / h as f32, r as f32 / w as f32, b as f32 / h as f32]
+}
+
+/// `XCL_PRESENT_SOURCE_RECTS=0`: every plane is shown whole, its source rect is ignored and the
+/// composer takes planes without a shader view as it did (the behaviour before source rects were
+/// read; only the 8-plane cap of `extract_planes` stays).
+fn source_rects_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_PRESENT_SOURCE_RECTS").map_or(true, |v| v.trim() != "0"))
+}
+
+/// The part of plane `k` (`w` x `h`) the display shows (`source_uv_rect`); the first source rect
+/// that is not the whole plane is logged once.
+fn shown_uv(k: usize, rect: Option<[i32; 4]>, w: u32, h: u32) -> [f32; 4] {
+    let uv = source_uv_rect(rect, w, h);
+    if uv != FULL_UV {
+        static LOGGED: Once = Once::new();
+        LOGGED.call_once(|| {
+            let off = if source_rects_enabled() { "" } else { " – ignored (XCL_PRESENT_SOURCE_RECTS=0)" };
+            crate::xlog_info!("present: plane {k} shows source rect {rect:?} of its {w}x{h} target (uv {uv:?}){off}");
+        });
+    }
+    if source_rects_enabled() { uv } else { FULL_UV }
+}
 
 thread_local! {
     static IN_PRESENT: Cell<bool> = const { Cell::new(false) };
@@ -275,7 +322,7 @@ static PLANE_INPUTS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
 pub(super) fn native_view_trace_configured() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("XCL_PRESENT_UPSTREAM_DESCS").is_some() || std::env::var_os("XCL_GPU_IMAGE_PROBES").is_some())
+    *ENABLED.get_or_init(|| std::env::var_os("XCL_PRESENT_UPSTREAM_DESCS").is_some() || std::env::var_os("XCL_GPU_IMAGE_PROBES").is_some() || super::target_dump::configured())
 }
 
 pub(super) fn lineage_depth() -> usize {
@@ -349,6 +396,8 @@ pub(super) fn record_scalar_probes(list: usize, shader: u64, values: Vec<ScalarP
 }
 
 pub(super) fn reset_plane_writes(list: usize) {
+    super::target_dump::reset(list);
+    super::submit_watch::reset(list);
     if let Some(probes) = SCALAR_LISTS.get() {
         probes.lock().unwrap().retain(|&(l, _), _| l != list);
     }
@@ -360,6 +409,8 @@ pub(super) fn reset_plane_writes(list: usize) {
 }
 
 pub(super) unsafe fn submit_plane_writes(queue: *mut c_void, lists: &[*mut c_void]) {
+    super::target_dump::submitted(queue as usize, lists);
+    super::submit_watch::submitted(queue, lists);
     if !writer_trace_active() {
         return;
     }
@@ -391,7 +442,7 @@ pub(super) unsafe fn submit_plane_writes(queue: *mut c_void, lists: &[*mut c_voi
     }
 }
 
-unsafe fn log_plane_writers(queue: *mut c_void, shown: &[usize], timed: bool) {
+unsafe fn log_plane_writers(queue: *mut c_void, shown: &[(usize, Option<[i32; 4]>)], timed: bool) {
     let frame = PRESENTS.load(Ordering::Relaxed);
     if !timed && !writer_frames().contains(&frame) {
         return;
@@ -401,7 +452,7 @@ unsafe fn log_plane_writers(queue: *mut c_void, shown: &[usize], timed: bool) {
     let submits = PLANE_SUBMITS.lock().unwrap().clone();
     let mut budget = 128;
     let mut visited = std::collections::HashSet::new();
-    for (i, &resource) in shown.iter().enumerate() {
+    for (i, &(resource, _)) in shown.iter().enumerate() {
         crate::xlog_info!("present writer: frame {frame} p{i} resource {resource:#x}, present q{present_q}, timing q{timing_q:?}");
         let mut queues = Vec::new();
         for (at, (recorded_frame, q, timing, w)) in submits.iter().enumerate().rev().filter(|(_, (seen, _, _, w))| *seen >= frame.saturating_sub(3) && w.resource == resource) {
@@ -769,11 +820,6 @@ fn window_thread() {
             hInstance: inst.into(),
             lpszClassName: class,
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
-            hbrBackground: if crate::hosting::host_hwnd().is_some() {
-                windows::Win32::Graphics::Gdi::HBRUSH(windows::Win32::Graphics::Gdi::GetStockObject(windows::Win32::Graphics::Gdi::BLACK_BRUSH).0)
-            } else {
-                Default::default()
-            },
             ..Default::default()
         };
         RegisterClassW(&wc);
@@ -782,25 +828,17 @@ fn window_thread() {
         let mut rc = RECT { left: 0, top: 0, right: cfg.window_width as i32, bottom: cfg.window_height as i32 };
         let _ = AdjustWindowRect(&mut rc, WS_OVERLAPPEDWINDOW, false);
         let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
-        // hosted (`--host-hwnd`): a child of the launcher's window; window_pos and the size are its
-        let host = crate::hosting::host_hwnd();
-        let (style, parent, [x, y, w, h]) = match host {
-            Some(p) => (WS_CHILD | WS_CLIPSIBLINGS | WS_CLIPCHILDREN | WS_VISIBLE, Some(HWND(p as *mut c_void)), crate::hosting::child_rect(p)),
-            None => {
-                let (x, y) = window_position(&cfg.window_pos, w, h);
-                (WS_OVERLAPPEDWINDOW | WS_VISIBLE, None, [x, y, w, h])
-            }
-        };
+        let (x, y) = window_position(&cfg.window_pos, w, h);
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             class,
             &HSTRING::from(format!("XCL – {title}")),
-            style,
+            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
             x,
             y,
             w,
             h,
-            parent,
+            None,
             None,
             Some(inst.into()),
             None,
@@ -810,12 +848,8 @@ fn window_thread() {
             return;
         };
         HWND_RAW.store(hwnd.0 as isize, Ordering::Release);
-        if host.is_some() {
-            crate::xlog_info!("XCL window created in the launcher's window ({w}x{h} at {x},{y})");
-            crate::hosting::attach(hwnd.0);
-        } else {
-            crate::xlog_info!("XCL window created ({}x{})", cfg.window_width, cfg.window_height);
-        }
+        crate::xlog_info!("XCL window created ({}x{})", cfg.window_width, cfg.window_height);
+        crate::hosting::adopt(hwnd.0);
         crate::hle::kbm::attach(hwnd.0);
         if super::live_status::advanced() || crate::live_stall::enabled() {
             super::live_status::start();
@@ -913,11 +947,6 @@ unsafe fn window_position(setting: &str, w: i32, h: i32) -> (i32, i32) {
     (x.clamp(r.left, (r.right - w).max(r.left)), y.clamp(r.top, (r.bottom - h).max(r.top)))
 }
 
-/// The XCL window, made now if it is not up yet (None: it could not be made).
-pub fn window() -> Option<isize> {
-    ensure_window().map(|h| h.0 as isize)
-}
-
 fn ensure_window() -> Option<HWND> {
     static START: Once = Once::new();
     START.call_once(|| {
@@ -976,20 +1005,31 @@ struct Composer {
 /// planes composed at most (the console's display has four)
 const COMPOSED_PLANES: usize = 4;
 
+/// The composer's shaders: a triangle over the whole output that samples the plane's source
+/// UVs (`uv_rect`, root constants b0; ivall/xcl 2ca749ab).
+const COMPOSER_VS: &str = "cbuffer R : register(b0) { float4 uv_rect; };\nstruct O { float4 p : SV_Position; float2 uv : TEXCOORD0; };\nO main(uint id : SV_VertexID) { O o; float2 t = float2((id << 1) & 2, id & 2); o.p = float4(t * float2(2, -2) + float2(-1, 1), 0, 1); o.uv = lerp(uv_rect.xy, uv_rect.zw, t); return o; }\n";
+const COMPOSER_PS: &str = "Texture2D t : register(t0);\nSamplerState s : register(s0);\nfloat4 main(float4 p : SV_Position, float2 uv : TEXCOORD0) : SV_Target { return t.SampleLevel(s, uv, 0); }\n";
+
 unsafe fn new_composer(dev: &ID3D12Device, fmt: DXGI_FORMAT) -> Option<Composer> {
-    const VS: &str = "struct O { float4 p : SV_Position; float2 uv : TEXCOORD0; };\nO main(uint id : SV_VertexID) { O o; o.uv = float2((id << 1) & 2, id & 2); o.p = float4(o.uv * float2(2, -2) + float2(-1, 1), 0, 1); return o; }\n";
-    const PS: &str = "Texture2D t : register(t0);\nSamplerState s : register(s0);\nfloat4 main(float4 p : SV_Position, float2 uv : TEXCOORD0) : SV_Target { return t.SampleLevel(s, uv, 0); }\n";
-    let (vs, ps) = (super::real::compile(VS, "vs_5_0"), super::real::compile(PS, "ps_5_0"));
+    let (vs, ps) = (super::real::compile(COMPOSER_VS, "vs_5_0"), super::real::compile(COMPOSER_PS, "ps_5_0"));
     if vs.is_empty() || ps.is_empty() {
         crate::xlog_error!("present: the plane composer's shaders did not compile");
         return None;
     }
     let range = D3D12_DESCRIPTOR_RANGE { RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV, NumDescriptors: 1, ..Default::default() };
-    let param = D3D12_ROOT_PARAMETER {
-        ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
-        Anonymous: D3D12_ROOT_PARAMETER_0 { DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE { NumDescriptorRanges: 1, pDescriptorRanges: &range } },
-        ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
-    };
+    // the plane's source UVs (4 constants, b0) and its view (t0)
+    let params = [
+        D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER_0 { Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: 4 } },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_VERTEX,
+        },
+        D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+            Anonymous: D3D12_ROOT_PARAMETER_0 { DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE { NumDescriptorRanges: 1, pDescriptorRanges: &range } },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+        },
+    ];
     let sampler = D3D12_STATIC_SAMPLER_DESC {
         Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
         AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
@@ -999,7 +1039,7 @@ unsafe fn new_composer(dev: &ID3D12Device, fmt: DXGI_FORMAT) -> Option<Composer>
         ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
         ..Default::default()
     };
-    let desc = D3D12_ROOT_SIGNATURE_DESC { NumParameters: 1, pParameters: &param, NumStaticSamplers: 1, pStaticSamplers: &sampler, Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE };
+    let desc = D3D12_ROOT_SIGNATURE_DESC { NumParameters: params.len() as u32, pParameters: params.as_ptr(), NumStaticSamplers: 1, pStaticSamplers: &sampler, Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE };
     let mut blob = None;
     D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut blob, None).ok()?;
     let blob = blob?;
@@ -1047,19 +1087,27 @@ unsafe fn new_composer(dev: &ID3D12Device, fmt: DXGI_FORMAT) -> Option<Composer>
 }
 
 /// The console's display composes a PresentX's planes: the first (the game's) as it is, each
-/// one after it (a UI plane, often at another size) over it with its alpha, every plane
-/// stretched over the whole output. Recorded on the presenter's list; the back buffer ends in
-/// COPY_SOURCE. False: no composer (the caller copies the bottom plane as before).
-/// shortcut: the planes' source rects and destination placement are not read.
-unsafe fn compose(p: &mut Presenter, bb: &ID3D12Resource, planes: &[ID3D12Resource]) -> bool {
+/// one after it (a UI plane, often at another size) over it with its alpha, each plane's source
+/// rect (its source UVs, `shown_uv`) stretched over the whole output. Recorded on the
+/// presenter's list; the back buffer ends in COPY_SOURCE. False: no composer, or a plane without
+/// a shader view (multisampled, not 2D, or denying shader resources; ivall/xcl #2418 3f4a1291) –
+/// the caller copies the bottom plane whole as before.
+/// shortcut: the destination placement (@0x20) is not read (upstream does not read it either).
+unsafe fn compose(p: &mut Presenter, bb: &ID3D12Resource, planes: &[(ID3D12Resource, [f32; 4])]) -> bool {
+    let planes = &planes[..planes.len().min(COMPOSED_PLANES)];
+    let viewable = |d: D3D12_RESOURCE_DESC| {
+        d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.SampleDesc.Count == 1 && !d.Flags.contains(D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)
+    };
+    if source_rects_enabled() && !planes.iter().all(|(r, _)| viewable(r.GetDesc())) {
+        return false;
+    }
     if p.composer.as_ref().map_or(true, |c| c.fmt != p.fmt) {
         p.composer = new_composer(&p.dev, p.fmt);
     }
     let Some(c) = p.composer.as_ref() else { return false };
     let step = p.dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
     let (cpu, gpu) = (c.srvs.GetCPUDescriptorHandleForHeapStart(), c.srvs.GetGPUDescriptorHandleForHeapStart());
-    let planes = &planes[..planes.len().min(COMPOSED_PLANES)];
-    for (k, r) in planes.iter().enumerate() {
+    for (k, (r, _)) in planes.iter().enumerate() {
         let d = r.GetDesc();
         let view = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: swap_format(d.Format).unwrap_or(d.Format),
@@ -1080,9 +1128,10 @@ unsafe fn compose(p: &mut Presenter, bb: &ID3D12Resource, planes: &[ID3D12Resour
     p.list.SetGraphicsRootSignature(&c.rs);
     p.list.SetDescriptorHeaps(&[Some(c.srvs.clone())]);
     p.list.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    for k in 0..planes.len() {
+    for (k, (_, uv)) in planes.iter().enumerate() {
         p.list.SetPipelineState(if k == 0 { &c.under } else { &c.over });
-        p.list.SetGraphicsRootDescriptorTable(0, D3D12_GPU_DESCRIPTOR_HANDLE { ptr: gpu.ptr + (k * step) as u64 });
+        p.list.SetGraphicsRoot32BitConstants(0, 4, uv.as_ptr() as *const c_void, 0);
+        p.list.SetGraphicsRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE { ptr: gpu.ptr + (k * step) as u64 });
         p.list.DrawInstanced(3, 1, 0, 0);
     }
     p.list.ResourceBarrier(&[transition(bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
@@ -1574,8 +1623,7 @@ fn display_thread(raw: isize) {
     }
 }
 
-unsafe fn present_now(min_interval: Duration, frame: Option<(usize, &[usize])>) {
-    crate::control::wait_while_paused();
+unsafe fn present_now(min_interval: Duration, frame: Option<(usize, &[(usize, Option<[i32; 4]>)])>) {
     if IN_PRESENT.with(|c| c.replace(true)) {
         return;
     }
@@ -1587,7 +1635,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, &[usize])>) 
     }
     let _reset = Reset;
     let (queue, src, mut guard) = if let Some((queue, planes)) = frame {
-        let raw = planes[0] as *mut c_void;
+        let raw = planes[0].0 as *mut c_void;
         let Some(src) = ID3D12Resource::from_raw_borrowed(&raw) else { return };
         (queue, src.clone(), PRESENTER.lock().unwrap())
     } else {
@@ -1648,10 +1696,21 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, &[usize])>) 
     if p.alloc.Reset().is_err() || p.list.Reset(&p.alloc, None).is_err() {
         return;
     }
-    // the planes over the first (a UI plane): composed as the console's display does
-    let mut planes = vec![src.clone()];
-    planes.extend(frame.map_or(&[][..], |f| &f.1[1..]).iter().filter_map(|&r| ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).cloned()));
-    let composed = planes.len() > 1 && compose(p, &bb, &planes);
+    // the planes over the first (a UI plane), and a first plane shown in part (its source rect:
+    // a frame drawn into part of a larger target): composed as the console's display does
+    let sources = frame.map_or(&[][..], |f| f.1);
+    let mut planes = vec![(src.clone(), sources.first().and_then(|s| s.1))];
+    planes.extend(sources.iter().skip(1).filter_map(|&(r, rect)| Some((ID3D12Resource::from_raw_borrowed(&(r as *mut c_void))?.clone(), rect))));
+    let planes: Vec<(ID3D12Resource, [f32; 4])> = planes
+        .into_iter()
+        .enumerate()
+        .map(|(k, (r, rect))| {
+            let d = r.GetDesc();
+            let uv = shown_uv(k, rect, u32::try_from(d.Width).unwrap_or(0), d.Height);
+            (r, uv)
+        })
+        .collect();
+    let composed = (planes.len() > 1 || planes[0].1 != FULL_UV) && compose(p, &bb, &planes);
     if !composed {
         p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)]);
         p.list.CopyResource(bb.as_ref(), &src);
@@ -1679,12 +1738,12 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, &[usize])>) 
     if trace_planes {
         let queue = super::list_x::queue_id(queue);
         crate::xlog_info!("present planes: frame {index}, {:.1} s, q{queue}, {} source(s), composed {composed}", crate::log::uptime(), planes.len());
-        for (k, plane) in planes.iter().take(COMPOSED_PLANES).enumerate() {
+        for (k, (plane, uv)) in planes.iter().take(COMPOSED_PLANES).enumerate() {
             let res = plane.as_raw() as usize;
             let d = plane.GetDesc();
             let title = super::real::title_address(res).or_else(|| super::title_textures::address(res));
             let backing = super::residency::describe_backing(res).unwrap_or_else(|| "not in residency registry".into());
-            crate::xlog_info!("present planes: p{k} resource {res:#x}, title {title:x?}, {}x{} format {} flags {:#x}, {backing}", d.Width, d.Height, d.Format.0, d.Flags.0);
+            crate::xlog_info!("present planes: p{k} resource {res:#x}, title {title:x?}, {}x{} format {} flags {:#x}, source uv {uv:?}, {backing}", d.Width, d.Height, d.Format.0, d.Flags.0);
             if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.SampleDesc.Count == 1 && d.DepthOrArraySize == 1 {
                 if let Some(format) = swap_format(d.Format).filter(|&f| f != DXGI_FORMAT_R16G16B16A16_FLOAT) {
                     if let Some((buffer, footprint)) = readback_copy(&p.list, plane, &d) {
@@ -1694,6 +1753,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, &[usize])>) 
             }
         }
     }
+    let target_dump = if frame.is_some() && super::target_dump::boundary() { super::target_dump::capture(&p.list, &planes.iter().map(|(r, _)| r.clone()).collect::<Vec<_>>()) } else { None };
     // with `XCL_TRACE_FRAME`: also the render target the title binds most (its scene / UI)
     // (and the targets the watched one's contents went on to: rt_<n>_<k>)
     if due && trace_frame() {
@@ -1733,7 +1793,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, &[usize])>) 
     let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&qraw) else { return };
     let Ok(cl) = p.list.cast::<ID3D12CommandList>() else { return };
     q.ExecuteCommandLists(&[Some(cl)]);
-    p.copy_sources = planes;
+    p.copy_sources = planes.into_iter().map(|(r, _)| r).collect();
     if let Some(frame) = p.dump_frame {
         crate::xlog_warn!("present: frame dump writer busy; skipped frame {frame}");
     }
@@ -1748,6 +1808,9 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, &[usize])>) 
         let e = fence::api_error(&p.dev, "Signal", e);
         crate::xlog_error!("present: submit copy: {e}");
         return;
+    }
+    if let Some(t) = target_dump {
+        super::target_dump::write_after(t, p.fence.clone(), p.value);
     }
     {
         let mut frames = DISPLAY_FRAMES.lock().unwrap();
@@ -1901,7 +1964,7 @@ pub fn last_frame_dump() -> Option<FrameDumpSample> {
 }
 
 /// a copy of subresource 0 of `src` into a new readback buffer, recorded on `list`
-unsafe fn readback_copy(list: &ID3D12GraphicsCommandList, src: &ID3D12Resource, desc: &D3D12_RESOURCE_DESC) -> Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)> {
+pub(super) unsafe fn readback_copy(list: &ID3D12GraphicsCommandList, src: &ID3D12Resource, desc: &D3D12_RESOURCE_DESC) -> Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)> {
     let dev: ID3D12Device = {
         let mut d: Option<ID3D12Device> = None;
         src.GetDevice(&mut d).ok()?;
@@ -1937,7 +2000,7 @@ unsafe fn readback_copy(list: &ID3D12GraphicsCommandList, src: &ID3D12Resource, 
 }
 
 /// texel → 8-bit RGB for the formats titles present in (None: not decoded)
-fn rgb(format: DXGI_FORMAT, t: u32) -> Option<[u8; 3]> {
+pub(super) fn rgb(format: DXGI_FORMAT, t: u32) -> Option<[u8; 3]> {
     Some(match format {
         DXGI_FORMAT_R10G10B10A2_UNORM => [(t >> 2 & 0xFF) as u8, (t >> 12 & 0xFF) as u8, (t >> 22 & 0xFF) as u8],
         DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => [t as u8, (t >> 8) as u8, (t >> 16) as u8],
@@ -2096,6 +2159,66 @@ impl Drop for Presenter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_rects_become_uvs_only_inside_the_plane() {
+        assert_eq!(source_uv_rect(Some([480, 270, 1440, 810]), 1920, 1080), [0.25, 0.25, 0.75, 0.75]);
+        assert_eq!(source_uv_rect(Some([0, 0, 1280, 720]), 1920, 1080), [0.0, 0.0, 1280.0 / 1920.0, 720.0 / 1080.0]);
+        assert_eq!(source_uv_rect(Some([0, 0, 1920, 1080]), 1920, 1080), FULL_UV);
+        // no rect, inverted, empty, reaching outside the plane, negative
+        for rect in [
+            None,
+            Some([800, 0, 400, 1080]),
+            Some([0, 900, 1920, 100]),
+            Some([100, 100, 100, 500]),
+            Some([0, 300, 1920, 300]),
+            Some([0, 0, 1921, 1080]),
+            Some([0, 0, 1920, 1081]),
+            Some([-1, 0, 960, 540]),
+            Some([0, i32::MIN, 960, 540]),
+        ] {
+            assert_eq!(source_uv_rect(rect, 1920, 1080), FULL_UV, "{rect:?}");
+        }
+        // a plane of no size
+        assert_eq!(source_uv_rect(Some([0, 0, 1, 1]), 0, 1080), FULL_UV);
+        assert_eq!(source_uv_rect(Some([0, 0, 1, 1]), 1920, 0), FULL_UV);
+    }
+
+    #[test]
+    fn composer_shaders_compile() {
+        assert!(!super::super::real::compile(COMPOSER_VS, "vs_5_0").is_empty());
+        assert!(!super::super::real::compile(COMPOSER_PS, "ps_5_0").is_empty());
+    }
+
+    #[test]
+    fn planes_carry_their_first_resource_and_source_rect() {
+        fn plane(buf: &mut [u8], k: usize, count: u32, list: usize, rect: usize) {
+            let b = &mut buf[k * PLANE_BYTES..];
+            b[8..12].copy_from_slice(&count.to_le_bytes());
+            b[0x10..0x18].copy_from_slice(&list.to_le_bytes());
+            b[0x18..0x20].copy_from_slice(&rect.to_le_bytes());
+        }
+        let rect = [0i32, 0, 1280, 720];
+        let resources = [0x1111_0000usize, 0x2222_0000, 0];
+        let (r0, r1, null) = (resources.as_ptr() as usize, resources.as_ptr() as usize + 8, resources.as_ptr() as usize + 16);
+        let rect_at = rect.as_ptr() as usize;
+        let mut buf = vec![0u8; (MAX_PLANES + 2) * PLANE_BYTES];
+        plane(&mut buf, 0, 1, r0, rect_at);
+        // a null rect pointer, an unreadable one
+        plane(&mut buf, 1, 1, r1, 0);
+        plane(&mut buf, 2, 2, r1, 0x10);
+        // no resources, a null resource: no plane
+        plane(&mut buf, 3, 0, r0, rect_at);
+        plane(&mut buf, 4, 1, null, rect_at);
+        for k in 5..MAX_PLANES + 2 {
+            plane(&mut buf, k, 1, r0, rect_at);
+        }
+        let planes = unsafe { extract_planes((MAX_PLANES + 2) as u32, buf.as_ptr()) };
+        let (with, without) = ((resources[0], Some(rect)), (resources[1], None));
+        assert_eq!(planes, [with, without, without, with, with, with]);
+        assert_eq!(unsafe { extract_planes(u32::MAX, buf.as_ptr()) }.len(), 6);
+        assert_eq!(unsafe { extract_planes(0, buf.as_ptr()) }, []);
+    }
 
     #[test]
     fn plane_capture_schedule_depends_on_time_and_does_not_repeat() {
@@ -2277,4 +2400,9 @@ mod frame_dump_tests {
             assert!(json["non_dark_samples"].is_null(), "undecoded is different from dark");
         }
     }
+}
+
+/// The XCL window, made now if it is not up yet (None: it could not be made).
+pub fn window() -> Option<isize> {
+    ensure_window().map(|h| h.0 as isize)
 }

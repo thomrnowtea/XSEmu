@@ -1,12 +1,14 @@
 #include "GameDetailsPage.h"
 
 #include "ImportSettingsDialog.h"
+#include "RunProfileEditor.h"
 #include "RunsWithPicker.h"
 #include "ShareSettingsDialog.h"
 
 #include "app/Services.h"
 #include "core/EmulatorBuild.h"
 #include "core/Format.h"
+#include "core/LaunchConfig.h"
 #include "core/Paths.h"
 #include "core/ShaderCacheInfo.h"
 #include "shell/LaunchErrors.h"
@@ -17,6 +19,7 @@
 #include "widgets/Icon.h"
 #include "widgets/SegmentedControl.h"
 #include "widgets/Text.h"
+#include "widgets/Toggle.h"
 
 #include <QDesktopServices>
 #include <QDir>
@@ -332,6 +335,18 @@ private:
 
 namespace {
 
+// " XCL_DISPLAY_MODE in the run profile wins over Display mode.": XSEmu reads these variables over xcl.toml.
+QString profileWins(const AppSettings& settings, const QString& titleId)
+{
+    const QHash<QString, QString> rows{{QStringLiteral("XCL_DISPLAY_MODE"), QStringLiteral("Display mode")}, {QStringLiteral("XCL_RAYTRACING"), QStringLiteral("Raytracing")}};
+    QString out;
+    for (const auto& e : LaunchConfig::parseProfile(LaunchConfig::runProfile(settings, titleId).join(QLatin1Char('\n'))).entries) {
+        if (rows.contains(e.first))
+            out += QStringLiteral(" %1 in the run profile wins over %2.").arg(e.first, rows.value(e.first));
+    }
+    return out;
+}
+
 struct OverrideSpec {
     QString key;            // xcl.toml key, or the launcher's per-game key when launcherSide
     QString label;
@@ -368,6 +383,10 @@ GameDetailsPage::GameDetailsPage(Services& services, QWidget* parent)
     , m_runCard(new InfoCard(QStringLiteral("Last run")))
     , m_overrides(new InfoCard(QStringLiteral("Per-game overrides")))
     , m_overridesNote(new Label({}, Label::Style::Caption, Theme::Role::Text3))
+    , m_profileCard(new InfoCard(QStringLiteral("Run profile")))
+    , m_ownProfile(new Toggle)
+    , m_profileEditor(new RunProfileEditor(12))
+    , m_profileNote(new Label({}, Label::Style::Caption, Theme::Role::Text3))
 {
     auto* v = new QVBoxLayout(this);
     v->setContentsMargins(0, 0, 0, 0);
@@ -413,6 +432,23 @@ GameDetailsPage::GameDetailsPage(Services& services, QWidget* parent)
     right->addWidget(m_overrides);
     m_overridesNote->setWordWrap(true);
     right->addWidget(m_overridesNote);
+    auto* own = new QWidget;
+    auto* oh = new QHBoxLayout(own);
+    oh->setContentsMargins(0, 0, 0, 0);
+    oh->setSpacing(10);
+    m_ownProfile->setObjectName(QStringLiteral("ownRunProfile"));
+    oh->addWidget(m_ownProfile);
+    oh->addWidget(new Label(QStringLiteral("Use a custom run profile for this game"), Label::Style::Small));
+    oh->addStretch(1);
+    auto* profileBody = new QWidget;
+    auto* pv = new QVBoxLayout(profileBody);
+    pv->setContentsMargins(0, 0, 0, 0);
+    pv->setSpacing(8);
+    m_profileNote->setWordWrap(true);
+    pv->addWidget(m_profileNote);
+    pv->addWidget(m_profileEditor);
+    m_profileCard->addRow(QStringLiteral("Custom profile"), own, profileBody);
+    right->addWidget(m_profileCard);
     right->addStretch(1);
     cols->addLayout(left, 1);
     cols->addLayout(right, 1);
@@ -479,10 +515,21 @@ GameDetailsPage::GameDetailsPage(Services& services, QWidget* parent)
         if (!m_game.isValid())
             return;
         if (key == QLatin1String(AppSettings::Key::RecentWarmups) || key == QLatin1String(AppSettings::Key::PlayStats)
-            || key == QLatin1String(AppSettings::Key::SteamGridDbKey))
+            || key == QLatin1String(AppSettings::Key::SteamGridDbKey) || key == QLatin1String(AppSettings::Key::RunProfile)
+            || key == QLatin1String(AppSettings::Key::GameOverrides))
             refresh();
         else if (key == QLatin1String(AppSettings::Key::DefaultDeviceType) || key == QLatin1String(AppSettings::Key::OverlayDefault))
             refreshOverrides();
+    });
+    connect(m_ownProfile, &Toggle::toggled, this, [this](bool on) {
+        if (on)
+            m_s.settings.setGameOverride(m_game.titleId(), QStringLiteral("runProfile"), m_s.settings.runProfile());
+        else
+            m_s.settings.clearGameOverride(m_game.titleId(), QStringLiteral("runProfile"));
+    });
+    connect(m_profileEditor, &RunProfileEditor::edited, this, [this](const QStringList& lines) {
+        if (m_s.settings.gameRunProfile(m_game.titleId()))
+            m_s.settings.setGameOverride(m_game.titleId(), QStringLiteral("runProfile"), lines);
     });
 }
 
@@ -585,7 +632,7 @@ void GameDetailsPage::refresh()
     // actions and the shader state
     const QList<WarmupRun> recent = m_s.settings.recentWarmups();
     const ShaderCacheInfo& cache = m_s.shaderCache.snapshot();
-    const TitleShaderState state = titleShaderState(id, recent, cache);
+    const TitleShaderState state = shownShaderState(m_s.settings, id, recent, cache);
     std::optional<WarmupRun> lastWarmup;
     for (const WarmupRun& r : recent) {
         if (r.titleId == id) {
@@ -611,7 +658,7 @@ void GameDetailsPage::refresh()
         m_secondary->setText(state == TitleShaderState::Ready ? QStringLiteral("Warm up again") : QStringLiteral("Warm up"));
         m_secondary->setIconName(QStringLiteral("bolt"));
     }
-    m_secondary->setVisible(!playingThis);
+    m_secondary->setVisible(!playingThis && m_s.settings.xsemuWarmup());
     const RunnerSpec& runner = m_s.emulator.runnerFor(g);
     if (!runner.isBuiltIn()) {
         m_secondary->setText(QStringLiteral("Pre-cache with %1").arg(runner.name));
@@ -627,7 +674,15 @@ void GameDetailsPage::refresh()
     case TitleShaderState::NeverWarmed: stateText = QStringLiteral("Never warmed up"); cacheState = QStringLiteral("Empty"); cacheRole = Theme::Role::Text3; break;
     case TitleShaderState::LastRunIncomplete: stateText = QStringLiteral("Warm-up needed"); cacheState = QStringLiteral("Last warm-up stopped part way"); tone = Theme::Tone::Warning; cacheRole = Theme::Role::Warning; break;
     case TitleShaderState::LastRunFailed: stateText = QStringLiteral("Warm-up failed"); cacheState = QStringLiteral("Last warm-up failed"); tone = Theme::Tone::Danger; cacheRole = Theme::Role::Danger; break;
-    case TitleShaderState::Unknown: stateText = QStringLiteral("Not warmed up here"); cacheState = QStringLiteral("Not warmed up from this launcher"); break;
+    case TitleShaderState::ProfileChanged: stateText = QStringLiteral("Warm-up needed"); cacheState = QStringLiteral("Run profile changed since the last warm-up"); tone = Theme::Tone::Warning; cacheRole = Theme::Role::Warning; break;
+    case TitleShaderState::Unknown:
+        if (m_s.settings.xsemuWarmup()) {
+            stateText = QStringLiteral("Not warmed up here");
+            cacheState = QStringLiteral("Not warmed up from this launcher");
+        } else {
+            cacheState = QStringLiteral("Built while the game runs");
+        }
+        break;
     }
     if (!runner.isBuiltIn()) {
         std::optional<WarmupRun> pre;
@@ -683,6 +738,7 @@ void GameDetailsPage::refresh()
         tone = tooOld ? Theme::Tone::Danger : Theme::Tone::Warning;
     }
     m_state->setText(stateText);
+    m_state->setVisible(!stateText.isEmpty());
     m_state->setToolTip(heldReason);
     m_state->setTone(tone);
 
@@ -761,6 +817,27 @@ void GameDetailsPage::refresh()
     m_runCard->end();
 
     refreshOverrides();
+    refreshRunProfile();
+}
+
+void GameDetailsPage::refreshRunProfile()
+{
+    if (!m_game.isValid())
+        return;
+    const std::optional<QStringList> own = m_s.settings.gameRunProfile(m_game.titleId());
+    {
+        const QSignalBlocker quiet(m_ownProfile);
+        m_ownProfile->setChecked(own.has_value());
+    }
+    m_profileEditor->setVisible(own.has_value());
+    if (own)
+        m_profileEditor->setLines(*own);
+    const qsizetype global = m_s.settings.runProfile().size();
+    const RunnerSpec& runner = m_s.emulator.runnerFor(m_game);
+    const QString applies = own ? QStringLiteral("Play and Warm-up for %1 use this profile instead of the one in Settings.").arg(m_game.title())
+                                : QStringLiteral("Play and Warm-up use the profile in Settings, Run profile (%1).")
+                                      .arg(global == 1 ? QStringLiteral("1 variable") : QStringLiteral("%1 variables").arg(global));
+    m_profileNote->setText(runner.isBuiltIn() ? applies : applies + QStringLiteral(" It applies when the game runs with XSEmu; %1 keeps its own environment.").arg(runner.name));
 }
 
 void GameDetailsPage::refreshOverrides()
@@ -877,7 +954,7 @@ void GameDetailsPage::refreshOverrides()
     const RunnerSpec& runner = m_s.emulator.runnerFor(m_game);
     m_overridesNote->setText(playingThis ? QStringLiteral("Changes apply the next time %1 starts.").arg(m_game.title())
                                          : runner.isBuiltIn()
-                                         ? QStringLiteral("Console, display mode, raytracing, keyboard and mouse and log level are written to %1 when the game starts.")
-                                               .arg(QDir::toNativeSeparators(tomlPath))
+                                         ? QStringLiteral("Console, display mode, raytracing, keyboard and mouse and log level are written to %1 when the game starts.%2")
+                                               .arg(QDir::toNativeSeparators(tomlPath), profileWins(m_s.settings, id))
                                          : QStringLiteral("%1 gets the console when the game starts; the other choices apply when it runs with XSEmu.").arg(runner.name));
 }

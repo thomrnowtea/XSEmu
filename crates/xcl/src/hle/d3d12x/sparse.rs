@@ -200,6 +200,204 @@ fn decommit_tiles(
     unmapped
 }
 
+/// what gives a lazy tile its video memory (`Lazy::given`): the CPU's first write of something
+/// other than zeros, a buffer placed over it, a GPU command of the title's that writes there
+const BY_WRITE: usize = 0;
+const BY_PLACEMENT: usize = 1;
+const BY_COMMAND: usize = 2;
+
+/// Committed tiles without video memory: those of the title's GPU heaps that the coherent window
+/// did not take (`alloc_diverted`). Such a heap is committed whole and the title writes part of
+/// it (a retail game: 1.75 GB of zero pages in 2.9 GB of heaps), so its tiles get video memory
+/// when it is first needed and not at the commit: when the CPU has written something other than
+/// zeros there (the write watch shows it before the next submit), when a buffer is placed over
+/// them, or when a GPU command the title records writes there. Until then a tile is not mapped
+/// in its window: the GPU reads zeros there, which is what the CPU's view holds, there is
+/// nothing to read back – and what a shader stores there by address is lost.
+#[derive(Default)]
+struct Lazy {
+    /// tile address → its committed 4 KiB pages (bit `i`: page `i`; never 0)
+    tiles: FxHashMap<usize, u16>,
+    /// tiles given video memory since the last title submit: all their pages are looked at
+    /// then, not only those the write watch reports
+    fresh: Vec<usize>,
+    /// tiles given video memory so far, by what asked (`BY_WRITE`, `BY_PLACEMENT`, `BY_COMMAND`)
+    given: [u64; 3],
+    /// when `line` last gave the counts, and what they were
+    logged: Option<(std::time::Instant, usize, [u64; 3])>,
+}
+
+impl Lazy {
+    /// The pages `[a, b)` were committed in a lazy heap: its tiles there are lazy with those
+    /// pages, but those with video memory (`mapped`). True: a tile is lazy that was not.
+    fn commit(&mut self, a: usize, b: usize, mut mapped: impl FnMut(usize) -> bool) -> bool {
+        let mut new = false;
+        let mut t = a & !(TILE - 1);
+        while t < b {
+            if !mapped(t) {
+                let pages = self.tiles.entry(t).or_insert_with(|| {
+                    new = true;
+                    0
+                });
+                *pages |= page_mask(t, a, b);
+            }
+            t += TILE;
+        }
+        new
+    }
+
+    /// The pages `[a, b)` were decommitted: lazy tiles lose them. True: a tile lost its last.
+    fn decommit(&mut self, a: usize, b: usize) -> bool {
+        let mut gone = false;
+        for t in self.within(a, b) {
+            let Some(pages) = self.tiles.get_mut(&t) else { continue };
+            *pages &= !page_mask(t, a, b);
+            if *pages == 0 {
+                self.tiles.remove(&t);
+                gone = true;
+            }
+        }
+        gone
+    }
+
+    /// The lazy tiles `[a, b)` touches, by address.
+    fn within(&self, a: usize, b: usize) -> Vec<usize> {
+        let first = a & !(TILE - 1);
+        let mut out: Vec<usize> = if b.saturating_sub(first) / TILE <= self.tiles.len() {
+            (first..b).step_by(TILE).filter(|t| self.tiles.contains_key(t)).collect()
+        } else {
+            self.tiles.keys().copied().filter(|&t| t >= first && t < b).collect()
+        };
+        out.sort_unstable();
+        out
+    }
+
+    /// Tile `t` gets video memory: if it was lazy, its holes (the pages that are not committed).
+    fn take(&mut self, t: usize) -> Option<u16> {
+        let pages = self.tiles.remove(&t)?;
+        self.fresh.push(t);
+        Some(!pages)
+    }
+
+    /// The lazy tiles the CPU wrote something other than zeros into, by address: those with a
+    /// committed page among `dirty` (written pages of `page` bytes, sorted) for which `nonzero`
+    /// (the address of a 4 KiB page) holds. A page written with zeros leaves its tile lazy.
+    fn written(&self, dirty: &[usize], page: usize, mut nonzero: impl FnMut(usize) -> bool) -> Vec<usize> {
+        let mut out: Vec<usize> = Vec::new();
+        let mut looked = (usize::MAX, 0u16);
+        for &d in dirty {
+            let mut pg = d & !(PAGE - 1);
+            while pg < d + page {
+                let t = pg & !(TILE - 1);
+                if looked.0 != t {
+                    looked = (t, self.tiles.get(&t).copied().unwrap_or(0));
+                }
+                if out.last() != Some(&t) && looked.1 & (1u16 << ((pg - t) / PAGE)) != 0 && nonzero(pg) {
+                    out.push(t);
+                }
+                if looked.1 == 0 || out.last() == Some(&t) {
+                    pg = t + TILE;
+                } else {
+                    pg += PAGE;
+                }
+            }
+        }
+        out
+    }
+
+    /// The counts for the log (`mapped`: tiles with video memory): at most every 30 s, once a
+    /// heap was lazy, and only when they changed.
+    fn line(&mut self, now: std::time::Instant, mapped: usize) -> Option<String> {
+        let counts = (self.tiles.len(), self.given);
+        if counts == (0, [0; 3]) || self.logged.is_some_and(|(at, tiles, given)| (tiles, given) == counts || now.duration_since(at).as_secs() < 30) {
+            return None;
+        }
+        self.logged = Some((now, counts.0, counts.1));
+        Some(format!(
+            "sparse lazy tiles: {} MB committed without video memory ({} tiles); video memory given to {} tiles at a first CPU write, {} at a buffer placement, {} at a GPU command write; {} MB of tiles mapped in all (XCL_SPARSE_LAZY_TILES=0: off)",
+            (counts.0 * TILE) >> 20,
+            counts.0,
+            self.given[BY_WRITE],
+            self.given[BY_PLACEMENT],
+            self.given[BY_COMMAND],
+            (mapped * TILE) >> 20
+        ))
+    }
+}
+
+/// The 4 KiB pages of the tile at `t` that `[a, b)` touches, as a mask (bit `i`: page `i`).
+fn page_mask(t: usize, a: usize, b: usize) -> u16 {
+    let (lo, hi) = (a.max(t), b.min(t + TILE));
+    if lo >= hi {
+        return 0;
+    }
+    let (first, last) = ((lo - t) / PAGE, (hi - 1 - t) / PAGE);
+    (((1u32 << (last - first + 1)) - 1) << first) as u16
+}
+
+/// Whether `page` holds only zeros.
+fn all_zero(page: &[u8]) -> bool {
+    let chunks = page.chunks_exact(CHUNK);
+    chunks.remainder().iter().all(|&b| b == 0) && chunks.into_iter().all(|c| read_chunk_words(c).iter().fold(0, |a, w| a | w) == 0)
+}
+
+/// `tiles` (tile addresses, sorted) as runs of neighbours: (start, bytes).
+fn tile_runs(tiles: &[usize]) -> Vec<(usize, usize)> {
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for &t in tiles {
+        match runs.last_mut() {
+            Some(last) if last.0 + last.1 == t => last.1 += TILE,
+            _ => runs.push((t, TILE)),
+        }
+    }
+    runs
+}
+
+/// The ranges `before_gpu_write` found without a lazy tile since a tile last became lazy
+/// (`born`: how many times one did): a GPU write recorded there again asks nothing of the state.
+#[derive(Default)]
+struct Settled {
+    born: u64,
+    ranges: Vec<(usize, usize)>,
+}
+
+impl Settled {
+    const KEPT: usize = 64;
+
+    fn covers(&self, born: u64, a: usize, b: usize) -> bool {
+        self.born == born && self.ranges.iter().any(|&(lo, hi)| lo <= a && b <= hi)
+    }
+
+    fn add(&mut self, born: u64, a: usize, b: usize) {
+        if self.born != born {
+            *self = Settled { born, ranges: Vec::new() };
+        }
+        if self.ranges.len() < Self::KEPT && !self.covers(born, a, b) {
+            self.ranges.push((a, b));
+        }
+    }
+}
+
+/// committed tiles without video memory now (`Lazy::tiles`), for those that do not hold the state
+static LAZY_TILES: AtomicU64 = AtomicU64::new(0);
+/// lazy heaps made so far (`alloc_diverted`): a commit asks `gpu::uma` for them once there is one
+static LAZY_HEAPS: AtomicU64 = AtomicU64::new(0);
+/// times a tile became lazy (`Settled`)
+static LAZY_BORN: AtomicU64 = AtomicU64::new(0);
+/// the device's tiled resources are below tier 2 (`open`): a tile without video memory does not
+/// read as zeros there, so none is lazy
+static NO_LAZY: AtomicBool = AtomicBool::new(false);
+static SETTLED: Mutex<Settled> = Mutex::new(Settled { born: 0, ranges: Vec::new() });
+
+/// The parts of the pages of `[a, a + n)` that lie in lazy heaps: (start, end), by address.
+fn lazy_parts(a: usize, n: usize) -> Vec<(usize, usize)> {
+    if LAZY_HEAPS.load(Ordering::Acquire) == 0 || NO_LAZY.load(Ordering::Acquire) {
+        return Vec::new();
+    }
+    let (start, end) = page_span(a, n);
+    crate::gpu::uma::made().map_or_else(Vec::new, |u| u.sparse_lazy_in(start, end))
+}
+
 struct UploadSlot {
     alloc: ID3D12CommandAllocator,
     list: ID3D12GraphicsCommandList,
@@ -263,6 +461,8 @@ struct State {
     runs: Option<Vec<(usize, usize)>>,
     /// reusable buffer for dirty runs in `before_execute` (avoids per-submit heap alloc)
     scratch_runs: Vec<(usize, usize)>,
+    /// committed tiles of lazy heaps that have no video memory yet
+    lazy: Lazy,
 }
 
 impl Drop for State {
@@ -408,6 +608,12 @@ unsafe impl Send for State {}
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 static UNAVAILABLE: AtomicBool = AtomicBool::new(false);
+
+/// (diagnostics, `memdiag`) The 4 KiB pages with hashes of the chunks last sent, and their bytes.
+pub(crate) fn diag_sent() -> (usize, usize) {
+    let n = STATE.lock().unwrap().as_ref().map_or(0, |s| s.mapped.values().map(|e| e.sent.iter().flatten().count()).sum());
+    (n, n * std::mem::size_of::<[u64; CHUNKS]>())
+}
 
 #[cfg(test)]
 pub(super) struct SnapshotForTest {
@@ -634,11 +840,22 @@ unsafe fn open(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             waited: FxHashMap::default(),
             runs: None,
             scratch_runs: Vec::new(),
+            lazy: Lazy::default(),
         })
     })();
     match made {
         Ok(s) => {
             crate::xlog_info!("D3D12.X: {} sparse window(s) for the title's own memory (tiled buffers on video memory)", out.len());
+            let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+            let known = dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &mut o as *mut _ as *mut c_void, std::mem::size_of_val(&o) as u32).is_ok();
+            let no_lazy = !known || o.TiledResourcesTier.0 < D3D12_TILED_RESOURCES_TIER_2.0;
+            NO_LAZY.store(no_lazy, Ordering::Release);
+            if no_lazy {
+                crate::xlog_warn!(
+                    "sparse windows: tiled resources tier {}: a tile without video memory does not read as zeros, so the title's GPU heaps get video memory for every tile at the commit (XCL_SPARSE_LAZY_TILES has no effect)",
+                    o.TiledResourcesTier.0
+                );
+            }
             // a state this replaces (the windows set up again) goes after the lock: the release of
             // its last buffers reaches `forget_buffer`, which takes the lock (#344)
             let old = STATE.lock().unwrap().replace(s);
@@ -814,8 +1031,25 @@ impl State {
         );
     }
 
+    /// `ensure_mapped` for what gives lazy tiles their video memory (`by`: `BY_WRITE` …), which
+    /// counts them.
+    unsafe fn give(&mut self, by: usize, a: usize, n: usize, initial_holes: impl FnMut(usize) -> u16) {
+        let before = self.lazy.fresh.len();
+        self.ensure_mapped(a, n, initial_holes);
+        self.lazy.given[by] += (self.lazy.fresh.len() - before) as u64;
+        LAZY_TILES.store(self.lazy.tiles.len() as u64, Ordering::Release);
+    }
+
+    /// The set of lazy tiles changed: the watched ranges (`mapped_ranges`) are made again.
+    fn lazy_changed(&mut self) {
+        self.runs = None;
+        LAZY_TILES.store(self.lazy.tiles.len() as u64, Ordering::Release);
+        MAPPED_GEN.fetch_add(1, Ordering::Release);
+    }
+
     /// tiles of `[a, a + n)` get video memory (mapped in their window); `initial_holes` supplies
-    /// the initial 16-bit hole mask for each newly mapped 64 KiB tile.
+    /// the initial 16-bit hole mask for each newly mapped 64 KiB tile (a lazy tile has its own:
+    /// the pages that are not committed).
     unsafe fn ensure_mapped(&mut self, a: usize, n: usize, mut initial_holes: impl FnMut(usize) -> u16) {
         self.reclaim_released_pins();
         if n == 0 {
@@ -830,13 +1064,15 @@ impl State {
             if !self.mapped.contains_key(&t) && self.window_index(t).is_some() {
                 if let Some(tile) = self.parked.remove(&t) {
                     // still mapped there: no new mapping, what it held is cleared
-                    self.mapped.insert(t, TileEntry::with_holes(tile, initial_holes(t)));
+                    let holes = self.lazy.take(t).unwrap_or_else(|| initial_holes(t));
+                    self.mapped.insert(t, TileEntry::with_holes(tile, holes));
                     self.runs = None;
                     self.queue_zero(t, TILE);
                     unparked = true;
                 } else {
                     let Some((tile, reused)) = self.take_tile() else { break };
-                    self.mapped.insert(t, TileEntry::with_holes(tile, initial_holes(t)));
+                    let holes = self.lazy.take(t).unwrap_or_else(|| initial_holes(t));
+                    self.mapped.insert(t, TileEntry::with_holes(tile, holes));
                     self.runs = None;
                     if reused {
                         self.queue_zero(t, TILE);
@@ -1303,6 +1539,69 @@ pub unsafe fn alloc_in(window: usize, size: usize, align: usize) -> Option<(usiz
     Some((addr, rounded))
 }
 
+/// `alloc` for a GPU heap of the title's that the coherent window did not take (`kernelx`:
+/// `XCL_COHERENT_HEAPS_MAX_MB`, a window without room). Such a heap came from window 3 and needs
+/// nothing of window 0: it is taken from the top of windows 1+ (`Uma::sparse_alloc_top`;
+/// `XCL_SPARSE_DIVERTED_TOP=0`: as `alloc`, window 0 first). And it is lazy (`Lazy`: its tiles
+/// get video memory when it is first needed; `XCL_SPARSE_LAZY_TILES=0`: all of them at the
+/// commit, as `alloc`). Both are logged with the first such heap.
+pub unsafe fn alloc_diverted(size: usize, align: usize) -> Option<(usize, usize)> {
+    static SWITCHES: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
+    static SAID: AtomicBool = AtomicBool::new(false);
+    let (lazy, top) = *SWITCHES.get_or_init(|| {
+        let on = |name: &str| std::env::var(name).map_or(true, |v| v != "0");
+        (on("XCL_SPARSE_LAZY_TILES"), on("XCL_SPARSE_DIVERTED_TOP"))
+    });
+    reclaim_released_blocks();
+    if !accepts_allocations() {
+        return None;
+    }
+    let u = crate::gpu::uma::get()?;
+    let (addr, rounded) = if top { u.sparse_alloc_top(size, align)? } else { u.sparse_alloc(size, align)? };
+    if lazy && u.sparse_set_lazy(addr) {
+        LAZY_HEAPS.fetch_add(1, Ordering::AcqRel);
+    }
+    if VirtualAlloc(addr as *const c_void, rounded, MEM_COMMIT, PAGE_READWRITE).is_null() {
+        u.sparse_release(addr);
+        return None;
+    }
+    committed(addr, rounded);
+    if !SAID.swap(true, Ordering::AcqRel) {
+        crate::xlog_info!(
+            "sparse windows: the first title GPU heap outside the coherent window ({} MB) is at {addr:#x}, in window {}: such heaps are taken {} (XCL_SPARSE_DIVERTED_TOP=0: window 0 first) and their tiles get video memory {} (XCL_SPARSE_LAZY_TILES=0: all at the commit)",
+            rounded >> 20,
+            u.window_of(addr).unwrap_or(0),
+            if top { "from the top of windows 1+" } else { "from window 0 first" },
+            if lazy && !NO_LAZY.load(Ordering::Acquire) { "when first written, placed on or written by a GPU command" } else { "all at the commit" }
+        );
+    }
+    Some((addr, rounded))
+}
+
+/// The title's GPU work is going to write `[va, va + len)` of a sparse window (a memory command
+/// it records, a copy or a resolve into a buffer there: `list_x`'s sparse writes). Lazy tiles
+/// there get their video memory now, ahead of the submit that runs the write – whose
+/// `before_execute` makes the title's queue wait for the mapping. Called with no lock of
+/// `list_x`'s held.
+pub unsafe fn before_gpu_write(va: usize, len: usize) {
+    if len == 0 || LAZY_TILES.load(Ordering::Acquire) == 0 || !crate::gpu::uma::made().is_some_and(|u| u.is_sparse(va)) {
+        return;
+    }
+    let (first, end) = (va & !(TILE - 1), va.saturating_add(len));
+    let settled = SETTLED.lock().unwrap().covers(LAZY_BORN.load(Ordering::Acquire), first, end);
+    if settled {
+        return;
+    }
+    let mut g = STATE.lock().unwrap();
+    let Some(s) = g.as_mut() else { return };
+    for (t, bytes) in tile_runs(&s.lazy.within(first, end)) {
+        s.give(BY_COMMAND, t, bytes, |_| 0xFFFF);
+    }
+    if s.lazy.within(first, end).is_empty() {
+        SETTLED.lock().unwrap().add(LAZY_BORN.load(Ordering::Acquire), first, end);
+    }
+}
+
 /// Release a sparse allocation from `alloc` / `alloc_in` (false: not a sparse allocation).
 pub unsafe fn free(p: usize) -> bool {
     let Some(u) = crate::gpu::uma::get() else { return false };
@@ -1424,9 +1723,21 @@ pub unsafe fn decommitted(a: usize, n: usize) {
 }
 
 impl State {
-    /// `committed` with the state locked
+    /// `committed` with the state locked: video memory for the tiles, but in a lazy heap, whose
+    /// tiles are recorded with their committed pages (`Lazy`)
     unsafe fn commit_range(&mut self, a: usize, n: usize) {
-        self.ensure_mapped(a, n, |_| 0xFFFF);
+        let mut at = a;
+        let mut born = false;
+        for (lo, hi) in lazy_parts(a, n) {
+            self.ensure_mapped(at, lo.saturating_sub(at), |_| 0xFFFF);
+            born |= self.lazy.commit(lo, hi, |t| self.mapped.contains_key(&t));
+            at = hi;
+        }
+        self.ensure_mapped(at, a.saturating_add(n).saturating_sub(at), |_| 0xFFFF);
+        if born {
+            LAZY_BORN.fetch_add(1, Ordering::AcqRel);
+            self.lazy_changed();
+        }
         let mut pg = a & !(PAGE - 1);
         let end = a.saturating_add(n);
         while pg < end {
@@ -1449,6 +1760,10 @@ impl State {
     /// `decommitted` with the state locked: the tiles that go are parked (`flush_parked` unmaps
     /// them and frees their pool tiles)
     unsafe fn decommit_range(&mut self, a: usize, n: usize) {
+        let pages = page_span(a, n);
+        if !self.lazy.tiles.is_empty() && self.lazy.decommit(pages.0, pages.1) {
+            self.lazy_changed();
+        }
         let mut pools: Vec<(usize, (u32, u32))> = Vec::new();
         let mut t = a & !(TILE - 1);
         let end = a.saturating_add(n);
@@ -1533,6 +1848,7 @@ pub(crate) fn alias_facts(va: usize) -> Option<String> {
             ),
         ),
         (None, Some(&tile)) => (Some(tile), format!("decommitted, still parked on video-memory pool tile {tile:?}")),
+        (None, None) if s.lazy.tiles.contains_key(&t) => (None, "committed in a lazy heap, no video memory yet: the GPU reads zeros and its writes are lost (XCL_SPARSE_LAZY_TILES)".to_string()),
         (None, None) => (None, "not committed: no video memory".to_string()),
     };
     if let Some(pool) = pool {
@@ -1556,12 +1872,13 @@ pub(crate) fn alias_facts(va: usize) -> Option<String> {
 }
 
 /// The sparse windows' tiles with video memory as sorted (start, end) runs: where a CPU write
-/// has to reach the GPU.
+/// has to reach the GPU. With them the committed tiles of lazy heaps that have none yet (`Lazy`):
+/// a CPU write there is what gives them theirs.
 pub fn mapped_ranges() -> Vec<(usize, usize)> {
     let mut g = STATE.lock().unwrap();
     let Some(s) = g.as_mut() else { return Vec::new() };
     if s.runs.is_none() {
-        let mut tiles: Vec<usize> = s.mapped.keys().copied().collect();
+        let mut tiles: Vec<usize> = s.mapped.keys().chain(s.lazy.tiles.keys()).copied().collect();
         tiles.sort_unstable();
         let mut runs: Vec<(usize, usize)> = Vec::new();
         for t in tiles {
@@ -1620,6 +1937,12 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     }
     let t_locked = std::time::Instant::now();
     PHASES[0].fetch_add((t_locked - t0).as_micros() as u64, Ordering::Relaxed);
+    if !s.lazy.tiles.is_empty() {
+        let written = s.lazy.written(dirty, page, |pg| !all_zero(std::slice::from_raw_parts(pg as *const u8, PAGE)));
+        for (t, bytes) in tile_runs(&written) {
+            s.give(BY_WRITE, t, bytes, |_| 0xFFFF);
+        }
+    }
     let zero_runs = s.take_zero_runs();
     for &(a, n) in &zero_runs {
         s.clear_sent_range(a, n);
@@ -1654,6 +1977,14 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
             x = end;
         }
     }
+    for t in std::mem::take(&mut s.lazy.fresh) {
+        let Some(entry) = s.mapped.get_mut(&t) else { continue };
+        let holes = entry.holes;
+        for idx in (0..PAGES_PER_TILE).filter(|idx| holes & (1u16 << idx) == 0) {
+            let pg = t + idx * PAGE;
+            scan_page(std::slice::from_raw_parts(pg as *const u8, PAGE), pg, &mut entry.sent[idx], &mut dirty_runs);
+        }
+    }
     let t_scanned = std::time::Instant::now();
     PHASES[1].fetch_add((t_scanned - t_locked).as_micros() as u64, Ordering::Relaxed);
     PHASES[3].fetch_add((zero_runs.len() + dirty_runs.len()) as u64, Ordering::Relaxed);
@@ -1686,6 +2017,9 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
                 PHASES[3].load(Ordering::Relaxed)
             );
         }
+    }
+    if let Some(line) = s.lazy.line(t0, s.mapped.len()) {
+        crate::xlog_info!("{line}");
     }
     dirty_runs.clear();
     s.scratch_runs = dirty_runs;
@@ -1726,7 +2060,7 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
     }
     // its tiles: the window's video memory at the same addresses; probe actual OS commitment
     // so uncommitted pages (e.g. [start, va) or reserved tails) stay marked as holes
-    s.ensure_mapped(start, delta + bytes, |t| query_tile_holes(t));
+    s.give(BY_PLACEMENT, start, delta + bytes, |t| query_tile_holes(t));
     let tiles: Vec<(usize, (u32, u32))> = (start..va + bytes).step_by(TILE).filter_map(|t| s.mapped.get(&t).map(|e| (t, e.pool))).collect();
     let raw = *ppv;
     let res = ID3D12Resource::from_raw_borrowed(&raw)?.clone();
@@ -1870,6 +2204,7 @@ mod tests {
                 waited: FxHashMap::default(),
                 runs: None,
                 scratch_runs: Vec::new(),
+                lazy: Lazy::default(),
             };
 
             let (first, reused) = s.take_tile().expect("a tile from a new pool");
@@ -1954,6 +2289,7 @@ mod tests {
                 waited: FxHashMap::default(),
                 runs: None,
                 scratch_runs: Vec::new(),
+                lazy: Lazy::default(),
             };
 
             s.commit_range(base, TILE);
@@ -2230,6 +2566,7 @@ mod tests {
                 waited: FxHashMap::default(),
                 runs: None,
                 scratch_runs: Vec::new(),
+                lazy: Lazy::default(),
             };
 
             // Mirrors `place_buffer`: map both tiles probing real OS page commitment.
@@ -2323,6 +2660,153 @@ mod tests {
         assert_eq!(u, vec![t3]);
         assert_eq!(free, vec![(0, 13)]);
         assert_eq!(to_zero, vec![(t4, PAGE)], "unrelated mapped tile's to_zero must remain");
+    }
+
+    /// The pages of a tile that a range touches, as the mask lazy tiles keep.
+    #[test]
+    fn page_masks_are_the_pages_a_range_touches() {
+        let t = 0x4_2000_0000usize;
+        assert_eq!(page_mask(t, t, t + TILE), 0xFFFF);
+        assert_eq!(page_mask(t, t - TILE, t + 3 * TILE), 0xFFFF);
+        assert_eq!(page_mask(t, t, t + PAGE), 0x0001);
+        assert_eq!(page_mask(t, t + 15 * PAGE, t + TILE), 0x8000);
+        assert_eq!(page_mask(t, t + 4 * PAGE, t + 8 * PAGE), 0x00F0);
+        assert_eq!(page_mask(t, t + 4 * PAGE + 1, t + 8 * PAGE + 1), 0x01F0, "a page counts when it is touched");
+        assert_eq!(page_mask(t, t - PAGE, t + 1), 0x0001);
+        assert_eq!(page_mask(t, t + TILE, t + 2 * TILE), 0);
+        assert_eq!(page_mask(t, t - TILE, t), 0);
+        assert_eq!(page_mask(t, t + PAGE, t + PAGE), 0);
+    }
+
+    /// The tiles of a lazy heap are recorded with their committed pages at a commit, lose them
+    /// at a decommit and go with their last page; a tile with video memory is not recorded, and
+    /// one that gets video memory hands over its holes once.
+    #[test]
+    fn lazy_tiles_follow_commits_and_decommits() {
+        let base = 0x4_2000_0000usize;
+        let mut lazy = Lazy::default();
+        assert!(lazy.commit(base, base + 3 * TILE, |t| t == base + TILE), "tiles became lazy");
+        assert_eq!(lazy.within(0, usize::MAX), vec![base, base + 2 * TILE]);
+        assert_eq!(lazy.tiles[&base], 0xFFFF);
+        assert!(!lazy.commit(base, base + TILE, |_| false), "no tile is new");
+        assert!(lazy.commit(base + 4 * TILE + 2 * PAGE, base + 4 * TILE + 6 * PAGE, |_| false));
+        assert_eq!(lazy.tiles[&(base + 4 * TILE)], 0x003C);
+        assert!(!lazy.commit(base + 4 * TILE, base + 4 * TILE + PAGE, |_| false));
+        assert_eq!(lazy.tiles[&(base + 4 * TILE)], 0x003D);
+        assert_eq!(lazy.within(base + 2 * TILE + 1, base + 4 * TILE + 1), vec![base + 2 * TILE, base + 4 * TILE]);
+        assert!(lazy.within(base + 3 * TILE, base + 4 * TILE).is_empty());
+
+        assert!(!lazy.decommit(base + 4 * TILE, base + 4 * TILE + 4 * PAGE), "pages are left");
+        assert_eq!(lazy.tiles[&(base + 4 * TILE)], 0x0030);
+        assert!(lazy.decommit(base + 4 * TILE + 4 * PAGE, base + 5 * TILE), "its last pages");
+        assert!(!lazy.tiles.contains_key(&(base + 4 * TILE)));
+        assert!(!lazy.decommit(base + TILE, base + 2 * TILE), "not a lazy tile");
+        assert!(lazy.decommit(base + TILE / 2, base + 8 * TILE));
+        assert_eq!(lazy.tiles[&base], 0x00FF);
+        assert_eq!(lazy.within(0, usize::MAX), vec![base]);
+
+        assert_eq!(lazy.take(base), Some(0xFF00), "the holes are the pages that are not committed");
+        assert_eq!(lazy.take(base), None);
+        assert_eq!(lazy.fresh, vec![base]);
+        assert!(lazy.tiles.is_empty());
+    }
+
+    /// A lazy tile is taken as written when one of its committed pages that the CPU wrote holds
+    /// something other than zeros – a page of zeros is what the GPU reads there anyway – and no
+    /// page is read that is not committed or not in a lazy tile.
+    #[test]
+    fn a_lazy_tile_is_written_when_a_committed_page_is_not_zero() {
+        let base = 0x4_2000_0000usize;
+        let mut lazy = Lazy::default();
+        lazy.commit(base, base + 4 * TILE, |_| false);
+        lazy.commit(base + 8 * TILE + 8 * PAGE, base + 9 * TILE, |_| false);
+        let nonzero = [base + 3 * PAGE, base + TILE + 5 * PAGE, base + TILE + 6 * PAGE, base + 8 * TILE + PAGE, base + 8 * TILE + 9 * PAGE, base + 16 * TILE];
+        let dirty = [
+            base + PAGE,
+            base + 3 * PAGE,
+            base + 4 * PAGE,
+            base + TILE + 5 * PAGE,
+            base + TILE + 6 * PAGE,
+            base + 2 * TILE,
+            base + 8 * TILE + PAGE,
+            base + 8 * TILE + 8 * PAGE,
+            base + 8 * TILE + 9 * PAGE,
+            base + 16 * TILE,
+        ];
+        let mut asked = Vec::new();
+        let written = lazy.written(&dirty, PAGE, |pg| {
+            asked.push(pg);
+            nonzero.contains(&pg)
+        });
+        assert_eq!(written, vec![base, base + TILE, base + 8 * TILE]);
+        assert_eq!(asked, vec![base + PAGE, base + 3 * PAGE, base + TILE + 5 * PAGE, base + 2 * TILE, base + 8 * TILE + 8 * PAGE, base + 8 * TILE + 9 * PAGE]);
+        assert!(lazy.written(&[base + 2 * TILE, base + 3 * TILE + PAGE], PAGE, |_| false).is_empty(), "zeros only");
+        assert_eq!(lazy.written(&[base + 2 * TILE], TILE, |pg| pg == base + 2 * TILE + 7 * PAGE), vec![base + 2 * TILE], "a written range of 16 pages");
+        assert!(Lazy::default().written(&dirty, PAGE, |_| true).is_empty());
+    }
+
+    #[test]
+    fn neighbouring_tiles_are_one_run() {
+        let t = 0x4_2000_0000usize;
+        assert!(tile_runs(&[]).is_empty());
+        assert_eq!(tile_runs(&[t, t + TILE, t + 2 * TILE, t + 4 * TILE, t + 9 * TILE, t + 10 * TILE]), vec![(t, 3 * TILE), (t + 4 * TILE, TILE), (t + 9 * TILE, 2 * TILE)]);
+    }
+
+    #[test]
+    fn a_page_of_zeros_is_told_from_one_with_a_byte() {
+        let mut page = vec![0u8; PAGE];
+        assert!(all_zero(&page));
+        for at in [0, 63, 64, 2047, PAGE - 1] {
+            page[at] = 1;
+            assert!(!all_zero(&page), "byte {at}");
+            page[at] = 0;
+        }
+        assert!(all_zero(&page));
+    }
+
+    /// A range found without lazy tiles is not looked at again until a tile becomes lazy.
+    #[test]
+    fn settled_ranges_last_until_a_tile_becomes_lazy() {
+        let mut s = Settled::default();
+        assert!(!s.covers(0, 0x1000, 0x2000));
+        s.add(0, 0x1_0000, 0x3_0000);
+        assert!(s.covers(0, 0x1_0000, 0x3_0000) && s.covers(0, 0x2_0000, 0x2_0008));
+        assert!(!s.covers(0, 0x2_0000, 0x3_0001) && !s.covers(0, 0xFFFF, 0x1_0001));
+        assert!(!s.covers(1, 0x1_0000, 0x3_0000), "a tile became lazy since");
+        s.add(1, 0x5_0000, 0x6_0000);
+        assert!(s.covers(1, 0x5_0000, 0x6_0000) && !s.covers(1, 0x1_0000, 0x3_0000));
+        s.add(1, 0x5_0000, 0x5_8000);
+        assert_eq!(s.ranges.len(), 1, "a range inside a kept one is not kept again");
+        for k in 0..2 * Settled::KEPT {
+            s.add(1, k << 20, (k << 20) + 0x1_0000);
+        }
+        assert_eq!(s.ranges.len(), Settled::KEPT);
+    }
+
+    /// The counts are logged once a heap is lazy, at most every 30 s and only when they changed.
+    #[test]
+    fn the_lazy_line_is_owed_every_30_s_while_the_counts_change() {
+        let base = 0x4_2000_0000usize;
+        let now = std::time::Instant::now();
+        let s = std::time::Duration::from_secs;
+        let mut lazy = Lazy::default();
+        assert_eq!(lazy.line(now, 0), None, "no lazy heap yet");
+        lazy.commit(base, base + 32 * TILE, |_| false);
+        assert_eq!(
+            lazy.line(now, 100).as_deref(),
+            Some("sparse lazy tiles: 2 MB committed without video memory (32 tiles); video memory given to 0 tiles at a first CPU write, 0 at a buffer placement, 0 at a GPU command write; 6 MB of tiles mapped in all (XCL_SPARSE_LAZY_TILES=0: off)")
+        );
+        assert_eq!(lazy.line(now + s(40), 100), None, "nothing changed");
+        lazy.take(base);
+        lazy.given[BY_WRITE] += 1;
+        assert_eq!(lazy.line(now + s(20), 101), None, "under 30 s since the last line");
+        let line = lazy.line(now + s(31), 101).expect("a line is owed");
+        assert!(line.contains("1 MB committed without video memory (31 tiles); video memory given to 1 tiles at a first CPU write"), "{line}");
+        lazy.given[BY_PLACEMENT] += 2;
+        lazy.given[BY_COMMAND] += 3;
+        assert_eq!(lazy.line(now + s(60), 101), None);
+        let line = lazy.line(now + s(61), 101).expect("a line is owed");
+        assert!(line.contains("2 at a buffer placement, 3 at a GPU command write"), "{line}");
     }
 
     /// The pages in `early`, checking that its ranges are page-aligned, not empty, disjoint and

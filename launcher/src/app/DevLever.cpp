@@ -29,6 +29,7 @@
 #include <QGuiApplication>
 #include <QScreen>
 #include <QScrollArea>
+#include <QScrollBar>
 #include <QDir>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -396,8 +397,8 @@ QStringList DevLever::states()
         QStringLiteral("cold-cache"), QStringLiteral("details"), QStringLiteral("details-no-art"),
         QStringLiteral("warmup-idle"), QStringLiteral("warmup-running"), QStringLiteral("warmup-paused-ram"),
         QStringLiteral("warmup-failed"), QStringLiteral("warmup-finished"), QStringLiteral("warmup-blocked"),
-        QStringLiteral("warmup-cancelled"), QStringLiteral("warmup-stopped"),
-        QStringLiteral("settings"), QStringLiteral("settings-network"), QStringLiteral("settings-shaders"),
+        QStringLiteral("warmup-cancelled"), QStringLiteral("warmup-stopped"), QStringLiteral("warmup-off"), QStringLiteral("details-warmup-off"),
+        QStringLiteral("settings"), QStringLiteral("settings-network"), QStringLiteral("settings-shaders"), QStringLiteral("settings-run-profile"),
         QStringLiteral("settings-shaders-clear"), QStringLiteral("settings-overlay"), QStringLiteral("settings-folders"),
         QStringLiteral("settings-input"), QStringLiteral("settings-graphics"), QStringLiteral("settings-logs"),
         QStringLiteral("settings-runners-folder"),
@@ -405,14 +406,14 @@ QStringList DevLever::states()
         QStringLiteral("first-launch"), QStringLiteral("first-launch-network"), QStringLiteral("first-launch-folders"),
         QStringLiteral("first-launch-folders-found"),
         QStringLiteral("error-files-missing"), QStringLiteral("error-not-enough-ram"), QStringLiteral("error-crash"),
-        QStringLiteral("error-device-removed"),
+        QStringLiteral("error-device-removed"), QStringLiteral("error-emulator-missing"),
         QStringLiteral("in-game-booting"), QStringLiteral("in-game-playing"), QStringLiteral("in-game-overlay"),
         QStringLiteral("in-game-paused"), QStringLiteral("in-game-fitted"), QStringLiteral("in-game-fullscreen-hint"),
         QStringLiteral("in-game-fullscreen"), QStringLiteral("in-game-crashed"), QStringLiteral("in-game-device-removed"),
         QStringLiteral("in-game-boot-error"), QStringLiteral("in-game-back-to-library"),
         QStringLiteral("runners"), QStringLiteral("runners-install-confirm"), QStringLiteral("runners-building"),
         QStringLiteral("runners-install-error"), QStringLiteral("runners-change-location"), QStringLiteral("details-runs-with-kelvaroq"),
-        QStringLiteral("details-runs-with-picker"),
+        QStringLiteral("details-runs-with-picker"), QStringLiteral("details-run-profile"),
         QStringLiteral("warmup-runner"), QStringLiteral("library-runner-own-window"), QStringLiteral("library-runner-floating-bar"),
         QStringLiteral("share-settings"), QStringLiteral("import-preview"), QStringLiteral("import-error"),
     };
@@ -495,6 +496,8 @@ void DevLever::apply(const Options& o, Services& s, MainWindow& w)
     s.settings.setTheme(o.theme == QLatin1String("dark") ? AppSettings::ThemeMode::Dark : AppSettings::ThemeMode::Light);
     s.settings.setDefaultDeviceType(QStringLiteral("lockhart"));
     s.settings.setOffline(true);
+    // the design states show XSEmu's warm-up; the -warmup-off states show it turned off, as the build ships
+    s.settings.setXsemuWarmup(!o.state.endsWith(QLatin1String("warmup-off")));
     const bool firstLaunch = o.state.startsWith(QLatin1String("first-launch"));
     const bool libraryState = isLibraryState(o.state) && o.state != QLatin1String("library-empty");
     const QString games = root(QStringLiteral("games"));
@@ -533,7 +536,7 @@ void DevLever::apply(const Options& o, Services& s, MainWindow& w)
         s.emulator.simulateForScreenshot(EmulatorController::State::Running, coast, {});
     } else if (st == QLatin1String("library-paused") || st == QLatin1String("library-stop-first"))
         s.emulator.simulateForScreenshot(EmulatorController::State::Paused, coast, pausedStats());
-    else if (st == QLatin1String("details"))
+    else if (st == QLatin1String("details") || st == QLatin1String("details-warmup-off"))
         w.showGameDetails(coast);
     else if (st == QLatin1String("details-no-art"))
         w.showGameDetails(signal);
@@ -542,7 +545,12 @@ void DevLever::apply(const Options& o, Services& s, MainWindow& w)
         w.showGameDetails(coast);
     } else if (st == QLatin1String("details-runs-with-picker"))
         w.showGameDetails(coast);
-    else if (st == QLatin1String("share-settings") || st.startsWith(QLatin1String("import-"))) {
+    else if (st == QLatin1String("details-run-profile")) {
+        s.settings.setGameOverride(coast.titleId(), QStringLiteral("runProfile"),
+                                   QStringList{QStringLiteral("XCL_SHADER_BACKEND=dxil"), QStringLiteral("XCL_LOOP_GUARD=4096"),
+                                               QStringLiteral("XCL_DISPLAY_MODE=2560x1440"), QStringLiteral("XCL_NETWORK=1")});
+        w.showGameDetails(coast);
+    } else if (st == QLatin1String("share-settings") || st.startsWith(QLatin1String("import-"))) {
         if (st == QLatin1String("share-settings")) {
             s.settings.setGameOverride(coast.titleId(), QStringLiteral("device_type"), QStringLiteral("anaconda"));
             s.settings.setGameOverride(coast.titleId(), QStringLiteral("display_mode"), QStringLiteral("1920x1080"));
@@ -616,6 +624,8 @@ void DevLever::apply(const Options& o, Services& s, MainWindow& w)
             w.settingsPage()->showSection(SettingsPage::Section::Shaders);
         } else if (st == QLatin1String("settings-network"))
             w.settingsPage()->showSection(SettingsPage::Section::Network);
+        else if (st == QLatin1String("settings-run-profile"))
+            w.settingsPage()->showSection(SettingsPage::Section::RunProfile);
         else if (st == QLatin1String("settings-overlay"))
             w.settingsPage()->showSection(SettingsPage::Section::Overlay);
         else if (st == QLatin1String("settings-folders"))
@@ -682,6 +692,11 @@ void DevLever::apply(const Options& o, Services& s, MainWindow& w)
 
     if (st == QLatin1String("details-runs-with-picker"))
         QTimer::singleShot(0, &w, [&w] { w.gameDetailsPage()->runsWith()->openPicker(); });
+    if (st == QLatin1String("details-run-profile"))
+        QTimer::singleShot(0, &w, [&w] {
+            QScrollBar* bar = w.gameDetailsPage()->findChild<QScrollArea*>()->verticalScrollBar();
+            bar->setValue(bar->maximum());
+        });
     if (st == QLatin1String("runners-install-confirm"))
         QTimer::singleShot(0, &w, [&w, &s] { RunnerUi::confirmInstall(&w, s, QStringLiteral("victory-7900xtx")); });
     if (st == QLatin1String("runners-change-location")) {
@@ -745,6 +760,11 @@ void DevLever::apply(const Options& o, Services& s, MainWindow& w)
             gone.folder = root(QStringLiteral("unplugged/Archive/Quiet"));
             gone.configPath = QDir(gone.folder).filePath(QStringLiteral("MicrosoftGame.config"));
             LaunchErrors::showLaunchProblem(&w, s, gone, s.emulator.checkLaunch(gone), [] {});
+        } else if (st == QLatin1String("error-emulator-missing")) {
+            // the emulator as a user sets it, at a path that no longer holds it; the check is real
+            qunsetenv("XSEMU_EMULATOR");
+            s.settings.setEmulatorPathOverride(root(QStringLiteral("XSEmu/XSEmu.exe")));
+            LaunchErrors::showLaunchProblem(&w, s, coast, s.emulator.checkLaunch(coast), [] {});
         } else if (st == QLatin1String("error-not-enough-ram")) {
             // fixture numbers: the need is the real one (1 GB floor + the launch need setting), free RAM is invented
             EmulatorController::LaunchCheck check;

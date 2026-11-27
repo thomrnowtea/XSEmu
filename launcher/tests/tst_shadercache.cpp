@@ -263,6 +263,15 @@ void TestShaderCache::titleState()
     const ShaderCacheInfo unscanned;
     QCOMPARE(titleShaderState(QStringLiteral("A"), {}, unscanned), TitleShaderState::Unknown);
     QCOMPARE(titleShaderState(QStringLiteral("A"), {ok}, unscanned), TitleShaderState::Ready);
+
+    // a warm-up made with other run profile switches no longer counts; an unrecorded one is not judged
+    WarmupRun withProfile = ok;
+    withProfile.profile = QStringLiteral("aaaa");
+    QCOMPARE(titleShaderState(QStringLiteral("A"), {withProfile}, cache, QStringLiteral("aaaa")), TitleShaderState::Ready);
+    QCOMPARE(titleShaderState(QStringLiteral("A"), {withProfile}, cache, QStringLiteral("bbbb")), TitleShaderState::ProfileChanged);
+    QCOMPARE(titleShaderState(QStringLiteral("A"), {withProfile}, cleared, QStringLiteral("bbbb")), TitleShaderState::NeverWarmed);
+    QCOMPARE(titleShaderState(QStringLiteral("A"), {ok}, cache, QStringLiteral("bbbb")), TitleShaderState::Ready);
+    QCOMPARE(WarmupRun::fromMap(withProfile.toMap()).profile, QStringLiteral("aaaa"));
 }
 
 void TestShaderCache::clearKeepsWhatIsNotTheCaches()

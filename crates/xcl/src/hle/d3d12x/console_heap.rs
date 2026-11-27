@@ -18,7 +18,9 @@
 //! its PC descriptor – and that heap is what lists bind. The title's own PC heap stays as a
 //! CPU-only mirror (where views are made, copies come from and UAV clears take their CPU
 //! handle). A heap gets its place in the shared heap a page of `PAGE_SLOTS` slots at a time,
-//! when a slot of that page is first used: titles make large heaps and fill few slots
+//! when a view with PC descriptors is first made in or copied to a slot of that page (`slot`;
+//! a slot that is read, or gets a view shaders read from memory, takes none: `lookup`): titles
+//! make large heaps and fill few slots
 //! (Minecraft: eight view heaps of 73 727 slots – 147 454 PC descriptors each, more in all
 //! than the 1 000 000 an NVIDIA shared heap holds – with a few hundred views in them). A heap
 //! left out of the shared heap would be lost: lists bind only the shared heap for views.
@@ -61,6 +63,14 @@ struct Heap {
     /// views in the shared heap: the index there of each page's first SRV (`UNMAPPED`: the
     /// page has no place yet); empty: the heap's views are not in the shared heap
     pages: Vec<u32>,
+    /// for each page of `pages`, the frame (present count) a slot of it was last used in
+    /// (`slot`, `lookup`, `table_bound`)
+    used: Vec<u32>,
+    /// the `EVICTED` pages: what their image slots named (`evict_words`)
+    evicted: std::collections::HashMap<u32, Named>,
+    /// (frame, page): in that frame a list bound a table taken to reach the heap's end from
+    /// that page (`table_pages`), and the pages from there on are marked as used in it
+    tail: Option<(u32, u32)>,
     /// shader visible as the title made it
     visible: bool,
     memory: Memory,
@@ -85,51 +95,13 @@ struct Global {
     cpu: u64,
     gpu: u64,
     inc: u32,
-    ranges: SharedRanges,
-}
-
-#[derive(Clone, Copy)]
-pub(super) enum Owner {
-    Title,
-    DirectoryPage,
-    DirectoryTable,
-    Locator,
-    Other,
-}
-
-const OWNER_COUNT: usize = Owner::Other as usize + 1;
-
-struct SharedRanges {
     cap: u32,
-    next: u32,
-    /// Free ranges (first, count), ordered by start and separated by live descriptors.
-    free: Vec<(u32, u32)>,
-    live: [u32; OWNER_COUNT],
-    refused: [u64; OWNER_COUNT],
-}
-
-impl SharedRanges {
-    fn new(cap: u32) -> Self {
-        Self { cap, next: NULL_IMAGE_VIEWS, free: Vec::new(), live: [0; OWNER_COUNT], refused: [0; OWNER_COUNT] }
-    }
-
-    fn reserve(&mut self, owner: Owner, count: u32) -> Option<u32> {
-        let first = take_range(&mut self.free, &mut self.next, self.cap, count);
-        if first.is_some() {
-            self.live[owner as usize] += count;
-        } else {
-            if self.refused == [0; OWNER_COUNT] {
-                crate::xlog_warn!("console descriptor heaps: the shared heap ({}) cannot fit {count} descriptors – shaders do not see the missing views", self.cap);
-            }
-            self.refused[owner as usize] += 1;
-        }
-        first
-    }
-
-    fn release(&mut self, owner: Owner, first: u32, count: u32) {
-        return_range(&mut self.free, &mut self.next, first, count);
-        self.live[owner as usize] -= count;
-    }
+    /// the single descriptors' region (`reserve_single`), after the null views; empty: there is none
+    singles: Region,
+    /// the rest of the heap: the title heaps' pages and XCL's own ranges
+    ranges: Region,
+    /// descriptors held now, by `Holder`
+    held: [u32; HOLDERS],
 }
 
 // D3D12 descriptor heaps and devices are free-threaded
@@ -138,13 +110,228 @@ unsafe impl Send for Global {}
 static GLOBAL: Mutex<Option<Global>> = Mutex::new(None);
 static GLOBAL_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// descriptors of the shared heap at most (the GPU may take more: OPTIONS19)
+/// descriptors of the shared heap at most (the GPU may take more than it reports: `larger_heap`)
 const GLOBAL_MAX: u32 = 1 << 21;
+
+/// Who holds descriptors of the shared heap (`usage_line` counts each).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Holder {
+    /// pages of the titles' view heaps (`page_of`)
+    TitlePages,
+    /// XCL's own ranges (`reserve_own`): the memory windows' raw views
+    Windows,
+    /// root versions of the physical directory
+    Roots,
+    /// its leaves
+    Leaves,
+    /// its recordings' locators
+    Locators,
+    /// its bound physical pages
+    Pages,
+}
+const HOLDERS: usize = 6;
+
+/// A part of the shared heap, `[first, end)`, with its own free ranges.
+struct Region {
+    first: u32,
+    end: u32,
+    next: u32,
+    /// Free ranges (first, count), ordered by start and separated by live descriptors.
+    free: Vec<(u32, u32)>,
+    /// descriptors given out
+    used: u32,
+}
+
+/// (first, end, descriptors given out, free ranges, the largest free range) of a region
+type RegionUsage = (u32, u32, u32, usize, u32);
+
+impl Region {
+    fn new(first: u32, end: u32) -> Self {
+        Self { first, end, next: first, free: Vec::new(), used: 0 }
+    }
+
+    fn take(&mut self, count: u32) -> Option<u32> {
+        let first = take_range(&mut self.free, &mut self.next, self.end, count)?;
+        self.used += count;
+        Some(first)
+    }
+
+    fn give(&mut self, first: u32, count: u32) {
+        return_range(&mut self.free, &mut self.next, first, count);
+        self.used = self.used.saturating_sub(count);
+    }
+
+    /// more than three quarters of it are given out
+    fn crowded(&self) -> bool {
+        self.used as u64 * 4 > (self.end - self.first) as u64 * 3
+    }
+
+    /// The room never given out (after `next`) counts as one free range.
+    fn usage(&self) -> RegionUsage {
+        let rest = self.end - self.next;
+        (self.first, self.end, self.used, self.free.len() + (rest > 0) as usize, self.free.iter().map(|&(_, n)| n).max().unwrap_or(0).max(rest))
+    }
+}
+
+/// single descriptors kept for the physical directory's roots, leaves and locators, beside one
+/// for each 64 KiB page of the title's memory
+const SINGLES_VIEWS: u32 = 16_384;
+/// single descriptors are named in 20 bits (`physical_directory`: a page table entry, a view)
+const SINGLES_END: u32 = 1 << 20;
+
+/// Descriptors of a shared heap of `cap` kept as the single descriptors' region
+/// (`XCL_DESCRIPTOR_SINGLES`: that many, 0: no region), for a title with `title_mb` MiB of
+/// memory: one for each 64 KiB physical page – the most the physical directory can bind – and
+/// `SINGLES_VIEWS`, a quarter of the heap at most and all below `SINGLES_END`. The title heaps'
+/// pages get none of these, so they cannot leave the directory without a descriptor, and single
+/// descriptors do not land in a page's released range (512: a single one there keeps it from
+/// being given whole again).
+fn singles_region(cap: u32, title_mb: u64, setting: Option<&str>) -> u32 {
+    let want = match setting.and_then(|v| v.trim().parse::<u32>().ok()) {
+        Some(n) => n,
+        None => (title_mb.saturating_mul(16).min(u32::MAX as u64) as u32).saturating_add(SINGLES_VIEWS),
+    };
+    want.min(cap / 4).min(SINGLES_END - NULL_IMAGE_VIEWS)
+}
+
+/// A shared heap of `GLOBAL_MAX` is tried where the device reports a smaller most
+/// (`XCL_DESCRIPTOR_HEAP_LARGE=0`: only the size it reports).
+fn larger_heap() -> bool {
+    std::env::var("XCL_DESCRIPTOR_HEAP_LARGE").map_or(true, |v| v != "0")
+}
 
 /// view slots per page of a heap's place in the shared heap (2 PC descriptors each)
 pub const PAGE_SLOTS: u32 = 256;
 /// a page with no place in the shared heap yet
 const UNMAPPED: u32 = u32::MAX;
+/// a page with no place in the shared heap whose slots were looked up (`lookup`): one the
+/// lookup would have given a place before, counted by the usage line
+const READ: u32 = u32::MAX - 1;
+/// a page whose place in the shared heap another page took (`evict`) while its image slots
+/// named its descriptors there: it gets a place again when one of its slots is used
+const EVICTED: u32 = u32::MAX - 2;
+
+/// Whether a page's entry is its place in the shared heap.
+fn placed(first: u32) -> bool {
+    first < EVICTED
+}
+
+/// When the shared heap has no room for a page of a title's view heap, the page takes the place
+/// of the least recently used page of a shader-visible heap (`evict`;
+/// `XCL_DESCRIPTOR_EVICT=0`: it gets none and its slots name the null views, `unplaced`).
+fn evicting() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_DESCRIPTOR_EVICT").map_or(true, |v| v != "0"))
+}
+
+/// Frames a page must have been out of use before another takes its place
+/// (`XCL_DESCRIPTOR_EVICT_IDLE_FRAMES`). The GPU reads a page's descriptors when it runs a
+/// list that binds a table over it, some frames after the list was recorded: as many as the
+/// title lets the GPU fall behind. A title waits for a frame's lists before it records into
+/// their allocators again and keeps two to four frames of those; 30 is ten times that, a second
+/// at 30 Hz. No fence proves it: a list run later than that reads the views of the page that
+/// got the place.
+const EVICT_IDLE_FRAMES: u32 = 30;
+
+fn evict_idle() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("XCL_DESCRIPTOR_EVICT_IDLE_FRAMES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(EVICT_IDLE_FRAMES))
+}
+
+/// the frame + 1 from which lists' descriptor tables are followed (`table_bound`; 0: not yet):
+/// from when the ranges are three quarters given out, so that the pages lists bind are known
+/// as used before the first eviction – no page goes before they were followed for the frames a
+/// page must be out of use (`evict`)
+static TABLES_FOLLOWED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// pages that lost their place (`evict`), and evicted pages that got one again (`page_of`)
+static EVICTIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PLACED_AGAIN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether lists' descriptor tables are followed (`table_bound`).
+pub fn tables_followed() -> bool {
+    TABLES_FOLLOWED.load(std::sync::atomic::Ordering::Relaxed) != 0
+}
+
+/// A table of more pages than this is taken to reach its heap's end (`table_pages`).
+const WIDE_TABLE: u32 = 16;
+
+/// The pages of a heap of `n` slots that a descriptor table of `slots` slots at slot `k`
+/// reaches, and whether it is a wide one: a table of more than `WIDE_TABLE` pages – one with
+/// a range without end, mostly – is taken to reach the heap's end, which `table_bound` marks
+/// once a frame.
+fn table_pages(n: u32, k: u32, slots: u32) -> (std::ops::Range<u32>, bool) {
+    let first = k / PAGE_SLOTS;
+    let end = k.saturating_add(slots.max(1)).min(n).div_ceil(PAGE_SLOTS).max(first + 1);
+    let wide = end - first > WIDE_TABLE;
+    (first..if wide { n.div_ceil(PAGE_SLOTS).max(end) } else { end }, wide)
+}
+
+/// The page to take the place of: of `pages` – each (heap, page, its descriptors, the frame it
+/// was last used in) – the one longest out of use at frame `now` that has `need` descriptors
+/// and was not used in the last `idle` frames. None: there is no such page.
+fn victim(pages: impl Iterator<Item = (usize, usize, u32, u32)>, need: u32, now: u32, idle: u32) -> Option<(usize, usize)> {
+    pages
+        .filter(|&(_, _, count, used)| count >= need && now.wrapping_sub(used) >= idle)
+        .max_by_key(|&(_, _, _, used)| now.wrapping_sub(used))
+        .map(|(heap, page, _, _)| (heap, page))
+}
+
+/// What the image slots of an evicted page named: (slot in the page, the PC index it named less
+/// the page's first, a hash of the slot's other words).
+type Named = Vec<(u16, u16, u32)>;
+
+/// A hash of words 1.. of a slot (FNV-1a): whether the slot still holds the T# it held.
+fn rest_hash(w: &[u32; 8]) -> u32 {
+    w[1..].iter().fold(0x811C_9DC5u32, |h, &x| (h ^ x).wrapping_mul(0x0100_0193))
+}
+
+/// The page whose slots are `slots` loses its place at `first` (`count` descriptors): every
+/// image T# there that names one of those descriptors names the null views from now on (word 0
+/// = 0: a shader reads zeros, its writes go nowhere), not the views of the page that gets the
+/// place. What they named is returned, for `restore_words`.
+fn evict_words(slots: &mut [[u32; 8]], first: u32, count: u32) -> Named {
+    let mut named = Vec::new();
+    for (k, w) in slots.iter_mut().enumerate() {
+        if w[3] >> 28 >= 8 && w[0] >= first && w[0] - first < count {
+            named.push((k as u16, (w[0] - first) as u16, rest_hash(w)));
+            w[0] = 0;
+        }
+    }
+    named
+}
+
+/// The page has a place again, at `first`: its slots that `evict_words` made null name their
+/// descriptors there, as `copy_words` renumbers a copy for its destination. A slot written
+/// since (another T#, a buffer, zeros) stays as it is. Returns the slots renamed.
+fn restore_words(slots: &mut [[u32; 8]], named: &Named, first: u32) -> u32 {
+    let mut renamed = 0;
+    for &(k, at, hash) in named {
+        if let Some(w) = slots.get_mut(k as usize).filter(|w| w[0] == 0 && w[3] >> 28 >= 8 && rest_hash(w) == hash) {
+            w[0] = first + at as u32;
+            renamed += 1;
+        }
+    }
+    renamed
+}
+
+/// The place of page `p` of a heap (`pages`) for a lookup, which gives it none: a page without
+/// one is marked `READ`. None: no place, or the heap is not in the shared heap.
+fn seen_page(pages: &mut [u32], p: usize) -> Option<u32> {
+    let first = pages.get_mut(p)?;
+    if *first == UNMAPPED {
+        *first = READ;
+    }
+    placed(*first).then_some(*first)
+}
+
+/// A page of a title's view heap takes its descriptors of the shared heap when a view with PC
+/// descriptors is made in it or copied to it, not when one of its slots is only read (a draw
+/// reads the tables it binds) or gets a view shaders read from memory – a constant buffer view,
+/// a buffer view by address (`XCL_DESCRIPTOR_LAZY_PAGES=0`: on any use of a slot, as before).
+fn lazy_pages() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_DESCRIPTOR_LAZY_PAGES").map_or(true, |v| v != "0"))
+}
 
 /// PC descriptors of page `p` of a heap of `n` slots: 2 per slot, and the last page only as
 /// long as the heap (a heap of a few slots takes a few descriptors, not a whole page's).
@@ -237,9 +424,21 @@ pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
         } else {
             1_000_000
         };
-        let cap = max.min(GLOBAL_MAX);
-        let d = D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, NumDescriptors: cap, Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, NodeMask: 0 };
-        let heap: ID3D12DescriptorHeap = match dev.CreateDescriptorHeap(&d) {
+        let mut cap = max.min(GLOBAL_MAX);
+        let mut d = D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, NumDescriptors: GLOBAL_MAX, Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, NodeMask: 0 };
+        let mut larger: Option<ID3D12DescriptorHeap> = None;
+        if cap < GLOBAL_MAX && larger_heap() {
+            match dev.CreateDescriptorHeap(&d) {
+                Ok(h) => {
+                    crate::xlog_info!("console descriptor heaps: the device reports {max} view descriptors in a heap at most and made a shared heap of {GLOBAL_MAX} (XCL_DESCRIPTOR_HEAP_LARGE=0: one of {cap})");
+                    larger = Some(h);
+                    cap = GLOBAL_MAX;
+                }
+                Err(e) => crate::xlog_info!("console descriptor heaps: the device reports {max} view descriptors in a heap at most and refused a shared heap of {GLOBAL_MAX} ({e}): one of {cap}, as it reports"),
+            }
+        }
+        d.NumDescriptors = cap;
+        let heap: ID3D12DescriptorHeap = match larger.map_or_else(|| dev.CreateDescriptorHeap(&d), Ok) {
             Ok(h) => h,
             Err(e) => {
                 GLOBAL_FAILED.store(true, Relaxed);
@@ -248,6 +447,10 @@ pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
             }
         };
         crate::xlog_info!("console descriptor heaps: one shader-visible PC heap of {cap} view descriptors for all of them; its first {NULL_IMAGE_VIEWS} are null image views (an empty slot's)");
+        let singles = NULL_IMAGE_VIEWS + singles_region(cap, crate::state::config().title_memory_budget_mb(), std::env::var("XCL_DESCRIPTOR_SINGLES").ok().as_deref());
+        if singles > NULL_IMAGE_VIEWS {
+            crate::xlog_info!("console descriptor heaps: descriptors {NULL_IMAGE_VIEWS}..{singles} of the shared heap are kept for single views (the physical directory's roots, leaves, locators and page bindings); the title heaps' pages take {singles}..{cap} (XCL_DESCRIPTOR_SINGLES=0: one region for all, or the descriptors to keep)");
+        }
         null_views(dev, heap.GetCPUDescriptorHandleForHeapStart().ptr as u64, dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV));
         *g = Some(Global {
             dev: dev.clone(),
@@ -255,65 +458,313 @@ pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
             gpu: heap.GetGPUDescriptorHandleForHeapStart().ptr,
             inc: dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV),
             heap,
-            ranges: SharedRanges::new(cap),
+            cap,
+            singles: Region::new(NULL_IMAGE_VIEWS, singles),
+            ranges: Region::new(singles, cap),
+            held: [0; HOLDERS],
         });
     }
     true
 }
 
-/// The place in the shared heap of the page slot `k` of `h` is in – (index of the page's
-/// first SRV there, the page's first slot) – given now if the page has none yet. None: the
-/// heap is not in the shared heap, or that is full.
-fn page_of(h: &mut Heap, k: u32) -> Option<(u32, u32)> {
+/// `count` descriptors of the shared heap for `holder`: the index of the first. None: no shared
+/// heap, or no room left in it. `single`: one descriptor, from the single descriptors' region
+/// while that has room. `quiet`: no room is not logged (the caller makes room and asks again).
+fn reserve_global(count: u32, holder: Holder, single: bool, quiet: bool) -> Option<u32> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut g = GLOBAL.lock().unwrap();
+    let s = g.as_mut()?;
+    let cap = s.cap;
+    let mut r = if single { s.singles.take(count) } else { None };
+    if !single && (s.ranges.crowded() || s.ranges.end - s.ranges.next < count) && evicting() && !tables_followed() {
+        TABLES_FOLLOWED.store(super::present::presents() + 1, Relaxed);
+    }
+    if r.is_none() {
+        r = s.ranges.take(count);
+        if single && r.is_some() && s.singles.end > s.singles.first {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| crate::xlog_warn!("console descriptor heaps: the single descriptors' region ({}..{}) is full – single views go among the title heaps' pages (XCL_DESCRIPTOR_SINGLES: the descriptors to keep)", s.singles.first, s.singles.end));
+        }
+    }
+    let mut first_full = false;
+    match r {
+        Some(_) => s.held[holder as usize] += count,
+        None if quiet => return None,
+        None => {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            first_full = N.fetch_add(1, Relaxed) == 0;
+            if first_full {
+                crate::xlog_warn!("console descriptor heaps: the shared heap ({cap}) is full – shaders do not see the views of slots past it");
+            }
+        }
+    }
+    if r.is_none() || s.ranges.crowded() || s.singles.crowded() {
+        let now = crate::log::uptime() as u64 + 1;
+        if usage_owed(USAGE_AT.load(Relaxed), now, first_full) {
+            USAGE_AT.store(now, Relaxed);
+            USAGE_OWED.store(if r.is_none() { count + 1 } else { 1 }, Relaxed);
+        }
+    }
+    r
+}
+
+/// seconds between usage lines
+const USAGE_EVERY: u64 = 30;
+/// title view heaps named in a usage line
+const USAGE_HEAPS: usize = 8;
+/// uptime (s) + 1 when a usage line was last owed (0: never)
+static USAGE_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// a usage line is owed (0: none): 1, or the descriptors of the reservation that found no room + 1
+static USAGE_OWED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Whether a usage line is owed at `now` (uptime + 1), the last at `last` (0: none yet): the
+/// first time the heap is full, the first time it is asked, then every `USAGE_EVERY` seconds.
+/// Asked while a reservation finds no room or a region is more than three quarters given out.
+fn usage_owed(last: u64, now: u64, first_full: bool) -> bool {
+    first_full || last == 0 || now >= last + USAGE_EVERY
+}
+
+/// The usage line, when one is owed (`reserve_global`). `heaps`: the heaps of a caller that
+/// holds them; None: taken here, unless another call has them (the line then waits for the next).
+fn report_usage(heaps: Option<&[Heap]>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if USAGE_OWED.load(Relaxed) == 0 {
+        return;
+    }
+    let guard;
+    let heaps = match heaps {
+        Some(h) => h,
+        None => match HEAPS.try_lock() {
+            Ok(g) => {
+                guard = g;
+                &guard[..]
+            }
+            Err(_) => return,
+        },
+    };
+    let owed = USAGE_OWED.swap(0, Relaxed);
+    if owed == 0 {
+        return;
+    }
+    let views: Vec<(u32, u32, u32)> = heaps.iter().filter(|h| !h.pages.is_empty()).map(|h| (h.n, h.pages.iter().filter(|&&f| placed(f)).count() as u32, h.pages.iter().filter(|&&f| f == READ).count() as u32)).collect();
+    let evictions = (EVICTIONS.load(Relaxed), PLACED_AGAIN.load(Relaxed), heaps.iter().map(|h| h.evicted.len() as u64).sum());
+    let g = GLOBAL.lock().unwrap();
+    let Some(s) = g.as_ref() else { return };
+    let line = usage_line(s.cap, owed - 1, s.held, s.ranges.usage(), s.singles.usage(), views, evictions);
+    if owed > 1 {
+        crate::xlog_warn!("{line}");
+    } else {
+        crate::xlog_info!("{line}");
+    }
+}
+
+/// The usage line: the descriptors each `Holder` has, the title view heaps in the shared heap
+/// (`views`: each one's slots, its pages with a place there and its pages only looked up, which
+/// have none – `lookup`; the `USAGE_HEAPS` with the most pages are named) and the room left in
+/// both regions. `failed`: the descriptors a reservation found no room for (0: none failed).
+/// `evictions`: pages that lost their place to another so far (`evict`), evicted pages that got
+/// a place again, and the pages that are evicted now.
+fn usage_line(cap: u32, failed: u32, held: [u32; HOLDERS], ranges: RegionUsage, singles: RegionUsage, mut views: Vec<(u32, u32, u32)>, evictions: (u64, u64, u64)) -> String {
+    let region = |name: &str, (first, end, used, free, largest): RegionUsage| format!("{name} {first}..{end}: {used} held, {free} free ranges, largest {largest}");
+    views.sort_unstable_by_key(|&(n, mapped, _)| std::cmp::Reverse((mapped, n)));
+    let named: Vec<String> = views.iter().take(USAGE_HEAPS).map(|&(n, mapped, _)| format!("{n} slots {mapped}/{} pages", n.div_ceil(PAGE_SLOTS).max(1))).collect();
+    format!(
+        "console descriptor heaps: shared heap usage{}: {} of {cap} descriptors held: title heap pages {}, memory windows {}, directory roots {}, directory leaves {}, directory locators {}, page bindings {}; {} title view heaps of {} slots, {} of their pages only looked up (no place), most pages first: [{}]; {} pages evicted, {} placed again, {} evicted now; {}; {}",
+        if failed > 0 { format!(" (full: no room for {failed})") } else { String::new() },
+        ranges.2 + singles.2,
+        held[Holder::TitlePages as usize],
+        held[Holder::Windows as usize],
+        held[Holder::Roots as usize],
+        held[Holder::Leaves as usize],
+        held[Holder::Locators as usize],
+        held[Holder::Pages as usize],
+        views.len(),
+        views.iter().map(|&(n, _, _)| n as u64).sum::<u64>(),
+        views.iter().map(|&(_, _, seen)| seen as u64).sum::<u64>(),
+        named.join(", "),
+        evictions.0,
+        evictions.1,
+        evictions.2,
+        region("ranges", ranges),
+        region("singles", singles)
+    )
+}
+
+/// The place in the shared heap of the page slot `k` of heap `i` is in – (index of the page's
+/// first SRV there, the page's first slot) – given now if the page has none yet, where the
+/// shared heap is full the place of a page long out of use (`evict`; `now`: the frame). An
+/// evicted page gets its views and its slots' names back (`place_again`). None: the heap is
+/// not in the shared heap, or that is full and no page can go.
+fn page_of(heaps: &mut [Heap], i: usize, k: u32, now: u32) -> Option<(u32, u32)> {
     let p = (k / PAGE_SLOTS) as usize;
-    let mut first = *h.pages.get(p)?;
-    if first == UNMAPPED {
-        let mut g = GLOBAL.lock().unwrap();
-        first = g.as_mut()?.ranges.reserve(Owner::Title, page_descriptors(h.n, p as u32))?;
+    let mut first = *heaps[i].pages.get(p)?;
+    if !placed(first) {
+        let need = page_descriptors(heaps[i].n, p as u32);
+        let quiet = evicting();
+        first = match reserve_global(need, Holder::TitlePages, false, quiet) {
+            Some(first) => first,
+            None if quiet => {
+                evict(heaps, need, now);
+                reserve_global(need, Holder::TitlePages, false, false)?
+            }
+            None => return None,
+        };
+        let h = &mut heaps[i];
         h.pages[p] = first;
+        if let Some(named) = h.evicted.remove(&(p as u32)) {
+            unsafe { place_again(h, p, first, &named) };
+        }
     }
     Some((first, p as u32 * PAGE_SLOTS))
 }
 
-/// A shared range from `reserve_own` is free again.
-pub fn release_global(first: u32, count: u32) {
-    release_range(Owner::Other, first, count);
+/// The title's memory of the slots of page `p` of `h` (None: not all of it is readable).
+unsafe fn page_words(h: &Heap, p: usize) -> Option<&'static mut [[u32; 8]]> {
+    let (at, slots) = (h.shadow + p * (PAGE_SLOTS * SLOT) as usize, (page_descriptors(h.n, p as u32) / 2) as usize);
+    (at % 4 == 0 && crate::gpu::shader::readable(at, slots * SLOT as usize)).then(|| std::slice::from_raw_parts_mut(at as *mut [u32; 8], slots))
 }
 
-pub(super) fn release_range(owner: Owner, first: u32, count: u32) {
-    if let Some(s) = GLOBAL.lock().unwrap().as_mut() {
-        s.ranges.release(owner, first, count);
+/// Room in the full shared heap for `need` descriptors: the page of a shader-visible heap
+/// longest out of use (`victim`) loses its place. Its image slots name the null views until
+/// it has a place again (`evict_words`), which it gets when one of its slots is used (`slot`,
+/// `lookup`, `table_bound`). Only shader-visible heaps: a CPU-only heap is where a title
+/// makes its views and copies them from, as memory too, so the descriptors of its pages are
+/// named from slots XCL does not see used. What is not known here: a T# copied as memory out
+/// of the page before, which names the place another page has now. False: no page can go.
+fn evict(heaps: &mut [Heap], need: u32, now: u32) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    /// (frame << 32 | descriptors): no page of that many descriptors could go in that frame,
+    /// so none can later in it – pages only come into use in a frame
+    static NO_VICTIM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+    let refused = NO_VICTIM.load(Relaxed);
+    if (refused >> 32) as u32 == now && need >= refused as u32 && evict_idle() != 0 {
+        return false;
     }
+    let followed = TABLES_FOLLOWED.load(Relaxed);
+    if followed == 0 || now.wrapping_sub((followed - 1) as u32) < evict_idle() {
+        return false;
+    }
+    let pages = heaps.iter().enumerate().filter(|(_, h)| h.visible).flat_map(|(i, h)| {
+        h.pages.iter().zip(&h.used).enumerate().filter(|(_, (&f, _))| placed(f)).map(move |(p, (_, &used))| (i, p, page_descriptors(h.n, p as u32), used))
+    });
+    let Some((i, p)) = victim(pages, need, now, evict_idle()) else {
+        NO_VICTIM.store((now as u64) << 32 | need as u64, Relaxed);
+        return false;
+    };
+    let h = &mut heaps[i];
+    let (first, count) = (h.pages[p], page_descriptors(h.n, p as u32));
+    let named = unsafe { page_words(h, p) }.map_or_else(Vec::new, |slots| evict_words(slots, first, count));
+    h.pages[p] = if named.is_empty() { UNMAPPED } else { EVICTED };
+    if !named.is_empty() {
+        h.evicted.insert(p as u32, named);
+    }
+    if let Some(res) = RES.lock().unwrap().as_mut() {
+        for index in first..first + count {
+            res.by_shared_index.remove(&index);
+        }
+    }
+    if material_gate_views::enabled() {
+        material_gate_views::forget_heap(0..0, std::iter::once((first, count)));
+    }
+    if super::depth_lineage::enabled() {
+        if let Some(uavs) = LINEAGE_UAVS.lock().unwrap().as_mut() {
+            for index in first..first + count {
+                uavs.by_index.remove(&index);
+            }
+        }
+    }
+    release_held(first, count, Holder::TitlePages);
+    if EVICTIONS.fetch_add(1, Relaxed) == 0 {
+        crate::xlog_warn!("console descriptor heaps: the shared heap has no room for a view heap's page: it takes the place of the shader-visible heap page longest out of use ({} frames or more: XCL_DESCRIPTOR_EVICT_IDLE_FRAMES), whose image slots name the null views until one of its slots is used again (XCL_DESCRIPTOR_EVICT=0: the new page gets no place)", evict_idle());
+    }
+    true
+}
+
+/// Page `p` of `h`, evicted, has a place again at `first`: its PC descriptors come back from
+/// the heap's own PC heap, where every view of it was made or copied, and its slots name them
+/// (`restore_words`: `named`, from the eviction).
+unsafe fn place_again(h: &Heap, p: usize, first: u32, named: &Named) {
+    if let Some(g) = GLOBAL.lock().unwrap().as_ref() {
+        let own = h.pc_cpu + (2 * p as u32 * PAGE_SLOTS * h.inc) as u64;
+        g.dev.CopyDescriptorsSimple(page_descriptors(h.n, p as u32), D3D12_CPU_DESCRIPTOR_HANDLE { ptr: (g.cpu + first as u64 * g.inc as u64) as usize }, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: own as usize }, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    }
+    if let Some(slots) = page_words(h, p) {
+        restore_words(slots, named, first);
+    }
+    PLACED_AGAIN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A list binds the descriptor table at console address `addr32` (once the ranges are nearly
+/// given out: `TABLES_FOLLOWED`), `slots` slots by its root signature
+/// (`console_list::Layout::tables`): the pages it reaches (`table_pages`) are in use this
+/// frame – the shaders of the list read their slots from memory, where XCL does not see it –
+/// and those that were evicted get a place again, while there is room.
+pub fn table_bound(addr32: u32, slots: u32) {
+    if !tables_followed() {
+        return;
+    }
+    let Some(u) = crate::gpu::uma::get() else { return };
+    let cpu = u.base() + addr32 as usize;
+    let mut heaps = HEAPS.lock().unwrap();
+    let Some(i) = heaps.iter().position(|h| !h.pages.is_empty() && cpu >= h.shadow && cpu < h.shadow + (h.n * SLOT) as usize) else { return };
+    let h = &mut heaps[i];
+    let now = super::present::presents() as u32;
+    let (pages, wide) = table_pages(h.n, ((cpu - h.shadow) / SLOT as usize) as u32, slots);
+    if wide {
+        if h.tail.is_some_and(|(frame, first)| frame == now && first <= pages.start) {
+            return;
+        }
+        h.tail = Some((now, pages.start));
+    }
+    let mut room = true;
+    for p in pages {
+        let Some(used) = heaps[i].used.get_mut(p as usize) else { break };
+        *used = now;
+        if room && heaps[i].pages[p as usize] == EVICTED {
+            room = page_of(&mut heaps, i, p * PAGE_SLOTS, now).is_some();
+        }
+    }
+    report_usage(Some(&heaps));
+}
+
+/// The shared range starting at `first` (`count` descriptors) that `holder` had is free again.
+pub fn release_held(first: u32, count: u32, holder: Holder) {
+    if let Some(s) = GLOBAL.lock().unwrap().as_mut() {
+        if first < s.singles.end {
+            s.singles.give(first, count);
+        } else {
+            s.ranges.give(first, count);
+        }
+        s.held[holder as usize] = s.held[holder as usize].saturating_sub(count);
+    }
+}
+
+/// The shared range starting at `first` (`count` descriptors, from `reserve_own`) is free again.
+pub fn release_global(first: u32, count: u32) {
+    release_held(first, count, Holder::Windows);
 }
 
 /// `count` descriptors of the shared heap for XCL's own views, kept for the process lifetime:
 /// the index of the first and its CPU handle (the next ones `inc` apart). None: no shared heap,
 /// or no room left in it.
 pub fn reserve_own(count: u32) -> Option<(u32, D3D12_CPU_DESCRIPTOR_HANDLE, u32)> {
-    reserve_own_as(Owner::Other, count)
+    reserve_for(count, Holder::Windows, false)
 }
 
-pub(super) fn reserve_own_as(owner: Owner, count: u32) -> Option<(u32, D3D12_CPU_DESCRIPTOR_HANDLE, u32)> {
-    let mut g = GLOBAL.lock().unwrap();
-    let s = g.as_mut()?;
-    let first = s.ranges.reserve(owner, count)?;
+/// One descriptor of the shared heap for `holder` (given back with `release_held`), from the
+/// single descriptors' region: its index and its CPU handle. None: no shared heap, or no room
+/// left in it.
+pub fn reserve_single(holder: Holder) -> Option<(u32, D3D12_CPU_DESCRIPTOR_HANDLE)> {
+    reserve_for(1, holder, true).map(|(first, cpu, _)| (first, cpu))
+}
+
+fn reserve_for(count: u32, holder: Holder, single: bool) -> Option<(u32, D3D12_CPU_DESCRIPTOR_HANDLE, u32)> {
+    let first = reserve_global(count, holder, single, false);
+    report_usage(None);
+    let first = first?;
+    let g = GLOBAL.lock().unwrap();
+    let s = g.as_ref()?;
     Some((first, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: (s.cpu + first as u64 * s.inc as u64) as usize }, s.inc))
-}
-
-/// Sample the allocator state without reading the console slots that the title can write.
-pub(crate) fn log_occupancy() {
-    let (cap, high, largest, live, refused) = {
-        let g = GLOBAL.lock().unwrap();
-        let Some(g) = g.as_ref() else { return };
-        let r = &g.ranges;
-        let largest = r.free.iter().map(|&(_, count)| count).max().unwrap_or(0).max(r.cap - r.next);
-        (r.cap, r.next, largest, r.live, r.refused)
-    };
-    let [title, pages, tables, locators, other] = live;
-    let total = live.iter().sum::<u32>() + NULL_IMAGE_VIEWS;
-    crate::xlog_info!(
-        "console descriptor heaps: {total} of {cap} live, high water {high}, largest free range {largest}; title {title}, directory pages {pages}, directory tables {tables}, locators {locators}, other {other}; reservations refused by owner (same order) {refused:?}"
-    );
 }
 
 /// The shader-visible PC heap lists bind for view descriptors (None: none shared).
@@ -387,7 +838,8 @@ pub fn register(obj: usize, n: u32, pc_cpu: u64, pc_gpu: u64, inc: u32, sampler:
     let pages = if shared && !sampler && GLOBAL.lock().unwrap().is_some() { vec![UNMAPPED; n.div_ceil(PAGE_SLOTS).max(1) as usize] } else { Vec::new() };
     static STAMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let stamp = if vsharp::enabled() { STAMP.fetch_add(1,std::sync::atomic::Ordering::Relaxed)+1 } else {0};
-    HEAPS.lock().unwrap().push(Heap { stamp, obj, shadow: p as usize, n, pc_cpu, pc_gpu, inc, sampler, pages, visible, memory });
+    let used = vec![0; pages.len()];
+    HEAPS.lock().unwrap().push(Heap { stamp, obj, shadow: p as usize, n, pc_cpu, pc_gpu, inc, sampler, pages, used, evicted: Default::default(), tail: None, visible, memory });
     if !sampler && n != 0 && super::depth_lineage::enabled() {
         LINEAGE_UAVS.lock().unwrap().get_or_insert_with(Default::default)
             .heaps.insert(p as usize, p as usize + n as usize * SLOT as usize);
@@ -403,7 +855,7 @@ pub fn unregister(obj: usize) {
         if let Some(h)=gone.as_ref().filter(|h|!h.sampler) { vsharp::forget(h.shadow..h.shadow+h.n as usize*SLOT as usize); }
         if let Some(h) = gone.as_ref().filter(|h| !h.sampler && material_gate_views::enabled()) {
             material_gate_views::forget_heap(h.shadow..h.shadow + h.n as usize * SLOT as usize,
-                h.pages.iter().enumerate().filter(|&(_, &f)| f != UNMAPPED).map(|(p, &f)| (f, page_descriptors(h.n, p as u32))));
+                h.pages.iter().enumerate().filter(|&(_, &f)| placed(f)).map(|(p, &f)| (f, page_descriptors(h.n, p as u32))));
         }
         gone
     };
@@ -418,8 +870,8 @@ pub fn unregister(obj: usize) {
         if let Some(res) = RES.lock().unwrap().as_mut() {
             res.forget(h.shadow..h.shadow + h.n as usize * h.slot_bytes() as usize);
         }
-        for (p, &f) in h.pages.iter().enumerate().filter(|&(_, &f)| f != UNMAPPED) {
-            release_range(Owner::Title, f, page_descriptors(h.n, p as u32));
+        for (p, &f) in h.pages.iter().enumerate().filter(|&(_, &f)| placed(f)) {
+            release_held(f, page_descriptors(h.n, p as u32), Holder::TitlePages);
         }
         match h.memory {
             Memory::Sparse => {
@@ -459,23 +911,94 @@ pub struct Slot {
 }
 
 /// The slot behind a console CPU handle (None: not one of XCL's console heaps). A view slot
-/// of a heap in the shared heap gets its page's place there now if the page has none yet.
+/// of a heap in the shared heap gets its page's place there now if the page has none yet: for
+/// a view with PC descriptors (an image, a view of a resource), which is made or cleared there.
 pub fn slot(cpu: u64) -> Option<Slot> {
     let mut heaps = HEAPS.lock().unwrap();
-    let h = heaps.iter_mut().find(|h| cpu >= h.shadow as u64 && cpu < (h.shadow + (h.n * h.slot_bytes()) as usize) as u64)?;
+    let s = slot_in(&mut heaps, cpu, true);
+    report_usage(Some(&heaps));
+    s
+}
+
+/// The slot behind a console CPU handle for a caller that needs none of its PC descriptors: a
+/// reader of its words, or the writer of a view shaders read from memory (a buffer V#). As
+/// `slot`, but a page with no place in the shared heap gets none (`lazy_pages`) and its slot
+/// then names the null views, with no place of its own (`shared_srv` 0).
+pub fn lookup(cpu: u64) -> Option<Slot> {
+    let mut heaps = HEAPS.lock().unwrap();
+    let s = slot_in(&mut heaps, cpu, !lazy_pages());
+    report_usage(Some(&heaps));
+    s
+}
+
+/// Whether a copy of view slot `s` has PC descriptors to carry: views were made in its page (it
+/// has a place in the shared heap), or it holds an image T#, whose copy names its destination's
+/// own PC descriptors (`copy_words`).
+pub fn has_pc_views(s: &Slot) -> bool {
+    s.shared_srv != 0 || unsafe { (s.at as *const u32).add(3).read_unaligned() } >> 28 >= 8
+}
+
+fn slot_in(heaps: &mut [Heap], cpu: u64, place: bool) -> Option<Slot> {
+    let i = heaps.iter().position(|h| cpu >= h.shadow as u64 && cpu < (h.shadow + (h.n * h.slot_bytes()) as usize) as u64)?;
+    let h = &mut heaps[i];
     let k = ((cpu - h.shadow as u64) / h.slot_bytes() as u64) as u32;
     if h.sampler {
         return Some(Slot { at: h.shadow + (k * SAMPLER_SLOT) as usize, index: k, pc_srv: h.pc_cpu + (k * h.inc) as u64, pc_uav: 0, pc_gpu_uav: 0, sampler: true, shared_srv: 0, k });
     }
     let uav = ((2 * k + 1) * h.inc) as u64;
-    let shared = page_of(h, k).and_then(|(first, k0)| {
+    let p = (k / PAGE_SLOTS) as usize;
+    let now = super::present::presents() as u32;
+    if let Some(used) = h.used.get_mut(p) {
+        *used = now;
+    }
+    let page = if place || h.pages.get(p) == Some(&EVICTED) {
+        page_of(heaps, i, k, now)
+    } else {
+        let marked = h.pages.get(p) == Some(&UNMAPPED);
+        let first = seen_page(&mut h.pages, p);
+        if marked {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| crate::xlog_info!("console descriptor heaps: a view heap's page takes its descriptors of the shared heap when a view with PC descriptors is made in it or copied to it, not when a slot of it is only read or gets a constant buffer view or a buffer view by address (XCL_DESCRIPTOR_LAZY_PAGES=0: on any use, as before)"));
+        }
+        first.map(|first| (first, p as u32 * PAGE_SLOTS))
+    };
+    let h = &heaps[i];
+    let shared = page.and_then(|(first, k0)| {
         let g = GLOBAL.lock().unwrap();
         let g = g.as_ref()?;
         let i = first + 2 * (k - k0);
         Some((i, g.gpu + (i as u64 + 1) * g.inc as u64, g.cpu + i as u64 * g.inc as u64))
     });
-    let (index, pc_gpu_uav, shared_srv) = shared.unwrap_or((2 * k, if h.pc_gpu == 0 { 0 } else { h.pc_gpu + uav }, 0));
+    let hosted = !h.pages.is_empty();
+    let (index, pc_gpu_uav, shared_srv) = match shared {
+        Some(place) => place,
+        None if hosted && !place => (0, 0, 0),
+        None => unplaced(k, hosted && null_when_full(), if h.pc_gpu == 0 { 0 } else { h.pc_gpu + uav }),
+    };
     Some(Slot { at: h.shadow + (k * SLOT) as usize, index, pc_srv: h.pc_cpu + (2 * k * h.inc) as u64, pc_uav: h.pc_cpu + uav, pc_gpu_uav, sampler: false, shared_srv, k })
+}
+
+/// A view slot of a heap in the shared heap whose page found no room there names the null views
+/// (`XCL_DESCRIPTOR_NULL_ON_FULL=0`: PC index 2k, as before).
+fn null_when_full() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_DESCRIPTOR_NULL_ON_FULL").map_or(true, |v| v != "0"))
+}
+
+/// (PC index, PC GPU handle of the UAV, CPU handle in the shared heap) of view slot `k` whose
+/// page has no place in the shared heap. `hosted`: its heap is in the shared heap, which had no
+/// room – the slot names the null views at descriptors 0 / 1 (`null_views`), so a shader reads
+/// zeros there and its writes go nowhere. 2k, the slot's place in a heap's own PC heap
+/// (`own_uav`: the GPU handle of its UAV there, 0: none), is in the shared heap another heap's
+/// views or the memory windows' raw views – read as a texture, those hang NVIDIA GPUs – and
+/// lists do not bind a hosted heap's own PC heap.
+fn unplaced(k: u32, hosted: bool, own_uav: u64) -> (u32, u64, u64) {
+    if !hosted {
+        return (2 * k, own_uav, 0);
+    }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| crate::xlog_warn!("console descriptor heaps: a view slot whose page found no room in the shared heap names the null views (descriptors 0 / 1): shaders read zeros there, not another heap's views (XCL_DESCRIPTOR_NULL_ON_FULL=0: PC index 2k, as before)"));
+    (0, 0, 0)
 }
 
 /// The view just made in slot `s` (its SRV, or with `uav` its UAV) goes to the shared heap.
@@ -490,12 +1013,12 @@ pub unsafe fn publish(s: &Slot, uav: bool) {
 }
 
 /// `n` view slots from `first` were copied (in the title's heap): they go to the shared heap,
-/// a run per page (a heap's pages lie apart there).
+/// a run per page (a heap's pages lie apart there), where their page has a place – one the
+/// copy gave no place holds no view with PC descriptors (`has_pc_views`).
 pub unsafe fn publish_range(first: &Slot, n: u32) {
     let mut done = 0;
     while done < n {
-        let s = if done == 0 { Some(*first) } else { slot((first.at + (done * SLOT) as usize) as u64) };
-        let Some(s) = s else { return };
+        let Some(s) = lookup((first.at + (done * SLOT) as usize) as u64) else { return };
         let run = (PAGE_SLOTS - s.k % PAGE_SLOTS).min(n - done);
         if s.shared_srv != 0 {
             if let Some(g) = GLOBAL.lock().unwrap().as_ref() {
@@ -553,9 +1076,23 @@ impl ViewOwners {
 
 static RES: Mutex<Option<ViewOwners>> = Mutex::new(None);
 
+/// What each view slot names is kept (`note_resource`): for the traces and markers, for the
+/// FSR4 stand-in, which tells its input and outputs by it (`bind::compute_images`), and for the
+/// stand-in for the indirect light (`title_gta6_ambient`), which checks the resources behind the
+/// views it writes through before it records anything.
+fn owners_kept() -> bool {
+    super::present::trace_frame() || super::markers::enabled() || super::present::writer_trace_configured() || super::fsr4_standin::wants_views() || super::title_gta6_ambient::wanted()
+}
+
+/// The unordered-access view of each slot is kept (`note_native_uav`): for the native-view
+/// traces, and for the FSR4 stand-in (what a pass may write).
+pub(super) fn native_uavs_kept() -> bool {
+    super::present::native_view_trace_configured() || super::fsr4_standin::wants_views()
+}
+
 /// The view in slot `s` names `res` (0: none).
 pub fn note_resource(s: &Slot, res: usize) {
-    if s.sampler || !(super::present::trace_frame() || super::markers::enabled() || super::present::writer_trace_configured()) {
+    if s.sampler || !owners_kept() {
         return;
     }
     RES.lock().unwrap().get_or_insert_with(Default::default).note(s, res);
@@ -601,6 +1138,12 @@ pub(super) fn note_native_uav(s: &Slot, resource: Option<NativeUav>) {
     } else {
         owners.native_uavs.remove(&s.at);
     }
+}
+
+/// The GPU handle of descriptor `index` of the shared view heap; None: there is no shared heap, or
+/// it is not that large.
+pub(super) fn shared_gpu(index: u32) -> Option<u64> {
+    GLOBAL.lock().unwrap().as_ref().filter(|g| index < g.cap).map(|g| g.gpu + index as u64 * g.inc as u64)
 }
 
 pub(super) fn native_uav_at(addr32: u32, index: u32) -> Option<usize> {
@@ -746,11 +1289,13 @@ pub fn copy_words(src: &Slot, dst: &Slot) {
     write_observed(dst, &w[..n], lineage, native,Writer::Copy(src.at));
     if !src.sampler {
         note_resource(dst, resource_at(src.at).unwrap_or(0));
-        if super::present::native_view_trace_configured() {
+        if native_uavs_kept() {
             let (srv, uav) = RES.lock().unwrap().as_ref().map_or((None, None), |owners| {
                 (owners.native_srvs.get(&src.at).copied(), owners.native_uavs.get(&src.at).copied())
             });
-            note_native_srv(dst, srv);
+            if super::present::native_view_trace_configured() {
+                note_native_srv(dst, srv);
+            }
             note_native_uav(dst, uav);
         }
     }
@@ -789,7 +1334,7 @@ pub fn census() {
         let (mut empty, mut own, mut other, mut buffers) = (0u32, 0u32, 0u32, 0u32);
         let mut examples: Vec<(u32, u32)> = Vec::new();
         let own_index = |k: u32| match h.pages.get((k / PAGE_SLOTS) as usize) {
-            Some(&f) if f != UNMAPPED => f + 2 * (k % PAGE_SLOTS),
+            Some(&f) if placed(f) => f + 2 * (k % PAGE_SLOTS),
             _ => 2 * k,
         };
         for k in 0..h.n {
@@ -822,7 +1367,7 @@ pub fn census() {
 /// is in one of the console heaps.
 pub fn words_at(addr32: u32) -> Option<[u32; 8]> {
     let u = crate::gpu::uma::get()?;
-    let s = slot((u.base() + addr32 as usize) as u64)?;
+    let s = lookup((u.base() + addr32 as usize) as u64)?;
     let mut w = [0u32; 8];
     unsafe { std::ptr::copy_nonoverlapping(s.at as *const u32, w.as_mut_ptr(), if s.sampler { 4 } else { 8 }) };
     Some(w)
@@ -1015,25 +1560,155 @@ mod tests {
         assert!(free.is_empty());
     }
 
+    /// The single descriptors' region: one for each 64 KiB page of the title's memory and the
+    /// directory's views, a quarter of the heap at most, below what a page table entry can name.
     #[test]
-    fn shared_ranges_count_live_and_refused_descriptors_by_owner() {
-        let start = NULL_IMAGE_VIEWS;
-        let mut ranges = SharedRanges::new(start + 6);
-        let title = ranges.reserve(Owner::Title, 4).unwrap();
-        let page = ranges.reserve(Owner::DirectoryPage, 1).unwrap();
-        assert_eq!((title, page), (start, start + 4));
-        assert_eq!(ranges.reserve(Owner::DirectoryTable, 2), None);
-        assert_eq!(ranges.live, [4, 1, 0, 0, 0]);
-        assert_eq!(ranges.refused, [0, 0, 1, 0, 0]);
+    fn singles_region_is_sized_for_the_titles_pages() {
+        assert_eq!(singles_region(1_000_000, 8_192, None), 131_072 + SINGLES_VIEWS, "Series S");
+        assert_eq!(singles_region(1_000_000, 13_824, None), 221_184 + SINGLES_VIEWS, "Series X");
+        assert_eq!(singles_region(1_000_000, 13_824, Some("0")), 0, "off");
+        assert_eq!(singles_region(1_000_000, 13_824, Some(" 5000 ")), 5000);
+        assert_eq!(singles_region(1_000_000, 13_824, Some("on")), 221_184 + SINGLES_VIEWS, "not a number: the default");
+        assert_eq!(singles_region(1000, 8_192, None), 250, "a quarter of a small heap");
+        assert_eq!(singles_region(GLOBAL_MAX, u64::MAX, None), GLOBAL_MAX / 4);
+        assert!(NULL_IMAGE_VIEWS + singles_region(u32::MAX, u64::MAX, Some("4294967295")) <= SINGLES_END);
+    }
 
-        ranges.release(Owner::Title, title, 4);
-        assert_eq!(ranges.reserve(Owner::Locator, 3), Some(title));
-        assert_eq!(ranges.live, [0, 1, 0, 3, 0]);
-        ranges.release(Owner::Locator, title, 3);
-        ranges.release(Owner::DirectoryPage, page, 1);
-        assert_eq!(ranges.live, [0; OWNER_COUNT]);
-        assert_eq!(ranges.next, start);
-        assert!(ranges.free.is_empty());
+    /// Title heap pages and single descriptors each keep to their region: pages that fill theirs
+    /// leave the singles their room, and a single given back leaves a page's range whole.
+    #[test]
+    fn single_descriptors_keep_their_region() {
+        let mut singles = Region::new(NULL_IMAGE_VIEWS, 104);
+        let mut ranges = Region::new(104, 104 + 3 * 512);
+        assert_eq!(singles.usage(), (4, 104, 0, 1, 100));
+        let pages: Vec<u32> = (0..3).map(|_| ranges.take(512).unwrap()).collect();
+        assert_eq!(pages, [104, 616, 1128]);
+        assert_eq!(ranges.take(512), None, "the ranges are full");
+        assert!(ranges.crowded() && !singles.crowded());
+        assert_eq!(ranges.usage(), (104, 1640, 1536, 0, 0));
+        let views: Vec<u32> = (0..76).map(|_| singles.take(1).unwrap()).collect();
+        assert_eq!((views[0], views[75]), (NULL_IMAGE_VIEWS, 79), "after the null views, below the pages");
+        assert!(singles.crowded(), "76 of 100");
+        singles.give(views[10], 1);
+        singles.give(views[11], 1);
+        singles.give(views[40], 1);
+        assert_eq!(singles.usage(), (4, 104, 73, 3, 24));
+        assert!(!singles.crowded());
+        assert_eq!(singles.take(1), Some(views[10]));
+        ranges.give(pages[1], 512);
+        assert_eq!(ranges.usage(), (104, 1640, 1024, 1, 512));
+        assert_eq!(ranges.take(512), Some(pages[1]), "a page's range comes back whole");
+        let (mut none, mut all) = (Region::new(NULL_IMAGE_VIEWS, NULL_IMAGE_VIEWS), Region::new(NULL_IMAGE_VIEWS, 100));
+        assert_eq!((none.take(1), none.crowded(), none.usage()), (None, false, (4, 4, 0, 0, 0)), "no region: nothing to take there");
+        assert_eq!(all.take(1), Some(NULL_IMAGE_VIEWS), "the singles then come from the ranges, as before");
+    }
+
+    /// A slot of a heap in the shared heap that found no room there names the null SRV / UAV
+    /// pair – what a T# of zeros finds – and has no UAV to clear through; a heap with its own PC
+    /// heap keeps 2k and its own UAV.
+    #[test]
+    fn a_slot_past_a_full_shared_heap_names_the_null_views() {
+        assert_eq!(unplaced(7, true, 0x5000), (0, 0, 0));
+        assert!(NULL_IMAGE_VIEWS >= 2, "descriptors 0 / 1 are the null pair");
+        assert_eq!(unplaced(7, false, 0x5000), (14, 0x5000, 0));
+        assert_eq!(unplaced(7, false, 0), (14, 0, 0));
+    }
+
+    /// A lookup gives a page no place: it marks the page, once, and finds the place a view
+    /// made there took before or takes after.
+    #[test]
+    fn a_page_only_looked_up_takes_no_place() {
+        let mut pages = vec![UNMAPPED, 616, UNMAPPED];
+        assert_eq!(seen_page(&mut pages, 0), None);
+        assert_eq!(seen_page(&mut pages, 0), None);
+        assert_eq!(seen_page(&mut pages, 1), Some(616));
+        assert_eq!(seen_page(&mut pages, 3), None, "past the heap");
+        assert_eq!(pages, [READ, 616, UNMAPPED]);
+        assert!(!placed(READ) && !placed(UNMAPPED) && placed(616) && placed(0));
+        assert_eq!(pages.iter().filter(|&&f| placed(f)).count(), 1, "one page's descriptors held");
+        pages[0] = 104;
+        assert_eq!(seen_page(&mut pages, 0), Some(104), "a view was made there since");
+        assert!(seen_page(&mut [], 0).is_none(), "a heap outside the shared heap");
+    }
+
+    /// The page that goes: the one longest out of use that is large enough and was not used in
+    /// the last frames, whatever the frame counter's wrap.
+    #[test]
+    fn the_page_longest_out_of_use_goes() {
+        let pages = [(0, 0, 512, 100), (0, 1, 512, 40), (1, 0, 8, 10), (1, 3, 512, 990), (2, 7, 512, 960)];
+        assert_eq!(victim(pages.into_iter(), 512, 1000, 30), Some((0, 1)), "the 8 descriptors of the oldest are too few");
+        assert_eq!(victim(pages.into_iter(), 8, 1000, 30), Some((1, 0)), "a short page takes a short page's place");
+        assert_eq!(victim(pages.into_iter(), 512, 1000, 961), None, "none out of use that long");
+        assert_eq!(victim(pages.into_iter(), 512, 1000, 960), Some((0, 1)));
+        assert_eq!(victim(pages[3..].iter().copied(), 512, 1000, 30), Some((2, 7)), "used 10 frames ago: stays");
+        assert_eq!(victim(pages[3..4].iter().copied(), 512, 1000, 30), None);
+        assert_eq!(victim(pages[3..4].iter().copied(), 512, 1000, 10), Some((1, 3)));
+        assert_eq!(victim([(0, 0, 512, u32::MAX - 5), (0, 1, 512, 3)].into_iter(), 512, 40, 30), Some((0, 0)), "46 frames ago, across the wrap");
+        assert_eq!(victim(std::iter::empty(), 512, 1000, 30), None);
+    }
+
+    /// The pages a table reaches: from its first slot's to its last's, to the heap's end at
+    /// most – and to the heap's end when it is a wide one.
+    #[test]
+    fn a_table_reaches_the_pages_of_its_slots() {
+        assert_eq!(table_pages(1_245_184, 0, 1), (0..1, false));
+        assert_eq!(table_pages(1_245_184, 255, 1), (0..1, false));
+        assert_eq!(table_pages(1_245_184, 255, 2), (0..2, false));
+        assert_eq!(table_pages(1_245_184, 1000, 64), (3..5, false), "slots 1000..1064: pages 3 and 4");
+        assert_eq!(table_pages(1_245_184, 1024, 256), (4..5, false));
+        assert_eq!(table_pages(1_245_184, 1024, 0), (4..5, false), "a table of no range: its first slot");
+        assert_eq!(table_pages(1_245_184, 512, 16 * 256), (2..18, false));
+        assert_eq!(table_pages(1_245_184, 512, 16 * 256 + 1), (2..4864, true), "more than 16 pages: to the heap's end");
+        assert_eq!(table_pages(1_245_184, 512, u32::MAX), (2..4864, true), "a range without end");
+        assert_eq!(table_pages(3128, 3000, u32::MAX), (11..13, false), "the heap ends in page 12");
+        assert_eq!(table_pages(3128, 3127, 500), (12..13, false));
+        assert_eq!(table_pages(4, 3, 9), (0..1, false));
+    }
+
+    /// An evicted page's image slots name the null views, and their own descriptors again where
+    /// the page gets a place – but not a slot the title wrote meanwhile, and never a T# that
+    /// names another page, a buffer or an empty slot.
+    #[test]
+    fn an_evicted_pages_slots_name_null_views_until_it_has_a_place_again() {
+        let image = |index: u32, format: u32| [index, format, 0, 9 << 28, 0, 0, 0, 0];
+        let buffer = [0x1234, 0, 64, 0x3101_6FAC, 0, 0, 0, 0];
+        let mut slots = [image(616, 0x0470_0000), image(618, 0x0470_0000), image(616 + 2 * 7, 0x0480_0000), image(104, 0x0470_0000), buffer, [0; 8], image(616 + 10, 0x0490_0000), image(1128, 0x0470_0000)];
+        let before = slots;
+        let named = evict_words(&mut slots, 616, 512);
+        assert_eq!(named.iter().map(|&(k, at, _)| (k, at)).collect::<Vec<_>>(), [(0, 0), (1, 2), (2, 14), (6, 10)]);
+        for k in [0, 1, 2, 6] {
+            assert_eq!((slots[k][0], &slots[k][1..]), (0, &before[k][1..]), "slot {k} names the null views and is the same view otherwise");
+        }
+        for k in [3, 4, 5, 7] {
+            assert_eq!(slots[k], before[k], "slot {k}: another page's image (104, 1128), a buffer, an empty slot");
+        }
+        slots[1] = image(0, 0x0499_0000);
+        slots[6] = buffer;
+        assert_eq!(restore_words(&mut slots, &named, 2152), 2);
+        assert_eq!((slots[0], slots[2]), (image(2152, 0x0470_0000), image(2152 + 14, 0x0480_0000)), "slot 2 names slot 7's views, as it did");
+        assert_eq!((slots[1], slots[6]), (image(0, 0x0499_0000), buffer), "written since: as the title left them");
+        assert_eq!(restore_words(&mut slots, &named, 4000), 0, "already named");
+        assert!(evict_words(&mut [buffer, [0; 8], image(104, 1)], 616, 512).is_empty(), "nothing named: the page is as one never placed");
+        assert!(!placed(EVICTED) && placed(EVICTED - 1));
+    }
+
+    #[test]
+    fn usage_lines_are_owed_when_full_and_every_30_s() {
+        assert!(usage_owed(0, 200, false), "the first time it is asked");
+        assert!(!usage_owed(200, 229, false));
+        assert!(usage_owed(200, 230, false));
+        assert!(usage_owed(200, 201, true), "full for the first time");
+    }
+
+    #[test]
+    fn usage_line_counts_every_holder() {
+        let held = [900_000, 5, 12, 30, 200, 60_000];
+        let line = usage_line(1_000_000, 512, held, (147_460, 1_000_000, 852_540, 2, 300), (4, 147_460, 60_242, 1, 87_214), vec![(4, 1, 0), (73_727, 3, 40), (500_000, 1954, 0)], (700, 12, 688));
+        assert_eq!(
+            line,
+            "console descriptor heaps: shared heap usage (full: no room for 512): 912782 of 1000000 descriptors held: title heap pages 900000, memory windows 5, directory roots 12, directory leaves 30, directory locators 200, page bindings 60000; 3 title view heaps of 573731 slots, 40 of their pages only looked up (no place), most pages first: [500000 slots 1954/1954 pages, 73727 slots 3/288 pages, 4 slots 1/1 pages]; 700 pages evicted, 12 placed again, 688 evicted now; ranges 147460..1000000: 852540 held, 2 free ranges, largest 300; singles 4..147460: 60242 held, 1 free ranges, largest 87214"
+        );
+        assert!(usage_line(100, 0, [0; HOLDERS], (4, 100, 0, 1, 96), (4, 4, 0, 0, 0), Vec::new(), (0, 0, 0)).starts_with("console descriptor heaps: shared heap usage: 0 of 100 descriptors held: "));
     }
 
     #[test]

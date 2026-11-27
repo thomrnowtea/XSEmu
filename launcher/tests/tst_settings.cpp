@@ -21,6 +21,10 @@ private slots:
     void paths();
     void gate();
     void runCommandLine();
+    void runProfileDefaults();
+    void runProfilePerGame();
+    void runProfileSettingsOwnedKeysWin();
+    void runProfileValidation();
     void titleConfigAtLaunch();
     void warmupClassification();
     void formats();
@@ -146,6 +150,131 @@ void TestSettings::runCommandLine()
     QVERIFY(!on.contains(QStringLiteral("XCL_STORE")));
     QVERIFY(!on.contains(QStringLiteral("XCL_FULL_DUMP")));
     QCOMPARE(WarmupController::warmupArguments(true), (QStringList{QStringLiteral("warm-up"), QStringLiteral("--full"), QStringLiteral("--progress-json")}));
+}
+
+void TestSettings::runProfileDefaults()
+{
+    QTemporaryDir dir;
+    qputenv("XCL_DATA_ROOT", dir.filePath(QStringLiteral("xcl")).toUtf8());
+    const QString ini = dir.filePath(QStringLiteral("s.ini"));
+    const QStringList play102{
+        QStringLiteral("XCL_SHADER_BACKEND=dxil"), QStringLiteral("XCL_LOOP_GUARD=1024"), QStringLiteral("XCL_RECOMP_OUTLINE_MIN_INSTS=4096"),
+        QStringLiteral("XCL_RECOMP_OUTLINE_RESULTS=static"), QStringLiteral("XCL_RECOMP_NO_PLAIN_LOADS=1"), QStringLiteral("XCL_TEXTURE_ALIAS=0"),
+        QStringLiteral("XCL_CHAIN_HOLD=0"), QStringLiteral("XCL_FSR4_STANDIN=1"), QStringLiteral("XCL_BVH_NODE_FIX=1"),
+        QStringLiteral("XCL_COMPUTE_PER_ACCESS_COHERENCE=0"), QStringLiteral("XCL_LOOP_PROFILE=67657769b50d2f8b"), QStringLiteral("XCL_PSO_LIBRARY=0"),
+        QStringLiteral("XCL_IMAGE_WRITEBACK=0"), QStringLiteral("XCL_LAZY_MESH_PSO=1"), QStringLiteral("XCL_DISPLAY_MODE=3840x2160"),
+        QStringLiteral("XCL_WAIT_TIMEOUT_MS=20000"), QStringLiteral("XCL_ADAPTER=rtx"), QStringLiteral("XCL_RT_GATE=hold"),
+        QStringLiteral("XCL_SHADER_CODE_MB=320"), QStringLiteral("XCL_SHADER_CODE_IDLE_S=30"),
+    };
+    {
+        AppSettings s(ini);
+        QCOMPARE(s.runProfile(), play102);
+        QCOMPARE(AppSettings::defaultRunProfile(), play102);
+        const QProcessEnvironment env = LaunchConfig::runEnvironment(QProcessEnvironment(), s, QStringLiteral("T"));
+        for (const auto& [key, value] : LaunchConfig::parseProfile(play102.join(QLatin1Char('\n'))).entries)
+            QCOMPARE(env.value(key), value);
+        QVERIFY(!env.contains(QStringLiteral("XCL_SKIP_SHADERS_FILE")));
+        QVERIFY(LaunchConfig::environmentOverride(s, QStringLiteral("XCL_DISPLAY_MODE")).contains(QLatin1String("XCL_DISPLAY_MODE=3840x2160 in the run profile")));
+
+        QSignalSpy spy(&s, &AppSettings::changed);
+        s.setRunProfile({QStringLiteral("XCL_LOOP_GUARD=2048"), QStringLiteral("XCL_LABEL=a=b,c")});
+        QCOMPARE(spy.count(), 1);
+        QCOMPARE(spy.first().first().toString(), QString::fromLatin1(AppSettings::Key::RunProfile));
+        QVERIFY(LaunchConfig::environmentOverride(s, QStringLiteral("XCL_DISPLAY_MODE")).isEmpty());
+    }
+    AppSettings s(ini);
+    QCOMPARE(s.runProfile(), (QStringList{QStringLiteral("XCL_LOOP_GUARD=2048"), QStringLiteral("XCL_LABEL=a=b,c")}));
+    QCOMPARE(LaunchConfig::runEnvironment(QProcessEnvironment(), s, QStringLiteral("T")).value(QStringLiteral("XCL_LABEL")), QStringLiteral("a=b,c"));
+    s.setRunProfile({});
+    QVERIFY(AppSettings(ini).runProfile().isEmpty());
+    QVERIFY(!LaunchConfig::runEnvironment(QProcessEnvironment(), s, QStringLiteral("T")).contains(QStringLiteral("XCL_LOOP_GUARD")));
+    s.resetRunProfile();
+    QCOMPARE(AppSettings(ini).runProfile(), play102);
+}
+
+void TestSettings::runProfilePerGame()
+{
+    QTemporaryDir dir;
+    qputenv("XCL_DATA_ROOT", dir.filePath(QStringLiteral("xcl")).toUtf8());
+    AppSettings s(dir.filePath(QStringLiteral("s.ini")));
+    const QString a = QStringLiteral("Northwind.A");
+    const QString b = QStringLiteral("Northwind.B");
+    QVERIFY(!s.gameRunProfile(a));
+    s.setGameOverride(a, QStringLiteral("runProfile"), QStringList{QStringLiteral("XCL_LOOP_GUARD=4096"), QStringLiteral("XCL_EXTRA=1")});
+    QCOMPARE(*AppSettings(s.fileName()).gameRunProfile(a), (QStringList{QStringLiteral("XCL_LOOP_GUARD=4096"), QStringLiteral("XCL_EXTRA=1")}));
+    QVERIFY(!s.gameRunProfile(b));
+
+    const QProcessEnvironment envA = LaunchConfig::runEnvironment(QProcessEnvironment(), s, a);
+    QCOMPARE(envA.value(QStringLiteral("XCL_LOOP_GUARD")), QStringLiteral("4096"));
+    QCOMPARE(envA.value(QStringLiteral("XCL_EXTRA")), QStringLiteral("1"));
+    QVERIFY(!envA.contains(QStringLiteral("XCL_SHADER_BACKEND")));
+    const QProcessEnvironment envB = LaunchConfig::runEnvironment(QProcessEnvironment(), s, b);
+    QCOMPARE(envB.value(QStringLiteral("XCL_LOOP_GUARD")), QStringLiteral("1024"));
+    QCOMPARE(envB.value(QStringLiteral("XCL_SHADER_BACKEND")), QStringLiteral("dxil"));
+    QVERIFY(!envB.contains(QStringLiteral("XCL_EXTRA")));
+    // the game's own profile replaces the global one, also when that one changes
+    s.setRunProfile({QStringLiteral("XCL_GLOBAL=1")});
+    QVERIFY(!LaunchConfig::runEnvironment(QProcessEnvironment(), s, a).contains(QStringLiteral("XCL_GLOBAL")));
+    QVERIFY(LaunchConfig::runEnvironment(QProcessEnvironment(), s, b).contains(QStringLiteral("XCL_GLOBAL")));
+    // an empty own profile is still the game's own: nothing from the global one
+    s.setGameOverride(a, QStringLiteral("runProfile"), QStringList{});
+    QVERIFY(s.gameRunProfile(a));
+    QVERIFY(!LaunchConfig::runEnvironment(QProcessEnvironment(), s, a).contains(QStringLiteral("XCL_GLOBAL")));
+    s.clearGameOverride(a, QStringLiteral("runProfile"));
+    QVERIFY(LaunchConfig::runEnvironment(QProcessEnvironment(), s, a).contains(QStringLiteral("XCL_GLOBAL")));
+
+    // the identity a warm-up records follows the switches that apply, not their order or the settings-owned lines
+    const QString identity = LaunchConfig::profileIdentity(s, a);
+    QCOMPARE(identity.size(), 16);
+    s.setRunProfile({QStringLiteral("XCL_NETWORK=1"), QStringLiteral("XCL_GLOBAL=1")});
+    QCOMPARE(LaunchConfig::profileIdentity(s, a), identity);
+    s.setRunProfile({QStringLiteral("XCL_GLOBAL=2")});
+    QVERIFY(LaunchConfig::profileIdentity(s, a) != identity);
+}
+
+void TestSettings::runProfileSettingsOwnedKeysWin()
+{
+    QTemporaryDir dir;
+    qputenv("XCL_DATA_ROOT", dir.filePath(QStringLiteral("xcl")).toUtf8());
+    AppSettings s(dir.filePath(QStringLiteral("s.ini")));
+    s.setRunProfile({QStringLiteral("XCL_NETWORK=1"), QStringLiteral("XCL_STORE=granted"), QStringLiteral("XCL_FULL_DUMP=/elsewhere"),
+                     QStringLiteral("XCL_DXIL_CACHE=/profile/cache"), QStringLiteral("XCL_LOOP_GUARD=1024")});
+    QProcessEnvironment base;
+    base.insert(QStringLiteral("XCL_DXIL_CACHE"), QStringLiteral("/settings/cache"));
+    const QProcessEnvironment on = LaunchConfig::runEnvironment(base, s, QStringLiteral("T"));
+    QCOMPARE(on.value(QStringLiteral("XCL_NETWORK")), QStringLiteral("0"));
+    QCOMPARE(on.value(QStringLiteral("XCL_STORE")), QStringLiteral("offline-error"));
+    QCOMPARE(on.value(QStringLiteral("XCL_FULL_DUMP")), QDir::toNativeSeparators(LaunchConfig::crashDumpDir(QStringLiteral("T"))));
+    QCOMPARE(on.value(QStringLiteral("XCL_DXIL_CACHE")), QStringLiteral("/settings/cache"));
+    QCOMPARE(on.value(QStringLiteral("XCL_LOOP_GUARD")), QStringLiteral("1024"));
+    s.setOffline(false);
+    s.setStoreOfflineError(false);
+    s.setCrashDumps(false);
+    const QProcessEnvironment off = LaunchConfig::runEnvironment(QProcessEnvironment(), s, QStringLiteral("T"));
+    for (const auto& [key, owner] : LaunchConfig::settingsOwnedKeys()) {
+        QVERIFY2(!off.contains(key), qPrintable(key));
+        QVERIFY(!owner.isEmpty());
+        QCOMPARE(LaunchConfig::settingOwning(key), owner);
+    }
+    QVERIFY(LaunchConfig::settingOwning(QStringLiteral("XCL_LOOP_GUARD")).isEmpty());
+}
+
+void TestSettings::runProfileValidation()
+{
+    const LaunchConfig::ProfileParse ok = LaunchConfig::parseProfile(QStringLiteral("  XCL_A = 1 \n\n_B=x=y\nC2=\n"));
+    QVERIFY(ok.ok());
+    QCOMPARE(ok.lines(), (QStringList{QStringLiteral("XCL_A=1"), QStringLiteral("_B=x=y"), QStringLiteral("C2=")}));
+
+    const LaunchConfig::ProfileParse bad = LaunchConfig::parseProfile(
+        QStringLiteral("XCL_A=1\nxcl_b=2\n9X=1\nXCL-C=1\nXCL_A=3\nno equals\n=1\nXCL_D=4"));
+    QCOMPARE(bad.lines(), (QStringList{QStringLiteral("XCL_A=1"), QStringLiteral("XCL_D=4")}));
+    QCOMPARE(bad.errors.size(), 6);
+    QVERIFY(bad.errors[0].startsWith(QLatin1String("Line 2: \"xcl_b\"")));
+    QVERIFY(bad.errors[1].startsWith(QLatin1String("Line 3: \"9X\"")));
+    QVERIFY(bad.errors[2].startsWith(QLatin1String("Line 4: \"XCL-C\"")));
+    QCOMPARE(bad.errors[3], QStringLiteral("Line 5: XCL_A is already set on line 1."));
+    QCOMPARE(bad.errors[4], QStringLiteral("Line 6: write it as KEY=VALUE."));
+    QVERIFY(bad.errors[5].startsWith(QLatin1String("Line 7: \"\"")));
 }
 
 void TestSettings::titleConfigAtLaunch()

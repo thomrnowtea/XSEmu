@@ -381,6 +381,11 @@ fn lock(p: &Pool) -> MutexGuard<'_, State> {
     p.state.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// (diagnostics, `memdiag`) Bytes the read-ahead holds now of the shared room.
+pub(crate) fn diag_held() -> u64 {
+    POOL.get().map_or(0, |p| lock(p).held)
+}
+
 pub(super) fn new_lane_id() -> u64 {
     NEXT_LANE.fetch_add(1, Ordering::Relaxed)
 }

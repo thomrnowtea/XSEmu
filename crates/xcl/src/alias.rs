@@ -123,6 +123,11 @@ impl Payloads {
         self.ring.is_empty()
     }
 
+    /// The bytes its ring holds.
+    pub fn bytes(&self) -> usize {
+        self.ring.capacity() * std::mem::size_of::<Payload>()
+    }
+
     /// The pieces over `[lo, hi)`, the latest first (up to `most`), each with whether a later
     /// piece was written over part of it (then the memory is not expected to hold it any more).
     pub fn over(&self, lo: usize, hi: usize, most: usize) -> Vec<(Payload, bool)> {
@@ -230,6 +235,11 @@ impl MapHistory {
         self.ring.is_empty()
     }
 
+    /// The bytes its ring holds.
+    pub fn bytes(&self) -> usize {
+        self.ring.capacity() * std::mem::size_of::<MapEvent>()
+    }
+
     /// The events that changed the 64 KiB page at `at`, the latest first (up to `most`).
     pub fn at(&self, at: usize, most: usize) -> Vec<MapEvent> {
         self.ring.iter().rev().filter(|e| e.len != 0 && e.at < at + PAGE && at < e.at + e.len).take(most).copied().collect()
@@ -270,6 +280,12 @@ impl Recent {
 
 static PAYLOADS: Mutex<Payloads> = Mutex::new(Payloads::new(1 << 18));
 static RECENT: Mutex<Option<Recent>> = Mutex::new(None);
+
+/// (diagnostics, `memdiag`) The payload pieces kept: (pieces, bytes of one, bytes the ring holds).
+pub(crate) fn diag_payloads() -> (usize, usize, usize) {
+    let p = lock(&PAYLOADS);
+    (p.len(), std::mem::size_of::<Payload>(), p.bytes())
+}
 
 thread_local! {
     /// the DirectStorage request the calling thread's payloads are written for (`with_request`)

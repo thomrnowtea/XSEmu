@@ -449,6 +449,16 @@ fn main() {
     // keep the TLS callback from being discarded by the linker
     unsafe { std::ptr::read_volatile(&XCL_TLS_CALLBACK) };
 
+    // Outlined memory functions hand their results back through statics unless told otherwise
+    // (XCL_RECOMP_OUTLINE_RESULTS=out): with out parameters main keeps a stack slot for every
+    // result of every call, and the NVIDIA driver removes the device when the title's big
+    // batch-cull programs run (play-102; static held in play-102f1). The default is set here and
+    // not in the translator: the translator's source and the switch's value both name the
+    // generation of the translated cache, so this keeps the generation those runs filled.
+    if std::env::var_os("XCL_RECOMP_OUTLINE_RESULTS").is_none() {
+        std::env::set_var("XCL_RECOMP_OUTLINE_RESULTS", "static");
+    }
+
     if let Some(boot) = std::env::var_os("XCL_HOST") {
         std::env::remove_var("XCL_HOST");
         std::process::exit(xcl::host::host_main(&PathBuf::from(boot)));
@@ -476,6 +486,7 @@ fn main() {
         Some("minidump") => xcl::eh::write_minidump_of(&args[1..]),
         Some("warm-up") if args.get(1).is_some_and(|a| a == "--blocking") => warm_up_blocking(&args[2..]),
         Some("warm-up") if args.get(1).is_some_and(|a| a == "--blocking-child") => warm_up_blocking_child(&args[2..]),
+        Some("compile-helper") if args.len() == 2 => xcl::hle::d3d12x::real::giant_helper_child(std::path::Path::new(&args[1])),
         Some("warm-up") if args.iter().any(|a| a == "--mesh-only") => {
             match &args[1..] {
                 [mesh] if mesh == "--mesh-only" => warm_up_mesh(None),

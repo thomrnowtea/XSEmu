@@ -5,6 +5,7 @@
 #include "core/EmulatorBuild.h"
 #include "core/Paths.h"
 #include "pages/ShareSettingsDialog.h"
+#include "shell/LaunchErrors.h"
 #include "widgets/Button.h"
 #include "widgets/Icon.h"
 #include "widgets/Text.h"
@@ -12,7 +13,6 @@
 #include <QClipboard>
 #include <QDesktopServices>
 #include <QDir>
-#include <QFileDialog>
 #include <QFileInfo>
 #include <QGuiApplication>
 #include <QHBoxLayout>
@@ -93,6 +93,8 @@ QWidget* SettingsSections::about(Services& s)
                   << (answer.capable ? QStringLiteral("Ready for the launcher.") : QStringLiteral("This XSEmu build is too old for the launcher: Play and Warm-up stay off."));
         if (other.busy())
             lines << other.reason();
+        if (AppSettings::emulatorPathFromEnvironment())
+            lines << QStringLiteral("Set by XSEMU_EMULATOR in the environment, which wins over Choose.");
         emu->setHelp(lines.join(QLatin1Char('\n')));
         copy->setEnabled(!answer.version.isEmpty());
         copy->setProperty("version", answer.version);
@@ -104,12 +106,7 @@ QWidget* SettingsSections::about(Services& s)
         if (key == QLatin1String(AppSettings::Key::EmulatorPath) || key == QLatin1String(AppSettings::Key::BusyMarker))
             refresh();
     });
-    QObject::connect(choose, &Button::clicked, choose, [&s, choose] {
-        const QString picked = QFileDialog::getOpenFileName(choose->window(), QStringLiteral("Choose the emulator"), QFileInfo(s.settings.emulatorPath()).absolutePath(),
-                                                            QStringLiteral("XSEmu (XSEmu.exe xcl.exe);;Programs (*.exe);;All files (*)"));
-        if (!picked.isEmpty())
-            s.settings.setEmulatorPathOverride(picked);
-    });
+    QObject::connect(choose, &Button::clicked, choose, [&s, choose] { LaunchErrors::chooseEmulator(choose->window(), s.settings); });
     QObject::connect(copy, &Button::clicked, copy, [copy] {
         QGuiApplication::clipboard()->setText(QStringLiteral("%1, launcher %2").arg(copy->property("version").toString(), QStringLiteral(XSEMU_VERSION)));
     });

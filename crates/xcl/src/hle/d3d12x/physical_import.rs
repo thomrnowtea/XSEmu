@@ -13,6 +13,8 @@ struct Segment {
     heap: ID3D12Heap,
     view: PhysicalSectionView,
     start: usize,
+    /// the buffer over all of the heap, placed when a run view first asks for it (`resolve_run`)
+    whole: OnceLock<Option<ID3D12Resource>>,
 }
 
 impl Drop for Segment {
@@ -38,6 +40,23 @@ impl ImportedPage {
     }
     pub(super) fn id(&self) -> usize {
         self.source.id()
+    }
+}
+
+/// A committed run of a section, imported as one heap (8 MiB at most), and the buffer over all
+/// of it: what one raw view shows every page of the run through.
+pub(super) struct ImportedRun(Arc<Segment>);
+
+impl ImportedRun {
+    pub(super) fn resource(&self) -> &ID3D12Resource {
+        self.0.whole.get().and_then(Option::as_ref).expect("placed run")
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.0.view.len()
+    }
+    pub(super) fn id(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
     }
 }
 
@@ -85,7 +104,7 @@ impl Backend {
             return None;
         }
         crate::memdiag::IMPORTED_SEGMENTS.add(view.len() as u64);
-        Some(Segment { heap, view, start })
+        Some(Segment { heap, view, start, whole: OnceLock::new() })
     }
 
     unsafe fn place_page(&self, segment: &Segment, offset: usize) -> Option<ID3D12Resource> {
@@ -93,9 +112,13 @@ impl Backend {
         if !relative.is_multiple_of(PHYS_PAGE_SIZE) || relative.checked_add(PHYS_PAGE_SIZE)? > segment.view.len() {
             return None;
         }
+        self.place(segment, relative, PHYS_PAGE_SIZE)
+    }
+
+    unsafe fn place(&self, segment: &Segment, relative: usize, bytes: usize) -> Option<ID3D12Resource> {
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: PHYS_PAGE_SIZE as u64,
+            Width: bytes as u64,
             Height: 1,
             DepthOrArraySize: 1,
             MipLevels: 1,
@@ -132,6 +155,20 @@ pub(super) fn supported(dev: &ID3D12Device) -> bool {
 pub(super) fn resolve_page(dev: &ID3D12Device, page: &PhysicalPageRef) -> Option<Arc<ImportedPage>> {
     let backend = BACKEND.get()?.as_ref().filter(|b| b.dev.as_raw() == dev.as_raw())?;
     resolve_on(backend, page)
+}
+
+/// The run `page` is in and the page's byte offset in it. The run's buffer is placed over the
+/// heap the page's own buffer is in, when first asked for. None: it cannot be placed.
+pub(super) fn resolve_run(dev: &ID3D12Device, page: &ImportedPage) -> Option<(ImportedRun, usize)> {
+    let backend = BACKEND.get()?.as_ref().filter(|b| b.dev.as_raw() == dev.as_raw())?;
+    run_on(backend, page)
+}
+
+fn run_on(backend: &Backend, page: &ImportedPage) -> Option<(ImportedRun, usize)> {
+    let segment = &page._segment;
+    let offset = page.source.section_offset().checked_sub(segment.start)?;
+    segment.whole.get_or_init(|| unsafe { backend.place(segment, 0, segment.view.len()) }).as_ref()?;
+    Some((ImportedRun(Arc::clone(segment)), offset))
 }
 
 fn resolve_on(backend: &Backend, page: &PhysicalPageRef) -> Option<Arc<ImportedPage>> {
@@ -296,6 +333,17 @@ mod tests {
             assert_eq!(
                 placements.as_slice(),
                 [(h, 0, size), (h, size, size), (c._segment.heap.as_raw() as usize, 0, size)]
+            );
+            drop(placements);
+            let (run, at) = run_on(&b, &a).unwrap();
+            let (same, next) = run_on(&b, &b2).unwrap();
+            assert_eq!((run.id(), run.len(), at, next), (same.id(), 2 * PHYS_PAGE_SIZE, 0, PHYS_PAGE_SIZE));
+            assert_ne!(run_on(&b, &c).unwrap().0.id(), run.id());
+            assert_eq!(run_on(&b, &alias).unwrap().1, 0);
+            assert_eq!(
+                PLACEMENTS.lock().unwrap()[3..],
+                [(h, 0, 2 * size), (c._segment.heap.as_raw() as usize, 0, size)],
+                "one buffer over each run, placed once"
             );
         }
     }

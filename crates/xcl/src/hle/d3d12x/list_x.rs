@@ -465,6 +465,9 @@ struct Bindings {
     /// the title set the console's rect list topology
     rect_list: bool,
     predication: Option<(usize, u64, D3D12_PREDICATION_OP)>,
+    /// a draw put off to the submit: the heaps its render targets were copied into
+    /// (`snapshot_render_targets`)
+    render_target_copies: Vec<ID3D12DescriptorHeap>,
 }
 
 /// Whether `list` draws rect lists now, and the title's vertex buffers (slot, (address, bytes, stride)).
@@ -749,6 +752,16 @@ pub(super) fn prepass_dsv(list: usize, pso: usize, planned:bool) -> Option<(usiz
     Some((b.render_targets.as_ref()?.dsv?, b.depth_capture_dsv_generation?, s.depth_bounds))
 }
 
+/// The first viewport (x, y, width, height) and scissor `list` set, each with how many it set.
+pub(super) fn viewport_scissor(list: usize) -> (Option<([f32; 4], usize)>, Option<([i32; 4], usize)>) {
+    let g = LISTS.lock().unwrap();
+    let Some(b) = g.as_ref().and_then(|m| m.get(&list)).map(|s| &s.bindings) else { return (None, None) };
+    (
+        b.viewports.first().map(|v| ([v.TopLeftX, v.TopLeftY, v.Width, v.Height], b.viewports.len())),
+        b.scissors.first().map(|r| ([r.left, r.top, r.right, r.bottom], b.scissors.len())),
+    )
+}
+
 pub(super) fn single_viewport(list: usize) -> Option<([f32;6],[i32;4])> {
     let g = LISTS.lock().unwrap();
     let b = &g.as_ref()?.get(&list)?.bindings;
@@ -769,6 +782,7 @@ pub(super) fn capture_native_pso(list: *mut c_void) -> usize {
 }
 
 unsafe fn set_native_pso(list: *mut c_void, pso: usize) {
+    super::shader_code::taken(list as usize, pso);
     pc::<unsafe extern "system" fn(*mut c_void, usize)>(list, PC_SET_PIPELINE_STATE)(list, pso);
     capture_native_bind(list, pso);
 }
@@ -872,6 +886,39 @@ struct ListState {
     draw_predicate: Option<DrawPredicate>,
     /// state a PC Reset clears (restored after KickoffX)
     bindings: Bindings,
+    /// what this segment records at the submit (`defer`)
+    deferred: Option<Deferred>,
+}
+
+/// A call put off to the submit (`defer`), with its arguments.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Deferred {
+    /// groups or, with `DispatchX`'s thread-dimension flag, threads; the `DispatchX` flags (None: `Dispatch`)
+    Dispatch(u32, u32, u32, Option<u32>),
+    /// signature, most commands, arguments and their offset, count buffer and its offset
+    Indirect(usize, u32, usize, u64, usize, u64),
+    Draw(u32, u32, u32, u32),
+    DrawIndexed(u32, u32, u32, i32, u32),
+    /// `DrawIndexedX`: the indices' address, their format and count
+    DrawIndexedX(u64, DXGI_FORMAT, u32),
+}
+
+impl Deferred {
+    pub(super) fn draws(&self) -> bool {
+        match *self {
+            Deferred::Dispatch(..) => false,
+            Deferred::Indirect(sig, ..) => !super::indirect::dispatches(sig),
+            _ => true,
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            Deferred::Dispatch(..) => "dispatch",
+            Deferred::Indirect(..) => "ExecuteIndirect",
+            _ => "draw",
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1125,6 +1172,7 @@ pub(super) fn clear_segment_state(list: usize) {
         s.draw_predicate = None;
         s.pred_in_state = false;
         s.bindings = Bindings::default();
+        s.deferred = None;
     }
 }
 
@@ -1143,6 +1191,12 @@ pub(super) fn on_allocator_release(alloc: usize) {
             }
         }
     }
+    // (released outside the lock: a companion's Release comes back here)
+    let gone: Vec<_> = COMPANIONS.lock().unwrap().as_mut().map_or_else(Vec::new, |m| {
+        let keys: Vec<_> = m.keys().filter(|k| k.0 == alloc).copied().collect();
+        keys.into_iter().filter_map(|k| m.remove(&k)).collect()
+    });
+    drop(gone);
 }
 
 /// Track `SetPipelineState` on a command list (for `RSSetDepthBiasX` and `KickoffX`),
@@ -1276,6 +1330,7 @@ fn pick_queue(last_queue: Option<usize>, device: usize, ty: D3D12_COMMAND_LIST_T
 
 fn note_write(list: usize, va: u64, size: u64) {
     LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(list).or_default().note_write(va, size);
+    unsafe { super::sparse::before_gpu_write(va as usize, size as usize) };
 }
 
 /// `[offset, offset + bytes)` of a buffer of `size` bytes at `base`, clamped to the buffer:
@@ -1306,6 +1361,8 @@ fn note_buffer_write(list: usize, dst: usize, offset: u64, bytes: u64, cpu_read_
         SPARSE_WRITE_LISTS.fetch_add(1, Ordering::AcqRel);
     }
     s.sparse_writes.push((va, n));
+    drop(g);
+    unsafe { super::sparse::before_gpu_write(va, n) };
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1736,6 +1793,16 @@ pub(super) unsafe fn break_cycles_before_title_signal(sig_q: usize, title_fence:
     }
 }
 
+/// Whether an armed GPU wait has outlasted the watchdog. Its clock stands while one of the title's
+/// threads is held for a pipeline build (`pso_async::title_held`: a bind's wait, or a submit's for
+/// the calls put off to it) and starts again after, as `kernelx::Sleep`'s does.
+fn wait_expired(aw: &mut ArmedGpuWait, held: bool) -> bool {
+    if held {
+        aw.armed_at = Instant::now();
+    }
+    aw.armed_at.elapsed() >= gpu_wait_watchdog_timeout()
+}
+
 fn wake_sync_watchdog() {
     let pair = SYNC_WATCHDOG_WAKE.get_or_init(|| {
         let pair = (Mutex::new(()), Condvar::new());
@@ -1782,8 +1849,9 @@ fn wake_sync_watchdog() {
                         let mut waiter_q = 0usize;
                         let mut waiter_ty = -1i32;
                         let before = cell.armed_waits.len();
-                        cell.armed_waits.retain(|aw| {
-                            if aw.armed_at.elapsed() >= gpu_wait_watchdog_timeout() {
+                        let held = super::pso_async::defer_to_submit() && super::pso_async::title_held();
+                        cell.armed_waits.retain_mut(|aw| {
+                            if wait_expired(aw, held) {
                                 if aw.val >= max_exp {
                                     max_exp = aw.val;
                                     waiter_q = aw.waiting_queue;
@@ -2570,9 +2638,33 @@ unsafe fn device_of(list: *mut c_void) -> Option<ID3D12Device> {
 type FillUploads = HashMap<usize, HashMap<[u8; 16], ID3D12Resource>>;
 static FILL_UPLOADS: Mutex<Option<FillUploads>> = Mutex::new(None);
 
+/// The command allocator the list `list` records on (0: not known, or the lists' table is taken now –
+/// the caller may be the one that holds it).
+pub(super) fn allocator_of(list: usize) -> usize {
+    LISTS.try_lock().ok().and_then(|g| g.as_ref().and_then(|m| m.get(&list)).map(|s| s.allocator)).unwrap_or(0)
+}
+
+/// Whether `list` is a bundle, by the driver's word or the title's (a title's bundle is not the
+/// driver's with `single`; false when the lists' table is taken now and the driver says no).
+pub(super) fn is_bundle(list: usize) -> bool {
+    if list == 0 {
+        return false;
+    }
+    let get: unsafe extern "system" fn(*mut c_void) -> D3D12_COMMAND_LIST_TYPE = unsafe { std::mem::transmute(real::original_or_native(list as *mut c_void, PC_GET_TYPE).0) };
+    let host = unsafe { get(list as *mut c_void) };
+    host == D3D12_COMMAND_LIST_TYPE_BUNDLE
+        || LISTS.try_lock().ok().is_some_and(|g| g.as_ref().and_then(|m| m.get(&list)).is_some_and(|s| s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE)))
+}
+
 pub(super) fn on_allocator_reset(allocator: usize) {
+    super::shader_code::allocator_reset(allocator);
     let uploads = FILL_UPLOADS.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator));
     drop(uploads);
+    // the GPU is done with every list recorded on `allocator`, the put-off calls they made too
+    let companions: Vec<_> = COMPANIONS.lock().unwrap().as_ref().map_or_else(Vec::new, |m| m.iter().filter(|(k, _)| k.0 == allocator).map(|(_, c)| c.clone()).collect());
+    for c in companions {
+        let _ = unsafe { c.lock().unwrap().Reset() };
+    }
 }
 
 unsafe fn pattern_buffer(list: *mut c_void, pat: [u8; 16]) -> Option<usize> {
@@ -2838,6 +2930,20 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
         return None;
     }
     let ty = list_type(list);
+    let next_pc = split(list, wrapper, None)?;
+    static SPLITS: AtomicU64 = AtomicU64::new(0);
+    let n = SPLITS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 4 || (n.is_power_of_two() && n <= 256) {
+        crate::xlog_info!("D3D12.X: split command list (type {}) around mid-list Wait after Write64 (#{n})", ty.0);
+    }
+    Some(next_pc)
+}
+
+/// Ends `list`'s segment of `wrapper`'s recording and opens the next, with all of `list`'s
+/// state; with `put_off` (a call put off to the submit and the closed segment it is recorded in
+/// there, `defer`), that segment comes between the two.
+unsafe fn split(list: *mut c_void, wrapper: *mut c_void, put_off: Option<(Deferred, *mut c_void)>) -> Option<*mut c_void> {
+    let ty = list_type(list);
     if ty == D3D12_COMMAND_LIST_TYPE_BUNDLE {
         return None;
     }
@@ -2893,6 +2999,7 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
     } else {
         super::pso_async::resolve_for_bind(bound_pso)
     };
+    super::shader_code::taken_on(alloc, init_pso);
     let dev = device_of(list)?;
     let dev_raw = dev.as_raw() as usize;
 
@@ -2925,15 +3032,7 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
         let m = g.get_or_insert_with(HashMap::new);
         let old = m.remove(&(next_pc as usize));
         if let Some(ref o) = old {
-            if !o.pending_waits.is_empty() {
-                PENDING_WAIT_LISTS.fetch_sub(1, Ordering::AcqRel);
-            }
-            if !o.sparse_writes.is_empty() {
-                SPARSE_WRITE_LISTS.fetch_sub(1, Ordering::AcqRel);
-            }
-            if !o.write64_signals.is_empty() {
-                WRITE64_SIGNAL_LISTS.fetch_sub(1, Ordering::AcqRel);
-            }
+            uncount(o);
         }
         m.insert(
             next_pc as usize,
@@ -2969,40 +3068,7 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
     restore_bindings(next_pc, &bindings, ty);
 
     if ty == D3D12_COMMAND_LIST_TYPE_DIRECT {
-        let info = if bound_pso != 0 { device_x::base_depth_bias_info(bound_pso) } else { None };
-        let mut applied_native = false;
-        if let Some((true, static_bias)) = info {
-            let target = depth_bias.unwrap_or(static_bias);
-            if target.is_zero() {
-                applied_native = true;
-            } else if try_native_depth_bias(next_pc, target) {
-                if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(next_pc as usize))) {
-                    s.native_bias = target;
-                }
-                applied_native = true;
-            }
-        } else if bound_pso == 0 {
-            if let Some(b) = depth_bias {
-                if device_x::dynamic_depth_bias_supported(dev_raw as *mut c_void) && try_native_depth_bias(next_pc, b) {
-                    if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(next_pc as usize))) {
-                        s.native_bias = b;
-                    }
-                    applied_native = true;
-                }
-            }
-        }
-        if depth_bias.is_some() && !applied_native {
-            if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(next_pc as usize))) {
-                s.pso_dirty = true;
-            }
-            DEPTH_BIAS_USED.store(true, Ordering::Release);
-        }
-        if let Some(ref view) = index_buffer {
-            set_index_buffer(next_pc, Some(view));
-        }
-        if let Some((min, max)) = depth_bounds {
-            pc::<unsafe extern "system" fn(*mut c_void, f32, f32)>(next_pc, PC_OM_SET_DEPTH_BOUNDS)(next_pc, min, max);
-        }
+        restore_direct(next_pc, dev_raw, bound_pso, depth_bias, index_buffer, depth_bounds);
     }
     if ty != D3D12_COMMAND_LIST_TYPE_COPY {
         if let (Some(op), Some(ref pb)) = (predication, pred_buf) {
@@ -3015,13 +3081,449 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
         }
     }
 
-    super::title_list::activate_segment(wrapper, list, next_pc);
-    static SPLITS: AtomicU64 = AtomicU64::new(0);
-    let n = SPLITS.fetch_add(1, Ordering::Relaxed) + 1;
-    if n <= 4 || (n.is_power_of_two() && n <= 256) {
-        crate::xlog_info!("D3D12.X: split command list (type {}) around mid-list Wait after Write64 (#{n})", ty.0);
+    if let Some((what, seg)) = put_off {
+        let mut captured = bindings.clone();
+        if what.draws() {
+            snapshot_render_targets(&dev, &mut captured);
+        }
+        let old = {
+            let mut g = LISTS.lock().unwrap();
+            let m = g.get_or_insert_with(HashMap::new);
+            let old = m.remove(&(seg as usize));
+            if let Some(ref o) = old {
+                uncount(o);
+            }
+            m.insert(
+                seg as usize,
+                ListState {
+                    allocator: alloc,
+                    list_type: Some(ty),
+                    last_queue,
+                    bound_pso,
+                    depth_bias,
+                    index_buffer,
+                    depth_bounds,
+                    bindings: captured,
+                    deferred: Some(what),
+                    ..Default::default()
+                },
+            );
+            old
+        };
+        drop(old);
+        super::title_textures::list_reset(seg as usize);
+        super::depth_state::reset(seg as usize);
+        super::residency::list_reset(seg as usize);
+        super::depth_uav::list_reset(seg as usize);
+        super::bind::inherit_for_split(list, seg, alloc);
+        super::title_list::push_segment(wrapper, seg);
     }
+
+    super::title_list::activate_segment(wrapper, list, next_pc);
     Some(next_pc)
+}
+
+/// The rest of a direct list's state a PC Reset clears, on `list` (a segment going on from
+/// another): the depth bias for `bound_pso`, the index buffer, the depth bounds.
+unsafe fn restore_direct(list: *mut c_void, dev_raw: usize, bound_pso: usize, depth_bias: Option<DepthBias>, index_buffer: Option<D3D12_INDEX_BUFFER_VIEW>, depth_bounds: Option<(f32, f32)>) {
+    let info = if bound_pso != 0 { device_x::base_depth_bias_info(bound_pso) } else { None };
+    let mut applied_native = false;
+    if let Some((true, static_bias)) = info {
+        let target = depth_bias.unwrap_or(static_bias);
+        if target.is_zero() {
+            applied_native = true;
+        } else if try_native_depth_bias(list, target) {
+            if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
+                s.native_bias = target;
+            }
+            applied_native = true;
+        }
+    } else if bound_pso == 0 {
+        if let Some(b) = depth_bias {
+            if device_x::dynamic_depth_bias_supported(dev_raw as *mut c_void) && try_native_depth_bias(list, b) {
+                if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
+                    s.native_bias = b;
+                }
+                applied_native = true;
+            }
+        }
+    }
+    if depth_bias.is_some() && !applied_native {
+        if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
+            s.pso_dirty = true;
+        }
+        DEPTH_BIAS_USED.store(true, Ordering::Release);
+    }
+    if let Some(ref view) = index_buffer {
+        set_index_buffer(list, Some(view));
+    }
+    if let Some((min, max)) = depth_bounds {
+        pc::<unsafe extern "system" fn(*mut c_void, f32, f32)>(list, PC_OM_SET_DEPTH_BOUNDS)(list, min, max);
+    }
+}
+
+/// The counts a list's state is in, for a state that goes (`on_release` does the same).
+fn uncount(o: &ListState) {
+    if !o.pending_waits.is_empty() {
+        PENDING_WAIT_LISTS.fetch_sub(1, Ordering::AcqRel);
+    }
+    if !o.sparse_writes.is_empty() {
+        SPARSE_WRITE_LISTS.fetch_sub(1, Ordering::AcqRel);
+    }
+    if !o.write64_signals.is_empty() {
+        WRITE64_SIGNAL_LISTS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// PC allocators the calls put off to the submit record on (`record_deferred`), one per title
+/// allocator and PC list type: by the submit the title's allocator may be recording another list.
+/// Each is reset with its title allocator (`on_allocator_reset`): the title resets that once the
+/// GPU is done with every list recorded on it, and so with their put-off calls too.
+type Companions = HashMap<(usize, i32), std::sync::Arc<Mutex<ID3D12CommandAllocator>>>;
+static COMPANIONS: Mutex<Option<Companions>> = Mutex::new(None);
+
+unsafe fn companion(dev: &ID3D12Device, alloc: usize, ty: D3D12_COMMAND_LIST_TYPE) -> Option<std::sync::Arc<Mutex<ID3D12CommandAllocator>>> {
+    let ty = D3D12_COMMAND_LIST_TYPE(super::single::list_type(ty.0 as usize) as i32);
+    let mut g = COMPANIONS.lock().unwrap();
+    let m = g.get_or_insert_with(HashMap::new);
+    if let Some(c) = m.get(&(alloc, ty.0)) {
+        return Some(c.clone());
+    }
+    let a: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).ok()?;
+    let c = std::sync::Arc::new(Mutex::new(a));
+    m.insert((alloc, ty.0), c.clone());
+    Some(c)
+}
+
+/// Calls put off to the submit in one frame at most, over all lists (`defer`).
+const DEFERRED_PER_FRAME: usize = 256;
+static DEFER_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+static DEFERRED_IN_FRAME: AtomicUsize = AtomicUsize::new(0);
+
+/// A call whose pipeline is still being built (`bind::put_off`) gets a closed segment of its
+/// own in `list`'s recording, recorded at the submit (`record_deferred`); the list goes on in
+/// the segment after it. False: the call stays in the list and is skipped as before (counted) –
+/// not a title list, a bundle, a predicated call or one inside an occlusion query (its Begin and
+/// End would be in different PC lists), or the budget used up: `title_list::MAX_DEFERRED` a
+/// recording, `DEFERRED_PER_FRAME` a frame (upstream, a segment for every unbuilt call of a world
+/// start ran a retail title out of command list memory: Close E_OUTOFMEMORY, then device removed).
+pub(super) unsafe fn defer(list: *mut c_void, what: Deferred) -> bool {
+    let Some(wrapper) = super::title_list::wrapper_of(list) else { return false };
+    let ty = list_type(list);
+    if ty == D3D12_COMMAND_LIST_TYPE_BUNDLE {
+        return false;
+    }
+    let frame = super::present::presents();
+    if DEFER_FRAME.swap(frame, Ordering::AcqRel) != frame {
+        DEFERRED_IN_FRAME.store(0, Ordering::Release);
+    }
+    let room = DEFERRED_IN_FRAME.load(Ordering::Acquire) < DEFERRED_PER_FRAME && super::title_list::can_defer(wrapper);
+    let done = room
+        && match put_off_segment(list, wrapper, ty) {
+            Some(seg) => split(list, wrapper, Some((what, seg))).is_some() || {
+                super::title_list::put_off_spare(wrapper, seg);
+                false
+            },
+            None => false,
+        };
+    if !done {
+        static KEPT: AtomicU64 = AtomicU64::new(0);
+        let n = KEPT.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 4 || n.is_power_of_two() {
+            crate::xlog_info!(
+                "D3D12.X: a {} with a pipeline still being built skipped, not put off to the submit: {} (#{n})",
+                what.name(),
+                if room { "predicated, inside an occlusion query, or no segment for it" } else { "the list's or the frame's budget is used up" }
+            );
+        }
+        return false;
+    }
+    DEFERRED_IN_FRAME.fetch_add(1, Ordering::AcqRel);
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 4 || n.is_power_of_two() {
+        crate::xlog_info!("D3D12.X: a {} with a pipeline still being built put off to the submit (#{n})", what.name());
+    }
+    true
+}
+
+/// A closed PC list of type `ty` for a call put off to the submit, holding no recording that has
+/// not run: one of `wrapper`'s put-off segments whose last recording ran (`pop_put_off_spare`), or
+/// a new one made closed with no recording (`CreateCommandList1`). Nothing is recorded in it here:
+/// the submit resets it once, on the companion of `list`'s allocator (`companion`), and records
+/// the call or nothing (`record_put_off`). A list reset and closed empty here was reset again at
+/// the submit, dropping a recording that never ran: D3D12 destroyed an allocation in it, and the
+/// kernel call did not return while the submitting thread's queues sat behind GPU waits only it
+/// could release. None: the call stays in `list` (`defer`).
+unsafe fn put_off_segment(list: *mut c_void, wrapper: *mut c_void, ty: D3D12_COMMAND_LIST_TYPE) -> Option<*mut c_void> {
+    let alloc = {
+        let g = LISTS.lock().unwrap();
+        let s = g.as_ref()?.get(&(list as usize))?;
+        let plain = s.allocator != 0 && s.predication.is_none() && s.draw_predicate.is_none() && s.bindings.predication.is_none() && s.occlusion.active.is_none();
+        plain.then_some(s.allocator)?
+    };
+    let dev = device_of(list)?;
+    companion(&dev, alloc, ty)?;
+    super::title_list::pop_put_off_spare(wrapper).or_else(|| {
+        let seg = real::create_closed_pc_command_list(dev.as_raw(), ty);
+        if seg.is_none() {
+            static ERR: AtomicU64 = AtomicU64::new(0);
+            warn(&ERR, "put-off call", format_args!("CreateCommandList1 of its segment failed"));
+        }
+        seg
+    })
+}
+
+/// The render targets a draw put off to the submit binds, copied into heaps of its own (kept with
+/// its segment): the title may write other views into its descriptors before the submit, and the
+/// PC reads them at OMSetRenderTargets. Left as they are when a copy cannot be made.
+unsafe fn snapshot_render_targets(dev: &ID3D12Device, b: &mut Bindings) {
+    let Some(rt) = b.render_targets.as_ref() else { return };
+    let mut copied = rt.clone();
+    let mut heaps = Vec::new();
+    let colour = if rt.handles.is_empty() { 0 } else { rt.num_targets };
+    for (ty, count) in [(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, colour), (D3D12_DESCRIPTOR_HEAP_TYPE_DSV, rt.dsv.is_some() as u32)] {
+        if count == 0 {
+            continue;
+        }
+        let desc = D3D12_DESCRIPTOR_HEAP_DESC { Type: ty, NumDescriptors: count, Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE, NodeMask: 0 };
+        let Ok(heap) = dev.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&desc) else { return };
+        let base = heap.GetCPUDescriptorHandleForHeapStart().ptr;
+        let step = dev.GetDescriptorHandleIncrementSize(ty) as usize;
+        for i in 0..count as usize {
+            let src = match (ty == D3D12_DESCRIPTOR_HEAP_TYPE_DSV, rt.single != 0) {
+                (true, _) => rt.dsv.unwrap_or(0),
+                (false, true) => rt.handles[0] + i * step,
+                (false, false) => rt.handles[i],
+            };
+            dev.CopyDescriptorsSimple(1, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: base + i * step }, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: src }, ty);
+        }
+        if ty == D3D12_DESCRIPTOR_HEAP_TYPE_DSV {
+            copied.dsv = Some(base);
+        } else {
+            copied.handles = vec![base];
+            copied.single = 1;
+        }
+        heaps.push(heap);
+    }
+    b.render_targets = Some(copied);
+    b.render_target_copies = heaps;
+}
+
+/// Records the calls put off to the submit in `wrapper`'s recording (`defer`), each once its
+/// pipeline is built: the submit waits for them all first, until `deadline` at most
+/// (`pso_async::wait_for_submit`). A call whose pipeline is not built by then goes the way it
+/// went before calls were put off: skipped and counted.
+pub(super) unsafe fn record_deferred(wrapper: *mut c_void, deadline: Instant) {
+    if !super::pso_async::defer_to_submit() {
+        return;
+    }
+    let mut segs = Vec::new();
+    if !super::title_list::push_segments(wrapper, &mut segs) || segs.len() < 2 {
+        return;
+    }
+    let put_off: Vec<*mut c_void> = {
+        let g = LISTS.lock().unwrap();
+        let Some(m) = g.as_ref() else { return };
+        segs.into_iter().filter(|&seg| m.get(&(seg as usize)).is_some_and(|s| s.deferred.is_some())).collect()
+    };
+    for &seg in &put_off {
+        super::pso_async::wait_for_submit(super::bind::tracked_pso(seg), deadline);
+    }
+    let Some(&first) = put_off.first() else { return };
+    if let Some(reason) = removed_reason(first) {
+        if !REMOVAL_NOTED.swap(true, Ordering::AcqRel) {
+            crate::xlog_error!("D3D12.X: the device was removed ({reason:#x}) before a submit recorded the {} calls put off to it", put_off.len());
+        }
+    }
+    let t0 = Instant::now();
+    let (n, draws) = (put_off.len(), put_off.into_iter().filter(|&seg| record_put_off(seg)).count());
+    static SUBMITS: AtomicU64 = AtomicU64::new(0);
+    let k = SUBMITS.fetch_add(1, Ordering::Relaxed) + 1;
+    if k <= 8 || k.is_power_of_two() {
+        crate::xlog_info!("D3D12.X: a submit recorded the {n} calls put off to it ({draws} draws) in {} ms (#{k})", t0.elapsed().as_millis());
+    }
+}
+
+/// The last calls put off to a submit and recorded there (`record_put_off`), oldest first, and
+/// the one a submit is recording now: for the log when the device is removed
+/// (`put_off_at_removal`).
+static RECORDED: Mutex<std::collections::VecDeque<String>> = Mutex::new(std::collections::VecDeque::new());
+const RECORDED_KEPT: usize = 64;
+static RECORDING: Mutex<Option<String>> = Mutex::new(None);
+/// the device's removal was logged by a submit (`record_deferred`, `record_put_off`)
+static REMOVAL_NOTED: AtomicBool = AtomicBool::new(false);
+
+fn note_recorded(line: String) {
+    let mut kept = RECORDED.lock().unwrap_or_else(|e| e.into_inner());
+    if kept.len() == RECORDED_KEPT {
+        kept.pop_front();
+    }
+    kept.push_back(line);
+}
+
+/// The device was removed (`real::log_device_removed`): the calls put off to a submit and
+/// recorded there last, and the one being recorded then.
+pub(super) fn put_off_at_removal() {
+    if let Some(now) = RECORDING.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        crate::xlog_error!("D3D12.X: at the removal a submit was recording put-off {now}");
+    }
+    let kept = RECORDED.lock().unwrap_or_else(|e| e.into_inner());
+    if kept.is_empty() {
+        return;
+    }
+    crate::xlog_error!("D3D12.X: the last {} calls put off to a submit and recorded there, oldest first:", kept.len());
+    for line in kept.iter() {
+        crate::xlog_error!("D3D12.X:   {line}");
+    }
+}
+
+/// The device of `list` was removed: the reason GetDeviceRemovedReason gives.
+unsafe fn removed_reason(list: *mut c_void) -> Option<u32> {
+    device_of(list)?.GetDeviceRemovedReason().err().map(|e| e.code().0 as u32)
+}
+
+/// Why the call `what` put off to a segment of type `ty` must not be recorded there with the
+/// state it kept (None: it may): its pipeline (`compute`, None: not known) is not of its kind,
+/// no root signature of its kind is bound (`roots`: compute, graphics), its render targets
+/// were not copied when it was put off (the title may have written other views into their
+/// descriptors since), or an indexed draw has no index buffer.
+fn refuse_put_off(what: &Deferred, ty: D3D12_COMMAND_LIST_TYPE, compute: Option<bool>, roots: (bool, bool), b: &Bindings, index_buffer: Option<D3D12_INDEX_BUFFER_VIEW>) -> Option<&'static str> {
+    let draws = what.draws();
+    if draws && ty != D3D12_COMMAND_LIST_TYPE_DIRECT {
+        return Some("a draw on a list that is not a direct one");
+    }
+    if compute == Some(draws) {
+        return Some(if draws { "a draw with a compute pipeline" } else { "a dispatch with a graphics pipeline" });
+    }
+    if !(if draws { roots.1 } else { roots.0 }) {
+        return Some("no root signature of its kind bound");
+    }
+    if !draws {
+        return None;
+    }
+    if b.render_targets.as_ref().is_some_and(|rt| !rt.handles.is_empty() || rt.dsv.is_some()) && b.render_target_copies.is_empty() {
+        return Some("its render targets were not copied when it was put off");
+    }
+    if matches!(what, Deferred::DrawIndexed(..)) && index_buffer.is_none() {
+        return Some("an indexed draw with no index buffer");
+    }
+    None
+}
+
+/// The call put off to the segment `seg`, recorded in it on its companion allocator with the
+/// state its list had (`split`), unless that state is not fit for it (`refuse_put_off`):
+/// true when it draws. `seg` is reset here once, whatever becomes of the call: a call not
+/// recorded leaves it empty, never with the recording it had before (`put_off_segment`). What it was recorded with, and how, is kept for the log of a removal
+/// (`put_off_at_removal`), and the device is checked after it: the first call after which the
+/// device is found removed is logged.
+unsafe fn record_put_off(seg: *mut c_void) -> bool {
+    static ERR: AtomicU64 = AtomicU64::new(0);
+    let taken = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(seg as usize))).and_then(|s| {
+        Some((s.deferred.take()?, s.list_type?, s.allocator, s.bound_pso, s.depth_bias, s.index_buffer, s.depth_bounds, s.bindings.clone()))
+    });
+    let Some((what, ty, alloc, bound_pso, depth_bias, index_buffer, depth_bounds, bindings)) = taken else { return false };
+    let draws = what.draws();
+    let title_pso = super::bind::tracked_pso(seg);
+    let kind = super::pso_async::kind_of(title_pso);
+    let said = {
+        let (shaders, real) = kind.as_ref().map_or(("not built here", 0), |(_, what, real)| (if what.is_empty() { "shaders unknown" } else { what.as_str() }, *real));
+        let rt = bindings.render_targets.as_ref();
+        format!(
+            "{what:?} in frame {} on {} list segment {seg:p}: pipeline {title_pso:#x} (real {real:#x}, {shaders}), root signatures {:?}; {} render targets{}{}, {} viewports, {} scissors, topology {:?}, vertex buffers {:?}, index buffer {:x?}, {} descriptor heaps",
+            super::present::presents(),
+            match ty { D3D12_COMMAND_LIST_TYPE_DIRECT => "a direct", D3D12_COMMAND_LIST_TYPE_COMPUTE => "a compute", D3D12_COMMAND_LIST_TYPE_COPY => "a copy", _ => "another" },
+            super::bind::roots_bound(seg),
+            rt.map_or(0, |rt| rt.num_targets),
+            if rt.is_some_and(|rt| rt.dsv.is_some()) { " and depth" } else { "" },
+            if bindings.render_target_copies.is_empty() { "" } else { " (copied)" },
+            bindings.viewports.len(),
+            bindings.scissors.len(),
+            bindings.topology,
+            bindings.vertex_buffers.iter().map(|(slot, v)| (*slot, v.BufferLocation, v.SizeInBytes, v.StrideInBytes)).collect::<Vec<_>>(),
+            index_buffer.map(|v| (v.BufferLocation, v.SizeInBytes, v.Format.0)),
+            bindings.heaps.len(),
+        )
+    };
+    // (an allocator the title released meanwhile: its lists must not run)
+    let Some((dev, companion)) = device_of(seg).filter(|_| alloc != 0).and_then(|d| Some((companion(&d, alloc, ty)?, d)).map(|(c, d)| (d, c))) else {
+        note_recorded(format!("skipped (its allocator is gone): {said}"));
+        super::bind::deferred_skipped(draws);
+        return draws;
+    };
+    let own = companion.lock().unwrap();
+    let own_raw = own.as_raw() as usize;
+    let reset = |init: usize| {
+        let ext = *(seg as *const usize);
+        let hr = pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(seg, PC_RESET)(seg, own_raw, init);
+        real::preserve_vtable(seg, ext);
+        hr
+    };
+    let close = || {
+        super::gpu_timing::before_close(seg);
+        let ext = *(seg as *const usize);
+        let hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(seg, PC_CLOSE)(seg);
+        real::preserve_vtable(seg, ext);
+        hr
+    };
+    if let Some(why) = refuse_put_off(&what, ty, kind.as_ref().map(|k| k.0), super::bind::roots_bound(seg), &bindings, index_buffer) {
+        static REFUSED: AtomicU64 = AtomicU64::new(0);
+        let n = REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 16 || n.is_power_of_two() {
+            crate::xlog_warn!("D3D12.X: a call put off to the submit skipped there, {why} (#{n}): {said}");
+        }
+        if reset(0) >= 0 {
+            super::physical_directory::recordings::ended(seg as usize);
+            super::gpu_timing::opened(seg, 0);
+            super::material_gate_views::prepass::native_reset(seg as usize);
+            close();
+        }
+        note_recorded(format!("skipped ({why}): {said}"));
+        super::bind::deferred_skipped(draws);
+        return draws;
+    }
+    // (a draw goes on with the pipeline its list had bound; a dispatch binds its own)
+    let init_pso = if draws && ty != D3D12_COMMAND_LIST_TYPE_COPY { super::pso_async::resolve(title_pso) } else { 0 };
+    super::shader_code::drawn_on(own_raw, init_pso);
+    let hr = reset(init_pso);
+    if hr < 0 {
+        warn(&ERR, "put-off call", format_args!("Reset failed ({hr:#x})"));
+        note_recorded(format!("skipped (Reset failed, {hr:#x}): {said}"));
+        super::bind::deferred_skipped(draws);
+        return draws;
+    }
+    *RECORDING.lock().unwrap_or_else(|e| e.into_inner()) = Some(said.clone());
+    super::physical_directory::recordings::ended(seg as usize);
+    super::gpu_timing::opened(seg, init_pso);
+    super::material_gate_views::prepass::native_reset(seg as usize);
+    restore_bindings(seg, &bindings, ty);
+    if ty == D3D12_COMMAND_LIST_TYPE_DIRECT {
+        restore_direct(seg, dev.as_raw() as usize, bound_pso, depth_bias, index_buffer, depth_bounds);
+    }
+    match what {
+        Deferred::Dispatch(x, y, z, flags) => super::bind::dispatch_flags(seg, x, y, z, flags),
+        Deferred::Indirect(sig, max, args, args_off, count_buf, count_off) => super::bind::execute_indirect(seg, sig, max, args, args_off, count_buf, count_off),
+        Deferred::Draw(vertices, instances, first_vertex, first_instance) => super::bind::draw_instanced(seg, vertices, instances, first_vertex, first_instance),
+        Deferred::DrawIndexed(indices, instances, first_index, base_vertex, first_instance) => super::bind::draw_indexed_instanced(seg, indices, instances, first_index, base_vertex, first_instance),
+        Deferred::DrawIndexedX(va, format, count) => draw_indexed_x(seg, va, format, count, 0),
+    }
+    let hr = close();
+    *RECORDING.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    if hr < 0 {
+        // a list whose Close failed must not run: an empty one instead
+        warn(&ERR, "put-off call", format_args!("Close failed ({hr:#x}); left out"));
+        super::bind::deferred_skipped(draws);
+        if reset(0) >= 0 {
+            close();
+        }
+    }
+    note_recorded(if hr < 0 { format!("left out (Close failed, {hr:#x}): {said}") } else { format!("recorded: {said}") });
+    if let Some(reason) = removed_reason(seg) {
+        if !REMOVAL_NOTED.swap(true, Ordering::AcqRel) {
+            crate::xlog_error!("D3D12.X: the device was found removed ({reason:#x}) right after a submit recorded put-off {said}");
+        }
+    }
+    draws
 }
 
 /// Record a `Wait32BitValueX` or `Wait64BitValueX` memory wait on `list`.
@@ -3113,8 +3615,8 @@ pub(super) unsafe extern "system" fn set_depth_bounds_x(this: *mut c_void, min: 
 }
 
 /// command list #78 DispatchX(x, y, z, flags)
-pub(super) unsafe extern "system" fn dispatch_x(this: *mut c_void, x: u32, y: u32, z: u32, _flags: u32) {
-    super::bind::dispatch(this, x, y, z);
+pub(super) unsafe extern "system" fn dispatch_x(this: *mut c_void, x: u32, y: u32, z: u32, flags: u32) {
+    super::bind::dispatch_flags(this, x, y, z, Some(flags));
 }
 
 /// command list #146 console compute/UAV barrier (used by `XboxBvhBuilder.dll` between BVH
@@ -3497,6 +3999,9 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     if close_hr < 0 {
         return warn(&ERR, "KickoffX", format_args!("Close failed ({close_hr:#x})"));
     }
+    if let Some(wrapper) = super::title_list::wrapper_of(this) {
+        record_deferred(wrapper, super::pso_async::submit_deadline());
+    }
 
     let q_raw = super::single::kickoff_queue(this as usize, queue as *mut c_void);
     super::title_textures::refresh(q_raw);
@@ -3597,6 +4102,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
 
     let ext_closed = *(target as *const usize);
     let init_pso = super::pso_async::resolve_for_bind(bound_pso);
+    super::shader_code::taken_on(alloc, init_pso);
     let reset_hr = pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(target, PC_RESET)(target, alloc, init_pso);
     real::preserve_vtable(target, ext_closed);
     if reset_hr < 0 {
@@ -4159,6 +4665,9 @@ pub(super) unsafe extern "system" fn draw_indexed_x(this: *mut c_void, va: u64, 
     if count == 0 {
         return;
     }
+    if super::bind::put_off(this, Deferred::DrawIndexedX(va, format, count)) {
+        return;
+    }
     let immediate = D3D12_INDEX_BUFFER_VIEW { BufferLocation: va, SizeInBytes: count.saturating_mul(stride), Format: format };
     let ia = ia_live::prepare(this, true, Some(immediate));
     let Some(list) = super::bind::prepare_indexed_draw(this, count, 1, 0, 0, 0) else {
@@ -4200,6 +4709,8 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
     // transfer its allocations until the driver accepts the new recording.
     let ext = *(this as *const usize);
     let resolved = super::pso_async::resolve_for_bind(pso);
+    super::shader_code::taken_on(alloc, resolved);
+    super::shader_code::bundle_takes(this as usize, resolved);
     let hr = pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(this, PC_RESET)(this, alloc, resolved);
     real::preserve_vtable(this, ext);
     if hr < 0 {
@@ -4488,7 +4999,7 @@ pub(super) unsafe extern "system" fn copy_texture_region_flags_x(this: *mut c_vo
     if let Some(d) = dst.as_ref() {
         let r: usize = transmute_copy(&d.pResource);
         super::present::note_use(r, super::present::USE_COPY);
-        if super::present::writer_trace_active() && super::present::is_writer_target(r) {
+        if super::target_dump::recording() || (super::present::writer_trace_active() && super::present::is_writer_target(r)) {
             let source = src.as_ref().map_or(0, |s| transmute_copy::<_, usize>(&s.pResource));
             trace_plane_transfer(this, r, source, "texture copy");
         }
@@ -4649,6 +5160,7 @@ const PC_RESOLVE_SUBRESOURCE: usize = 19;
 const PC_RESOLVE_SUBRESOURCE_REGION: usize = 64;
 
 fn trace_plane_transfer(list: *mut c_void, dst: usize, src: usize, op: &'static str) {
+    super::target_dump::record_write(list as usize, dst, op);
     if super::present::writer_trace_active() && super::present::is_writer_target(dst) {
         let backing = super::residency::describe_backing(src).unwrap_or_else(|| "untracked".into());
         super::present::record_plane_write(list as usize, dst, op, 0, vec![format!("source {src:#x} {backing}")]);
@@ -4831,6 +5343,115 @@ pub(super) unsafe extern "system" fn resolve_query_data_x(this: *mut c_void, hea
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn a_gpu_wait_does_not_expire_while_the_title_is_held_for_a_build() {
+        let old = Instant::now() - gpu_wait_watchdog_timeout() * 2;
+        let mut aw = ArmedGpuWait { val: 1, waiting_queue: 0, waiting_queue_ty: 0, wait_seq: 1, armed_at: old, after_write64: false };
+        assert!(!wait_expired(&mut aw, true));
+        assert!(!wait_expired(&mut aw, false), "its clock starts again when the hold ends");
+        aw.armed_at = old;
+        assert!(wait_expired(&mut aw, false));
+    }
+
+    /// A dispatch whose pipeline is still being built gets a segment of its own and the list goes
+    /// on without waiting; the submit waits for the build and records it there. Past the
+    /// per-recording budget a dispatch is skipped as before; so is every one with
+    /// `XCL_DEFER_TO_SUBMIT=0`.
+    #[test]
+    fn a_dispatch_with_a_pipeline_still_building_waits_at_the_submit() {
+        use super::super::{bind, pso_async, title_list};
+        use std::time::{Duration, Instant};
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let warp = CreateDXGIFactory1::<IDXGIFactory4>().and_then(|f| f.EnumWarpAdapter::<IDXGIAdapter>());
+                if warp.and_then(|w| D3D12CreateDevice(&w, D3D_FEATURE_LEVEL_11_0, &mut dev)).is_err() {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                }
+            }
+            let dev = dev.unwrap();
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COMPUTE, ..Default::default() }).unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).unwrap();
+            let raw: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &alloc, None).unwrap();
+            let done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+
+            let standin = 0x7E57_D101usize;
+            static BUILD: AtomicBool = AtomicBool::new(false);
+            pso_async::submit(
+                standin,
+                true,
+                Box::new(|| {
+                    let t = Instant::now();
+                    while !BUILD.load(Ordering::Acquire) && t.elapsed() < Duration::from_secs(10) {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    0
+                }),
+            );
+            let pc0 = raw.into_raw();
+            real::adopt(pc0, real::Kind::CommandList);
+            on_create(pc0, alloc.as_raw() as usize, 0, D3D12_COMMAND_LIST_TYPE_COMPUTE);
+            bind::reset(pc0, alloc.as_raw() as usize, standin);
+            let wrap = title_list::wrap(pc0);
+            pso_async::SKIP_UNTIL_BUILT.with(|s| s.set(true));
+
+            // off: skipped as before, in the list
+            pso_async::set_defer_for_test(Some(false));
+            let skipped = bind::counts_snapshot()[4];
+            bind::dispatch(pc0, 1, 1, 1);
+            let mut segs = Vec::new();
+            assert!(title_list::push_segments(wrap, &mut segs));
+            assert_eq!(segs.len(), 1, "put off with XCL_DEFER_TO_SUBMIT=0");
+            assert!(bind::counts_snapshot()[4] > skipped, "not skipped with XCL_DEFER_TO_SUBMIT=0");
+
+            pso_async::set_defer_for_test(Some(true));
+            const DISPATCHES: usize = 34;
+            for n in 1..=DISPATCHES {
+                let t = Instant::now();
+                bind::dispatch(*segs.last().unwrap(), 1, 1, 1);
+                assert!(t.elapsed() < Duration::from_millis(700), "dispatch {n} waited for the build ({:?})", t.elapsed());
+                segs.clear();
+                assert!(title_list::push_segments(wrap, &mut segs));
+            }
+            assert_eq!(segs.len(), 1 + 2 * 32, "the list before each put-off dispatch, the dispatch, the list after it; 32 a recording");
+            assert!(pso_async::is_pending(standin));
+
+            let close_fn: unsafe extern "system" fn(*mut c_void) -> i32 = std::mem::transmute(*(*(wrap as *const *const usize)).add(9));
+            assert_eq!(close_fn(wrap), 0);
+            assert!(pso_async::is_pending(standin), "Close waited for the build");
+
+            let skipped = bind::counts_snapshot()[4];
+            let build = std::thread::spawn(|| {
+                std::thread::sleep(Duration::from_millis(300));
+                BUILD.store(true, Ordering::Release);
+            });
+            record_deferred(wrap, Instant::now() + Duration::from_secs(20));
+            pso_async::SKIP_UNTIL_BUILT.with(|s| s.set(false));
+            pso_async::set_defer_for_test(None);
+            assert!(!pso_async::is_pending(standin), "the submit waits for the build");
+            assert!(bind::counts_snapshot()[4] >= skipped + 32, "the dispatches of a build that failed are skipped, at the submit");
+            build.join().unwrap();
+
+            type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
+            let exec: ExecFn = std::mem::transmute(*(*(queue.as_raw() as *const *const usize)).add(PC_QUEUE_EXECUTE_COMMAND_LISTS));
+            exec(queue.as_raw(), segs.len() as u32, segs.as_ptr());
+            queue.Signal(&done, 1).unwrap();
+            let t = Instant::now();
+            while done.GetCompletedValue() < 1 && t.elapsed() < Duration::from_secs(5) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(done.GetCompletedValue(), 1, "the split list runs");
+
+            let rel_fn: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(wrap as *const *const usize)).add(2));
+            assert_eq!(rel_fn(wrap), 0);
+            let _ = pso_async::released(standin);
+        }
+    }
 
     /// ClearUnorderedAccessView* handles: two console slots → their PC UAVs, two PC handles as
     /// they are, anything else not usable.

@@ -52,6 +52,8 @@ pub struct Uma {
     /// cannot take it – a title that commits all of unified memory at start (Unicorn
     /// Overlord: 2046 of 2048 MB) left no room for draw arguments, and draws were skipped.
     pool: Mutex<(usize, usize, Vec<usize>)>,
+    /// windows remade as driver heaps (`hle::d3d12x::uma_driver`), one bit each
+    driver: std::sync::atomic::AtomicU32,
 }
 
 /// bytes of XCL's arena pool (`Uma::new`)
@@ -81,6 +83,25 @@ fn note_event(at: usize, len: usize, back: bool, by: &'static std::panic::Locati
         h.pop_front();
     }
     h.push_back(Event { at, len, t: crate::log::uptime() as f32, by, back });
+}
+
+/// (diagnostics, `memdiag`) The block history: (events, bytes of one, bytes it holds).
+pub fn diag_history() -> (usize, usize, usize) {
+    let h = HISTORY.lock().unwrap_or_else(|e| e.into_inner());
+    (h.len(), std::mem::size_of::<Event>(), h.capacity() * std::mem::size_of::<Event>())
+}
+
+/// (diagnostics, `memdiag`) The blocks handed out in the committed windows, by address: where,
+/// how many bytes, and the XCL code that asked (None: no longer in the history; the title's
+/// allocations come by `kernelx`).
+pub fn diag_blocks() -> Vec<(usize, usize, Option<&'static std::panic::Location<'static>>)> {
+    let Some(u) = made() else { return Vec::new() };
+    let blocks: Vec<(usize, usize)> = u.inner.lock().unwrap_or_else(|e| e.into_inner()).used.iter().map(|(&at, &len)| (u.base + at, len)).collect();
+    let mut by = std::collections::HashMap::new();
+    for e in HISTORY.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|e| !e.back) {
+        by.insert(e.at, e.by);
+    }
+    blocks.into_iter().map(|(at, len)| (at, len, by.get(&at).copied())).collect()
 }
 
 /// (diagnostics, `alias::report`) Whose the memory at `p` in a committed window is and was:
@@ -155,6 +176,9 @@ struct Inner {
 struct SparseRanges {
     ranges: (BTreeMap<usize, usize>, BTreeMap<usize, usize>),
     used_bytes: usize,
+    /// reservations (their starts) whose tiles get video memory when it is first needed, not
+    /// when they are committed (`sparse_set_lazy`, `d3d12x::sparse`)
+    lazy: BTreeSet<usize>,
 }
 
 impl SparseRanges {
@@ -163,6 +187,58 @@ impl SparseRanges {
         self.used_bytes += size;
         Some(at)
     }
+
+    fn take_top(&mut self, lo: usize, hi: usize, size: usize, align: usize) -> Option<usize> {
+        let at = take_sparse_top(&mut self.ranges, lo, hi, size, align)?;
+        self.used_bytes += size;
+        Some(at)
+    }
+}
+
+/// `take_sparse_in` from the other end: the highest `align`-aligned block of `size` bytes (a
+/// window at most, and never across two) that `free` has within `[lo_bound, hi_bound)`. What is
+/// taken from the top leaves the low addresses in one piece for a large reservation.
+fn take_sparse_top(g: &mut (BTreeMap<usize, usize>, BTreeMap<usize, usize>), lo_bound: usize, hi_bound: usize, size: usize, align: usize) -> Option<usize> {
+    if lo_bound >= hi_bound || size == 0 || size > WINDOW {
+        return None;
+    }
+    let last_fit = |(&o, &l): (&usize, &usize)| {
+        let lo = o.max(lo_bound);
+        let hi = o.saturating_add(l).min(hi_bound);
+        let mut at = hi.checked_sub(size)? & !(align - 1);
+        while at >= lo {
+            if at / WINDOW == (at + size - 1) / WINDOW {
+                return Some((o, l, at));
+            }
+            at = ((at + size - 1) / WINDOW * WINDOW).checked_sub(size)? & !(align - 1);
+        }
+        None
+    };
+    let (start, len, at) = g.0.range(..hi_bound).rev().take_while(|&(&o, &l)| o.saturating_add(l) > lo_bound).find_map(last_fit)?;
+    g.0.remove(&start);
+    if at > start {
+        g.0.insert(start, at - start);
+    }
+    if at + size < start + len {
+        g.0.insert(at + size, start + len - (at + size));
+    }
+    g.1.insert(at, size);
+    Some(at)
+}
+
+/// The parts of `[a, b)` that lie in the reservations of `reserved` (start → bytes) whose start
+/// is in `lazy`, as (start, end) by address.
+fn lazy_parts(lazy: &BTreeSet<usize>, reserved: &BTreeMap<usize, usize>, a: usize, b: usize) -> Vec<(usize, usize)> {
+    if a >= b {
+        return Vec::new();
+    }
+    let from = lazy.range(..=a).next_back().copied().unwrap_or(a);
+    lazy.range(from..b)
+        .filter_map(|&start| {
+            let (lo, hi) = (start.max(a), start.saturating_add(*reserved.get(&start)?).min(b));
+            (lo < hi).then_some((lo, hi))
+        })
+        .collect()
 }
 
 /// Carve an `align`-aligned block of `size` bytes from `free` within `[lo_bound, hi_bound)`.
@@ -302,6 +378,7 @@ impl Uma {
                 inner: Mutex::new(inner),
                 sparse_free: Mutex::new(sparse_free),
                 pool: Mutex::new((0, 0, Vec::new())),
+                driver: Default::default(),
             };
             u.reserve_pool(POOL);
             return Some(u);
@@ -372,6 +449,16 @@ impl Uma {
     /// Whether `p` is in a committed window.
     pub fn is_committed(&self, p: usize) -> bool {
         self.window_of(p).is_some_and(|k| self.is_committed_window(k))
+    }
+
+    /// Window `k` is a driver heap now (`hle::d3d12x::uma_driver`).
+    pub fn set_driver_window(&self, k: usize) {
+        self.driver.fetch_or(1 << k, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether window `k` is a driver heap (`set_driver_window`).
+    pub fn is_driver_window(&self, k: usize) -> bool {
+        k < 32 && self.driver.load(std::sync::atomic::Ordering::Relaxed) & (1 << k) != 0
     }
 
     /// Whether `[p, p + len)` lies in a committed coherent window – memory that is committed and
@@ -446,10 +533,43 @@ impl Uma {
         }
     }
 
+    /// `sparse_alloc` from the other end, for the GPU heaps of the title's that the coherent
+    /// window did not take (`d3d12x::sparse::alloc_diverted`): the highest free block of windows
+    /// 1+. Those heaps came from window 3 and need nothing of window 0, which descriptor heaps
+    /// and 32-bit addresses do; and taken from the top they leave the low addresses in one piece
+    /// for a large reservation (`desc_range`). Without room there, as `sparse_alloc`.
+    pub fn sparse_alloc_top(&self, size: usize, align: usize) -> Option<(usize, usize)> {
+        if !self.has_sparse() {
+            return None;
+        }
+        let rounded = size.max(1).checked_next_multiple_of(GRAIN)?;
+        let pow = align.max(GRAIN).checked_next_power_of_two()?;
+        let above_0 = (self.base + WINDOW).max(self.title_sparse_start());
+        let top = self.sparse_free.lock().unwrap().take_top(above_0, self.base + MAX_WINDOWS * WINDOW, rounded, pow);
+        top.map(|at| (at, rounded)).or_else(|| self.sparse_alloc(size, align))
+    }
+
+    /// The sparse reservation starting at `p` gets video memory for its tiles when it is first
+    /// needed (`d3d12x::sparse`: a lazy heap), until it is released. False: none starts there.
+    pub fn sparse_set_lazy(&self, p: usize) -> bool {
+        let mut g = self.sparse_free.lock().unwrap();
+        g.ranges.1.contains_key(&p) && {
+            g.lazy.insert(p);
+            true
+        }
+    }
+
+    /// The parts of `[a, b)` in reservations marked by `sparse_set_lazy`: (start, end), by address.
+    pub fn sparse_lazy_in(&self, a: usize, b: usize) -> Vec<(usize, usize)> {
+        let g = self.sparse_free.lock().unwrap();
+        lazy_parts(&g.lazy, &g.ranges.1, a, b)
+    }
+
     /// The bytes of the sparse reservation starting at `p` (it is gone after this).
     pub fn sparse_release(&self, p: usize) -> Option<usize> {
         let mut g = self.sparse_free.lock().unwrap();
         let size = g.ranges.1.remove(&p)?;
+        g.lazy.remove(&p);
         g.used_bytes -= size;
         let free = &mut g.ranges.0;
         let (mut start, mut len) = (p, size);
@@ -510,6 +630,7 @@ impl Uma {
                     inner: Mutex::new(inner),
                     sparse_free: Mutex::new(Default::default()),
                     pool: Mutex::new((0, 0, Vec::new())),
+                    driver: Default::default(),
                 });
             }
             for p in got {
@@ -850,17 +971,42 @@ const COHERENT_ASKED: &str = "uma_coherent.txt";
 /// game's most in use differed by 27 MB between three runs and grew by 53 MB in the last 470 s
 /// of one; 512 MB of room were 539 MB resident and unused. 256 MB leave the title's largest
 /// allocation its 96 MB of XCL's own (`kernelx`) and 160 MB more than any earlier run took.
+/// `XCL_COHERENT_HEADROOM_MB` chooses another (`coherent_headroom`).
 const COHERENT_HEADROOM: usize = 256 << 20;
+
+/// `XCL_COHERENT_HEADROOM_MB` (`v`: its value) in bytes, at most a window; `COHERENT_HEADROOM`
+/// when it is not set or not a number.
+fn headroom_bytes(v: Option<&str>) -> usize {
+    v.and_then(|v| v.trim().parse::<usize>().ok()).map_or(COHERENT_HEADROOM, |mb| mb.saturating_mul(1 << 20).min(MAX_SIZE))
+}
+
+/// The room the coherent window is made with past the most an earlier run used:
+/// `COHERENT_HEADROOM`, or what `XCL_COHERENT_HEADROOM_MB` gives (logged once when it differs).
+fn coherent_headroom() -> usize {
+    static BYTES: OnceLock<usize> = OnceLock::new();
+    *BYTES.get_or_init(|| {
+        let bytes = headroom_bytes(std::env::var("XCL_COHERENT_HEADROOM_MB").ok().as_deref());
+        if bytes != COHERENT_HEADROOM {
+            crate::xlog_info!(
+                "UMA: {} MB of room in the coherent window past the most an earlier run used (XCL_COHERENT_HEADROOM_MB; {} MB when it is not set)",
+                bytes >> 20,
+                COHERENT_HEADROOM >> 20
+            );
+        }
+        bytes
+    })
+}
 
 fn coherent_read(name: &str) -> Option<usize> {
     std::fs::read_to_string(coherent_file(name)).ok().and_then(|s| s.trim().parse::<usize>().ok()).filter(|&b| b > 0)
 }
 
-/// Bytes of the coherent window for the most an earlier run used of it at once (`peak`), else
-/// for the sum of what the title asked for in one (`asked`), else XCL's own share.
-fn coherent_bytes(peak: Option<usize>, asked: Option<usize>) -> usize {
+/// Bytes of the coherent window for the most an earlier run used of it at once (`peak`) and
+/// `headroom`, else for the sum of what the title asked for in one (`asked`), else XCL's own
+/// share.
+fn coherent_bytes(peak: Option<usize>, asked: Option<usize>, headroom: usize) -> usize {
     match (peak, asked) {
-        (Some(peak), _) => peak.saturating_add(COHERENT_HEADROOM).clamp(RUNTIME_COMMITTED_CAP, MAX_SIZE),
+        (Some(peak), _) => peak.saturating_add(headroom).clamp(RUNTIME_COMMITTED_CAP, MAX_SIZE),
         (None, Some(asked)) => asked.saturating_add(RUNTIME_COMMITTED_CAP).min(MAX_SIZE),
         (None, None) => RUNTIME_COMMITTED_CAP,
     }
@@ -884,7 +1030,7 @@ pub fn coherent_hint() -> usize {
         );
         return RUNTIME_COMMITTED_CAP;
     }
-    coherent_bytes(peak, asked)
+    coherent_bytes(peak, asked, coherent_headroom())
 }
 
 /// Commit free before the title starts for its GPU heaps to go to the coherent window.
@@ -917,7 +1063,7 @@ pub fn note_coherent_need(bytes: usize) {
         }
         let _ = std::fs::write(&f, bytes.to_string());
         if bytes >> 28 != before >> 28 {
-            crate::xlog_info!("UMA: {} MB in use in the coherent window at once (a window of {} MB from the next run)", bytes >> 20, coherent_bytes(Some(bytes), None) >> 20);
+            crate::xlog_info!("UMA: {} MB in use in the coherent window at once (a window of {} MB from the next run)", bytes >> 20, coherent_bytes(Some(bytes), None, coherent_headroom()) >> 20);
         }
     }
 }
@@ -967,14 +1113,34 @@ mod tests {
     fn the_coherent_window_is_sized_by_peak_use() {
         const MIB: usize = 1 << 20;
         // a title that asked for 4582 MB in all and held 3033 MB at once
-        assert_eq!(coherent_bytes(None, Some(4582 * MIB)), MAX_SIZE);
-        assert_eq!(coherent_bytes(Some(3033 * MIB), Some(4582 * MIB)), 3289 * MIB);
+        assert_eq!(coherent_bytes(None, Some(4582 * MIB), COHERENT_HEADROOM), MAX_SIZE);
+        assert_eq!(coherent_bytes(Some(3033 * MIB), Some(4582 * MIB), COHERENT_HEADROOM), 3289 * MIB);
         // XCL's own share at least, a window at most
-        assert_eq!(coherent_bytes(None, None), RUNTIME_COMMITTED_CAP);
-        assert_eq!(coherent_bytes(Some(64 * MIB), None), RUNTIME_COMMITTED_CAP);
-        assert_eq!(coherent_bytes(Some(400 * MIB), None), 656 * MIB);
-        assert_eq!(coherent_bytes(Some(3900 * MIB), None), MAX_SIZE);
-        assert_eq!(coherent_bytes(Some(usize::MAX), Some(1)), MAX_SIZE);
+        assert_eq!(coherent_bytes(None, None, COHERENT_HEADROOM), RUNTIME_COMMITTED_CAP);
+        assert_eq!(coherent_bytes(Some(64 * MIB), None, COHERENT_HEADROOM), RUNTIME_COMMITTED_CAP);
+        assert_eq!(coherent_bytes(Some(400 * MIB), None, COHERENT_HEADROOM), 656 * MIB);
+        assert_eq!(coherent_bytes(Some(3900 * MIB), None, COHERENT_HEADROOM), MAX_SIZE);
+        assert_eq!(coherent_bytes(Some(usize::MAX), Some(1), COHERENT_HEADROOM), MAX_SIZE);
+    }
+
+    /// `XCL_COHERENT_HEADROOM_MB` is the room past an earlier run's peak; the window stays XCL's
+    /// own share at least and a window at most, and what is not a number changes nothing.
+    #[test]
+    fn the_coherent_headroom_is_settable() {
+        const MIB: usize = 1 << 20;
+        assert_eq!(headroom_bytes(None), COHERENT_HEADROOM);
+        assert_eq!(headroom_bytes(Some("512")), 512 * MIB);
+        assert_eq!(headroom_bytes(Some(" 64 ")), 64 * MIB);
+        assert_eq!(headroom_bytes(Some("0")), 0);
+        assert_eq!(headroom_bytes(Some("-1")), COHERENT_HEADROOM);
+        assert_eq!(headroom_bytes(Some("many")), COHERENT_HEADROOM);
+        assert_eq!(headroom_bytes(Some("99999999999999999999")), COHERENT_HEADROOM);
+        assert_eq!(headroom_bytes(Some("17592186044416")), MAX_SIZE);
+        assert_eq!(coherent_bytes(Some(3033 * MIB), None, headroom_bytes(Some("512"))), 3545 * MIB);
+        assert_eq!(coherent_bytes(Some(3033 * MIB), None, headroom_bytes(Some("0"))), 3033 * MIB);
+        assert_eq!(coherent_bytes(Some(64 * MIB), None, headroom_bytes(Some("0"))), RUNTIME_COMMITTED_CAP);
+        assert_eq!(coherent_bytes(Some(3900 * MIB), None, headroom_bytes(Some("4096"))), MAX_SIZE);
+        assert_eq!(coherent_bytes(None, Some(1000 * MIB), headroom_bytes(Some("0"))), 1512 * MIB);
     }
 
     /// The window is non-local video memory in full; before D3D12 has opened it (and without
@@ -1043,6 +1209,69 @@ mod tests {
         assert_eq!(take_sparse_in(&mut cross, lo, hi, 2 * GRAIN, GRAIN, false), Some(lo));
     }
     use super::*;
+
+    /// A heap taken from the top is the highest block that fits, aligned, inside one window and
+    /// inside the bounds; the low addresses stay in one piece.
+    #[test]
+    fn sparse_top_fit_takes_the_highest_block_of_one_window() {
+        let (lo, hi) = (WINDOW, 3 * WINDOW);
+        let free = BTreeMap::from([(GRAIN, 3 * WINDOW - GRAIN)]);
+        let mut g = (free.clone(), BTreeMap::new());
+        assert_eq!(take_sparse_top(&mut g, lo, hi, 16 * GRAIN, GRAIN), Some(hi - 16 * GRAIN));
+        assert_eq!(take_sparse_top(&mut g, lo, hi, 3 * GRAIN, 32 * GRAIN), Some(hi - 32 * GRAIN));
+        assert_eq!(g.0, BTreeMap::from([(GRAIN, hi - 32 * GRAIN - GRAIN), (hi - 29 * GRAIN, 13 * GRAIN)]));
+        assert_eq!(g.1, BTreeMap::from([(hi - 32 * GRAIN, 3 * GRAIN), (hi - 16 * GRAIN, 16 * GRAIN)]));
+        assert_eq!(take_sparse_top(&mut g, lo, hi, 13 * GRAIN, GRAIN), Some(hi - 29 * GRAIN));
+        assert_eq!(take_sparse_top(&mut g, lo, hi, WINDOW - 32 * GRAIN, GRAIN), Some(2 * WINDOW));
+        assert_eq!(take_sparse_top(&mut g, lo, hi, WINDOW, GRAIN), Some(WINDOW));
+        assert_eq!(take_sparse_top(&mut g, lo, hi, GRAIN, GRAIN), None, "windows 1 and 2 are full");
+        assert_eq!(g.0, BTreeMap::from([(GRAIN, WINDOW - GRAIN)]), "window 0 was not touched");
+        let mut g = (free, BTreeMap::new());
+        assert_eq!(take_sparse_top(&mut g, lo, hi, WINDOW + GRAIN, GRAIN), None, "more than a window");
+        assert_eq!(take_sparse_top(&mut g, lo, hi, 0, GRAIN), None);
+        assert_eq!(take_sparse_top(&mut g, hi, lo, GRAIN, GRAIN), None);
+        assert_eq!(take_sparse_top(&mut g, lo, lo + GRAIN / 2, GRAIN, GRAIN), None);
+    }
+
+    /// A block that would lie across two windows moves below the boundary; a free range that
+    /// reaches past the bounds is used only inside them.
+    #[test]
+    fn sparse_top_fit_never_straddles_a_window() {
+        let mut g = (BTreeMap::from([(WINDOW + GRAIN, WINDOW + 2 * GRAIN)]), BTreeMap::new());
+        assert_eq!(take_sparse_top(&mut g, WINDOW, 3 * WINDOW, 4 * GRAIN, GRAIN), Some(2 * WINDOW - 4 * GRAIN));
+        assert_eq!(g.0, BTreeMap::from([(WINDOW + GRAIN, WINDOW - 5 * GRAIN), (2 * WINDOW, 3 * GRAIN)]));
+        assert_eq!(take_sparse_top(&mut g, WINDOW, 3 * WINDOW, 3 * GRAIN, 2 * GRAIN), Some(2 * WINDOW));
+        assert_eq!(take_sparse_top(&mut g, WINDOW, 3 * WINDOW, 3 * GRAIN, 2 * GRAIN), Some(2 * WINDOW - 8 * GRAIN));
+        let mut g = (BTreeMap::from([(GRAIN, 3 * WINDOW - GRAIN)]), BTreeMap::new());
+        assert_eq!(take_sparse_top(&mut g, WINDOW + GRAIN, 2 * WINDOW + GRAIN, 2 * GRAIN, GRAIN), Some(2 * WINDOW - 2 * GRAIN));
+        assert_eq!(take_sparse_top(&mut g, WINDOW + GRAIN, WINDOW + 3 * GRAIN, 2 * GRAIN, GRAIN), Some(WINDOW + GRAIN));
+        assert_eq!(take_sparse_top(&mut g, WINDOW + GRAIN, WINDOW + 3 * GRAIN, GRAIN, GRAIN), None);
+        let mut g = (BTreeMap::from([(WINDOW - GRAIN, 2 * GRAIN), (2 * WINDOW - GRAIN, 2 * GRAIN)]), BTreeMap::new());
+        assert_eq!(take_sparse_top(&mut g, WINDOW, 3 * WINDOW, 2 * GRAIN, GRAIN), None, "each free range lies across a boundary");
+        assert_eq!(take_sparse_top(&mut g, WINDOW, 3 * WINDOW, GRAIN, GRAIN), Some(2 * WINDOW));
+        assert_eq!(take_sparse_top(&mut g, WINDOW, 3 * WINDOW, GRAIN, GRAIN), Some(2 * WINDOW - GRAIN));
+        assert_eq!(take_sparse_top(&mut g, WINDOW, 3 * WINDOW, GRAIN, GRAIN), Some(WINDOW));
+        assert_eq!(take_sparse_top(&mut g, WINDOW, 3 * WINDOW, GRAIN, GRAIN), None, "what is left is below the bounds");
+    }
+
+    /// A range is lazy where it lies in a reservation that was marked, and nowhere else.
+    #[test]
+    fn lazy_parts_are_the_marked_reservations_in_a_range() {
+        let t = GRAIN;
+        let reserved = BTreeMap::from([(4 * t, 4 * t), (8 * t, 2 * t), (10 * t, 6 * t), (32 * t, 8 * t)]);
+        let lazy = BTreeSet::from([4 * t, 10 * t, 32 * t]);
+        assert_eq!(lazy_parts(&lazy, &reserved, 0, 64 * t), vec![(4 * t, 8 * t), (10 * t, 16 * t), (32 * t, 40 * t)]);
+        assert_eq!(lazy_parts(&lazy, &reserved, 5 * t, 11 * t), vec![(5 * t, 8 * t), (10 * t, 11 * t)]);
+        assert_eq!(lazy_parts(&lazy, &reserved, 6 * t + 0x1000, 6 * t + 0x3000), vec![(6 * t + 0x1000, 6 * t + 0x3000)]);
+        assert!(lazy_parts(&lazy, &reserved, 8 * t, 10 * t).is_empty(), "a reservation that is not marked");
+        assert!(lazy_parts(&lazy, &reserved, 16 * t, 32 * t).is_empty(), "between reservations");
+        assert!(lazy_parts(&lazy, &reserved, 0, 4 * t).is_empty());
+        assert!(lazy_parts(&lazy, &reserved, 40 * t, 48 * t).is_empty());
+        assert!(lazy_parts(&lazy, &reserved, 6 * t, 6 * t).is_empty());
+        assert!(lazy_parts(&lazy, &reserved, 7 * t, 5 * t).is_empty());
+        assert!(lazy_parts(&BTreeSet::new(), &reserved, 0, 64 * t).is_empty());
+        assert!(lazy_parts(&BTreeSet::from([20 * t]), &reserved, 0, 64 * t).is_empty(), "a mark without its reservation");
+    }
 
     #[test]
     fn committed_usage_counts_pool_and_window_allocations() {

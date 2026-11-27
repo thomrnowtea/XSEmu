@@ -29,6 +29,11 @@
 //!   has them. This is the one patch that writes the title's memory (`Image`). General fix: no
 //!   frame takes over 30 s (a bind's promotion off the backlog lock, admission that does not
 //!   starve background builds).
+//! - Stand-in indirect light (`XCL_GTA6_AMBIENT`, off unless it holds a level; `title_gta6_ambient`
+//!   has the patch and its other switches): with ray tracing off the title's screen probes leave
+//!   indoor surfaces black, and the diffuse light is raised to an estimate taken from the frame
+//!   right after the title's program that resolves it. General fix: inline ray tracing the driver
+//!   can compile in bounded memory, then ray tracing on.
 //!
 //! The ray-hit resolve and ray activation names and the early shader list come from codec_d's
 //! cool_fox (the CGBJ re-upload), commit f4b48ad766ddbec1a1867022cd42f7645b0dd55e: crates/
@@ -45,29 +50,52 @@ use std::sync::OnceLock;
 const TITLE_ID: &str = "7952987A";
 
 #[derive(Clone, Copy)]
-enum Patch {
+pub(super) enum Patch {
     PresentFirst,
     Early,
     RtSkip,
     Watchdog,
+    Ambient,
 }
 
+const PATCHES: usize = 5;
+
 impl Patch {
-    const fn switch(self) -> &'static str {
+    pub(super) const fn switch(self) -> &'static str {
         match self {
             Patch::PresentFirst => "XCL_TITLE_PRESENT_FIRST",
             Patch::Early => "XCL_TITLE_EARLY",
             Patch::RtSkip => "XCL_TITLE_RT_SKIP",
             Patch::Watchdog => "XCL_TITLE_GTA6_WATCHDOG",
+            Patch::Ambient => "XCL_GTA6_AMBIENT",
         }
     }
 
-    const fn what(self) -> &'static str {
+    pub(super) const fn what(self) -> &'static str {
         match self {
             Patch::PresentFirst => "present chain first",
             Patch::Early => "early shaders",
             Patch::RtSkip => "ray passes left out",
             Patch::Watchdog => "watchdog held to 300 s",
+            Patch::Ambient => "stand-in indirect light",
+        }
+    }
+
+    /// Whether the patch is on with its switch holding `value`: on unless that is 0, but the
+    /// stand-in for the indirect light changes the picture and is on only when its switch holds a
+    /// level (`title_gta6_ambient::set`).
+    fn set(self, value: Option<&str>) -> bool {
+        match self {
+            Patch::Ambient => super::title_gta6_ambient::set(value),
+            _ => switch_on(value),
+        }
+    }
+
+    /// What its switch holds when the patch is off, for the log.
+    const fn off(self) -> &'static str {
+        match self {
+            Patch::Ambient => " unset or 0; a share of the estimate such as 0.8 turns it on",
+            _ => "=0",
         }
     }
 }
@@ -129,12 +157,12 @@ fn title() -> bool {
     })
 }
 
-fn on(patch: Patch) -> bool {
-    static ON: [OnceLock<bool>; 4] = [const { OnceLock::new() }; 4];
+pub(super) fn on(patch: Patch) -> bool {
+    static ON: [OnceLock<bool>; PATCHES] = [const { OnceLock::new() }; PATCHES];
     *ON[patch as usize].get_or_init(|| {
-        let on = title() && switch_on(std::env::var(patch.switch()).ok().as_deref());
+        let on = title() && patch.set(std::env::var(patch.switch()).ok().as_deref());
         if title() && !on {
-            crate::xlog_info!("D3D12.X: title patch {} off ({}=0)", patch.what(), patch.switch());
+            crate::xlog_info!("D3D12.X: title patch {} off ({}{})", patch.what(), patch.switch(), patch.off());
         }
         on
     })
@@ -142,7 +170,7 @@ fn on(patch: Patch) -> bool {
 
 /// Logged the first time, then at powers of two.
 fn engaged(patch: Patch, detail: impl FnOnce() -> String) {
-    static SEEN: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
+    static SEEN: [AtomicUsize; PATCHES] = [const { AtomicUsize::new(0) }; PATCHES];
     let n = SEEN[patch as usize].fetch_add(1, Ordering::Relaxed) + 1;
     if n == 1 || n.is_power_of_two() {
         crate::xlog_info!("D3D12.X: title patch {} ({}=0 turns it off): {} (#{n})", patch.what(), patch.switch(), detail());
@@ -151,6 +179,17 @@ fn engaged(patch: Patch, detail: impl FnOnce() -> String) {
 
 pub(super) fn ray_pass(container: &[u8]) -> Option<&'static [u8]> {
     RAY_PASSES.iter().copied().find(|name| container.windows(name.len()).any(|w| w == *name))
+}
+
+/// Ray tracing off with every ray a miss (`raytracing::miss_pass`): a compute shader of the title's
+/// ray passes, built behind every other pipeline. Title-specific (by the pass names in GTA VI's
+/// containers, only with the title's id; `XCL_RT_PASS_LAST=0` turns it off with the general part):
+/// a general fix would order builds by what the frame's visible output reads.
+pub fn miss_ray_pass(container: &[u8]) -> Option<&'static [u8]> {
+    if !title() {
+        return None;
+    }
+    ray_pass(container)
 }
 
 /// Ray tracing off (`raytracing::left_out`): a compute shader of the title's ray passes.

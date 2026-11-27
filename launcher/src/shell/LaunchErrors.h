@@ -5,6 +5,7 @@
 
 #include <functional>
 
+class AppSettings;
 class QWidget;
 class Services;
 
@@ -18,10 +19,15 @@ namespace LaunchErrors {
 // straight to play(), whose launch check shows the stop-first dialog.
 void confirmPlay(QWidget* window, Services& services, const Game& game, std::function<void()> play,
                  std::function<void()> warmUp);
-// True when Play would ask about the shader cache first: never warmed up on this PC, or the last
-// warm-up for the title stopped part way or failed. Staleness (a new translator) is not known to the
-// launcher, so a finished warm-up never asks.
+// True when Play would ask about the shader cache first: never warmed up on this PC, the last
+// warm-up for the title stopped part way or failed, or it ran with another run profile. A new XSEmu
+// translator build is not known to the launcher, so a finished warm-up with the same profile never asks,
+// and nothing asks while the XSEmu warm-up is turned off (AppSettings::xsemuWarmup).
 bool shadersCold(Services& services, const Game& game);
+
+// The emulator picker (Settings, About and the missing or too old emulator dialogs): stores the file
+// chosen as AppSettings::emulatorPathOverride. False when the user cancelled.
+bool chooseEmulator(QWidget* parent, AppSettings& settings);
 
 // Why a launch was refused (EmulatorController::checkLaunch). retry() launches again.
 void showLaunchProblem(QWidget* window, Services& services, const Game& game,

@@ -57,4 +57,17 @@ mod tests {
         assert!(Cell::at(Plane::Gpu, 1 << 48).is_none());
         assert!(Cell::at(Plane::Gpu, 123).is_none());
     }
+
+    /// The pages of one run share its view's index and differ in the page bits, as the
+    /// translated shaders take them apart (`xcl_raw_gpuva`).
+    #[test]
+    fn pages_of_one_run_share_a_view_and_differ_in_the_page_bits() {
+        let shader = |pte: u32| (pte & 0xfffff, ((pte >> 20) & 127) as usize * 65536);
+        for page in [0usize, 1, 64, 127] {
+            let pte = mapped_pte(77, page * 65536).unwrap();
+            assert_eq!(shader(pte), (77, page * 65536));
+            assert_ne!(pte & UNMAPPED, 0);
+        }
+        assert_eq!(mapped_pte(77, 8 << 20), None, "a run is 8 MiB at most");
+    }
 }

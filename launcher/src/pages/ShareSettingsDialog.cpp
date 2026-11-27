@@ -94,8 +94,12 @@ void open(QWidget* window, Services& s, SettingsProfile::Profile profile, const 
         if (!v.isValid())
             continue;
         const bool pinned = spec.kind == SettingsProfile::KeySpec::Kind::Runner && !profile.runnerVersion.isEmpty();
-        const QString value = SettingsProfile::valueLabel(spec.key, v);
-        card->addRow(spec.label, pinned ? QStringLiteral("%1 · pinned %2").arg(value, profile.runnerVersion) : value);
+        QString value = SettingsProfile::valueLabel(spec.key, v);
+        if (pinned)
+            value = QStringLiteral("%1 · pinned %2").arg(value, profile.runnerVersion);
+        else if (spec.kind == SettingsProfile::KeySpec::Kind::RunProfile)
+            value += QStringLiteral(" · paths on this PC stay here");
+        card->addRow(spec.label, value);
     }
     const bool empty = profile.values.isEmpty();
     if (empty)

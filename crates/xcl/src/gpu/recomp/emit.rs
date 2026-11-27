@@ -90,6 +90,9 @@ pub(super) struct Em {
     /// Multi-wave code with a barrier not proven convergent uses an LDS arrival count.
     safe_barrier: bool,
     mem_coherence: MemCoherence,
+    /// the scalar load being written reads through the view that is not coherent
+    /// (`MemCoherence::PlainBefore`): `memc` and the `_cached` four-address loads
+    plain_load: bool,
     mesh_export_barriers: bool,
     group_sync_edges: Vec<(u64, u64)>,
     group_sync_end: Option<u64>,
@@ -106,6 +109,8 @@ pub(super) struct Em {
     page_groups: bool,
     /// the page groups of the block being written
     groups: Vec<PageGroup>,
+    /// the program's memory functions are kept out of line (`outlined`)
+    outline: bool,
 }
 
 /// Loads whose addresses are one base (unchanged registers `sgprs` / `vgprs`, `key`) plus a
@@ -141,6 +146,9 @@ enum MemCoherence {
     Plain,
     Coherent,
     CachedBefore(u64),
+    /// coherent, but the scalar loads before this address read through a view that is not
+    /// (`plain_load_limit`), their page groups included
+    PlainBefore(u64),
 }
 
 fn has_mem_coherence_bits(d: &Decoded) -> bool {
@@ -155,11 +163,62 @@ fn mem_coherence(insts: &[Decoded], input_sgprs: Option<u32>) -> MemCoherence {
             || matches!(name, "S_DCACHE_INV" | "S_GL1_INV" | "BUFFER_GL0_INV" | "BUFFER_GL1_INV")
             || ["BUFFER_ATOMIC_", "GLOBAL_ATOMIC_", "FLAT_ATOMIC_"].iter().any(|p| name.starts_with(p))
     });
-    if !coherent {
+    if !coherent || plain_memory() {
         return MemCoherence::Plain;
     }
-    input_sgprs.and_then(|n| pre_acquire_read_limit(insts, n))
-        .map_or(MemCoherence::Coherent, MemCoherence::CachedBefore)
+    if let Some(pc) = input_sgprs.and_then(|n| pre_acquire_read_limit(insts, n)) {
+        return MemCoherence::CachedBefore(pc);
+    }
+    plain_load_limit(insts).filter(|_| plain_loads()).map_or(MemCoherence::Coherent, MemCoherence::PlainBefore)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// tests: `plain_loads` on this thread (None: as the environment has it)
+    pub(super) static PLAIN_LOADS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// A coherent program's first scalar loads read through a view that is not coherent
+/// (`plain_load_limit`); never with `XCL_RECOMP_NO_PLAIN_LOADS`.
+fn plain_loads() -> bool {
+    #[cfg(test)]
+    if let Some(on) = PLAIN_LOADS.get() {
+        return on;
+    }
+    std::env::var_os("XCL_RECOMP_NO_PLAIN_LOADS").is_none()
+}
+
+/// `XCL_RECOMP_PLAIN_MEMORY`, a measurement only: no program's memory is `globallycoherent`, so a
+/// run shows what the qualifier costs on the GPU. A program that reads what another wave of its
+/// dispatch writes may then read old values.
+fn plain_memory() -> bool {
+    std::env::var_os("XCL_RECOMP_PLAIN_MEMORY").is_some()
+}
+
+/// The address before which a coherent program's loads cannot tell a coherent view of memory from
+/// one that is not: before its first memory write or atomic, its first access with a coherence
+/// flag, its first barrier and the head of its first loop. Such a load runs at most once and
+/// before anything its own wave writes; what other waves write meanwhile it may or may not see on
+/// the console either, where only a flagged access is promised the newest value. `globallycoherent`
+/// keeps the GPU from caching what it reads (on NVIDIA every such load pays for it), and these
+/// programs are coherent because of one atomic near their end. None: a program that invalidates
+/// caches itself or jumps where the analysis cannot follow, or whose first instruction is the limit.
+fn plain_load_limit(insts: &[Decoded]) -> Option<u64> {
+    let mut limit = u64::MAX;
+    for d in insts {
+        let name = d.inst.name;
+        if matches!(name, "S_DCACHE_INV" | "S_GL1_INV" | "BUFFER_GL0_INV" | "BUFFER_GL1_INV" | "S_SETPC_B64" | "S_SWAPPC_B64") || d.inst.flags & rdna2::F_INDIRECT != 0 {
+            return None;
+        }
+        let memory = matches!(d.enc.name, "ENC_SMEM" | "ENC_MUBUF" | "ENC_MTBUF" | "ENC_FLAT" | "ENC_FLAT_GLBL");
+        if memory && (name.contains("STORE") || name.contains("ATOMIC")) || has_mem_coherence_bits(d) || name == "S_BARRIER" {
+            limit = limit.min(d.pc);
+        }
+        if let Some(to) = d.far_target.or_else(|| rdna2::branch_target(d)).filter(|&to| to <= d.pc) {
+            limit = limit.min(to);
+        }
+    }
+    (limit != u64::MAX && limit > insts.first()?.pc).then_some(limit)
 }
 
 fn pre_acquire_read_limit(insts: &[Decoded], input_sgprs: u32) -> Option<u64> {
@@ -761,6 +820,297 @@ fn page_groups() -> bool {
     std::env::var_os("XCL_RECOMP_NO_PAGE_GROUPS").is_none()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// tests: the group accessors and `ld_raw` of the earlier form (`XCL_RECOMP_NO_ACCESSOR_SHRINK`)
+    /// on this thread
+    pub(super) static NO_ACCESSOR_SHRINK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// tests: outlined memory functions in every program (true) or in none (false) on this thread
+    pub(super) static OUTLINE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// tests: the form of the outlined functions on this thread (`outline_statics`, `outline_atomics`)
+    pub(super) static OUTLINE_FORM: std::cell::Cell<Option<(bool, OutlineAtomics)>> = const { std::cell::Cell::new(None) };
+}
+
+/// The atomics `outlined` keeps out of line (`XCL_RECOMP_OUTLINE_ATOMICS=all|add|none`): every
+/// one, the adds alone, or none (the others are inlined at their calls, as in a plain program).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum OutlineAtomics {
+    All,
+    Add,
+    None,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// tests: `outline_flat` on this thread
+    pub(super) static OUTLINE_FLAT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+const OUTLINE_STATICS_DEFAULT: bool = false;
+const OUTLINE_FLAT_DEFAULT: bool = false;
+const OUTLINE_ATOMICS_DEFAULT: OutlineAtomics = OutlineAtomics::All;
+
+/// The statics an outlined function hands its results back through (`outline_statics`), by type
+/// and position among the function's results.
+pub(super) const OUTLINE_RESULT_STATICS: &str = "static uint xcl_ret_uint_0;\nstatic uint xcl_ret_uint_1;\nstatic uint xcl_ret_uint_2;\nstatic uint xcl_ret_uint_3;\nstatic uint64_t xcl_ret_uint64_t_0;\nstatic int xcl_ret_int_0;\nstatic int64_t xcl_ret_int64_t_0;\n";
+
+/// `XCL_RECOMP_OUTLINE_RESULTS=static|out`: an outlined function hands its results back through
+/// statics (`OUTLINE_RESULT_STATICS`) or through `out` parameters. An `out` parameter of a function
+/// DXIL keeps is a pointer, so its caller keeps a stack slot for every result of every call (1,342
+/// in one title program of 866 calls); a static is one per-thread word however many calls there are.
+pub(super) fn outline_statics() -> bool {
+    #[cfg(test)]
+    if let Some((statics, _)) = OUTLINE_FORM.get() {
+        return statics;
+    }
+    match std::env::var("XCL_RECOMP_OUTLINE_RESULTS").ok().as_deref().map(str::trim) {
+        Some("static") => true,
+        Some("out") => false,
+        _ => OUTLINE_STATICS_DEFAULT,
+    }
+}
+
+/// `XCL_RECOMP_OUTLINE_NESTED=flat|keep`: flat, a kept function calls the text of the functions it
+/// uses (`name_i`, inlined into it) and never a kept one; keep, `xcl_loadx4` calls the kept
+/// `xcl_mLoad` once a dword when its four are not in one 64 KiB block.
+pub(super) fn outline_flat() -> bool {
+    #[cfg(test)]
+    if let Some(flat) = OUTLINE_FLAT.get() {
+        return flat;
+    }
+    match std::env::var("XCL_RECOMP_OUTLINE_NESTED").ok().as_deref().map(str::trim) {
+        Some("flat") => true,
+        Some("keep") => false,
+        _ => OUTLINE_FLAT_DEFAULT,
+    }
+}
+
+pub(super) fn outline_atomics() -> OutlineAtomics {
+    #[cfg(test)]
+    if let Some((_, atomics)) = OUTLINE_FORM.get() {
+        return atomics;
+    }
+    match std::env::var("XCL_RECOMP_OUTLINE_ATOMICS").ok().as_deref().map(str::trim) {
+        Some("all") => OutlineAtomics::All,
+        Some("add") => OutlineAtomics::Add,
+        Some("none") => OutlineAtomics::None,
+        _ => OUTLINE_ATOMICS_DEFAULT,
+    }
+}
+
+/// Guest instructions from which a compute program gets its memory functions outlined
+/// (`outlined`): 1024, or `XCL_RECOMP_OUTLINE_MIN_INSTS`; never with `XCL_RECOMP_NO_OUTLINE`.
+fn outline_from(insts: usize) -> bool {
+    #[cfg(test)]
+    if let Some(on) = OUTLINE.get() {
+        return on;
+    }
+    if std::env::var_os("XCL_RECOMP_NO_OUTLINE").is_some() {
+        return false;
+    }
+    insts >= std::env::var("XCL_RECOMP_OUTLINE_MIN_INSTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1024)
+}
+
+/// `src` with each function `pick` names kept out of line: DXC inlines every call of a plain
+/// function, so a program's every memory access carried the whole accessor (window test, page
+/// walk, page-crossing path). The function's text stays as `name_i`; `[noinline] name_n` calls it
+/// with scalar parameters and `out` results (what a function DXIL keeps may take); `name` calls
+/// that, so no call site changes. With `outline_statics` the kept function is `name_r`, takes no
+/// `out` parameter and leaves every result in a static its caller reads at once (the caller declares
+/// `OUTLINE_RESULT_STATICS` before the text). The direct DXIL backend inlines all the same, so DXC
+/// compiles such a program (`dxc::compile_direct`).
+pub(super) fn outlined(src: &str, pick: &dyn Fn(&str) -> bool) -> String {
+    const TYPES: [(&str, usize); 8] = [("void", 0), ("uint", 1), ("uint2", 2), ("uint3", 3), ("uint4", 4), ("uint64_t", 1), ("int", 1), ("int64_t", 1)];
+    const XYZW: [&str; 4] = ["x", "y", "z", "w"];
+    let width = |t: &str| TYPES.iter().find(|(n, _)| *n == t).map(|&(_, k)| k);
+    let mut out = String::with_capacity(src.len() * 3 / 2);
+    // the functions kept so far, for `outline_flat`
+    let (flat, mut kept) = (outline_flat(), Vec::<&str>::new());
+    let mut i = 0;
+    while i < src.len() {
+        let line_end = src[i..].find('\n').map_or(src.len(), |k| i + k + 1);
+        let line = &src[i..line_end];
+        let def = (|| {
+            let (ret, rest) = line.split_once(' ')?;
+            let k = width(ret)?;
+            let (name, rest) = rest.split_once('(')?;
+            let (params, rest) = rest.split_once(')')?;
+            (rest.starts_with(" {") && pick(name)).then_some(())?;
+            let (mut sig, mut args, mut back) = (Vec::new(), Vec::new(), Vec::new());
+            // the same without the results: what `name_r` takes, and everything it hands back
+            let (mut ins_sig, mut ins_args, mut outs) = (Vec::new(), Vec::new(), Vec::new());
+            for p in params.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                let (is_out, p) = p.strip_prefix("out ").map_or((false, p), |p| (true, p));
+                let (ty, n) = p.split_once(' ')?;
+                match (width(ty)?, is_out) {
+                    (0, _) | (2.., true) => return None,
+                    (1, _) => {
+                        sig.push(if is_out { format!("out {ty} {n}") } else { format!("{ty} {n}") });
+                        args.push(n.to_string());
+                        back.push(n.to_string());
+                        if is_out {
+                            outs.push((ty.to_string(), n.to_string()));
+                        } else {
+                            ins_sig.push(format!("{ty} {n}"));
+                            ins_args.push(n.to_string());
+                        }
+                    }
+                    (w, false) => {
+                        ins_sig.extend((0..w).map(|c| format!("uint {n}{c}")));
+                        ins_args.extend((0..w).map(|c| format!("{n}.{}", XYZW[c])));
+                        sig.extend((0..w).map(|c| format!("uint {n}{c}")));
+                        args.extend((0..w).map(|c| format!("{n}.{}", XYZW[c])));
+                        back.push(format!("{ty}({})", (0..w).map(|c| format!("{n}{c}")).collect::<Vec<_>>().join(", ")));
+                    }
+                }
+            }
+            let results: Vec<String> = (0..k).map(|c| format!("xr{c}")).collect();
+            let scalar = if k == 1 { ret } else { "uint" };
+            sig.extend(results.iter().map(|r| format!("out {scalar} {r}")));
+            args.extend(results.iter().cloned());
+            let call = format!("{name}_i({})", back.join(", "));
+            let (inner, outer) = match k {
+                0 => (format!("{call};"), format!("{name}_n({});", args.join(", "))),
+                1 => (format!("xr0 = {call};"), format!("{ret} xr0; {name}_n({}); return xr0;", args.join(", "))),
+                _ => (
+                    format!("{ret} xr = {call}; {}", (0..k).map(|c| format!("xr{c} = xr.{};", XYZW[c])).collect::<Vec<_>>().join(" ")),
+                    format!("uint {}; {name}_n({}); return {ret}({});", results.join(", "), args.join(", "), results.join(", ")),
+                ),
+            };
+            let head = format!("{ret} {name}_i({params})");
+            outs.extend(results.iter().map(|r| (scalar.to_string(), r.clone())));
+            let slot = |j: usize, ty: &str| format!("xcl_ret_{ty}_{j}");
+            // a function with a result no static is there for keeps its out parameters
+            let tail = if outline_statics() && !outs.is_empty() && outs.iter().enumerate().all(|(j, (ty, _))| OUTLINE_RESULT_STATICS.contains(&format!("static {ty} {};", slot(j, ty)))) {
+                let each = |f: &dyn Fn(usize, &str, &str) -> String| outs.iter().enumerate().map(|(j, (ty, n))| f(j, ty, n)).collect::<Vec<_>>().join(" ");
+                let (locals, give, take) = (each(&|_, ty, n| format!("{ty} {n};")), each(&|j, ty, n| format!("{} = {n};", slot(j, ty))), each(&|j, ty, n| format!("{n} = {};", slot(j, ty))));
+                let (inner, outer) = match k {
+                    0 => (format!("{call};"), format!("{name}_r({}); {take}", ins_args.join(", "))),
+                    1 => (format!("xr0 = {call};"), format!("{ret} xr0; {name}_r({}); {take} return xr0;", ins_args.join(", "))),
+                    _ => (
+                        format!("{ret} xr = {call}; {}", (0..k).map(|c| format!("xr{c} = xr.{};", XYZW[c])).collect::<Vec<_>>().join(" ")),
+                        format!("uint {}; {name}_r({}); {take} return {ret}({});", results.join(", "), ins_args.join(", "), results.join(", ")),
+                    ),
+                };
+                format!("\n[noinline] void {name}_r({}) {{ {locals} {inner} {give} }}\n{ret} {name}({params}) {{ {outer} }}", ins_sig.join(", "))
+            } else {
+                format!("\n[noinline] void {name}_n({}) {{ {inner} }}\n{ret} {name}({params}) {{ {outer} }}", sig.join(", "))
+            };
+            Some((head, tail, i + line.find(") {")? + 1, name))
+        })();
+        let Some((head, tail, body, name)) = def else {
+            out.push_str(line);
+            i = line_end;
+            continue;
+        };
+        let mut depth = 0;
+        let mut end = src.len();
+        for (j, c) in src[body..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' if depth == 1 => {
+                    end = body + j + 1;
+                    break;
+                }
+                '}' => depth -= 1,
+                _ => {}
+            }
+        }
+        out.push_str(&head);
+        if flat {
+            // a call of a kept function becomes a call of its text
+            let (ident, mut rest) = (|c: char| c.is_ascii_alphanumeric() || c == '_', &src[body..end]);
+            while let Some(at) = rest.find(ident) {
+                let to = rest[at..].find(|c| !ident(c)).map_or(rest.len(), |k| at + k);
+                out.push_str(&rest[..to]);
+                if rest[to..].starts_with('(') && kept.contains(&&rest[at..to]) {
+                    out.push_str("_i");
+                }
+                rest = &rest[to..];
+            }
+            out.push_str(rest);
+        } else {
+            out.push_str(&src[body..end]);
+        }
+        kept.push(name);
+        out.push_str(&tail);
+        i = end;
+    }
+    out
+}
+
+/// The accessors `outlined` keeps out of line: every access of a memory window (`xcl_m`, `xcl_v`,
+/// `xcl_loadx4`) and a group's page resolutions.
+fn outlined_accessor(name: &str) -> bool {
+    name.starts_with("xcl_loadx4") || name == "xcl_group_pages"
+        || ["xcl_m", "xcl_v"].iter().any(|p| {
+            name.strip_prefix(p).is_some_and(|n| {
+                ["Load", "Store", "_cachedLoad"].iter().any(|k| n.starts_with(k))
+                    || match outline_atomics() {
+                        OutlineAtomics::All => n.starts_with("Interlocked"),
+                        OutlineAtomics::Add => n.starts_with("InterlockedAdd"),
+                        OutlineAtomics::None => false,
+                    }
+            })
+        })
+}
+
+fn accessor_shrink() -> bool {
+    #[cfg(test)]
+    if NO_ACCESSOR_SHRINK.get() {
+        return false;
+    }
+    std::env::var_os("XCL_RECOMP_NO_ACCESSOR_SHRINK").is_none()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// tests: the earlier 10-bit primitive index fields (`XCL_RECOMP_NO_PRIM9`) on this thread
+    pub(super) static NO_PRIM9: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `exp prim` words hold 9-bit vertex indices (`prim_indices`; off: `XCL_RECOMP_NO_PRIM9`,
+/// the earlier 10-bit fields).
+fn prim9() -> bool {
+    #[cfg(test)]
+    if NO_PRIM9.get() {
+        return false;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("XCL_RECOMP_NO_PRIM9").is_none())
+}
+
+/// The three vertex indices of the primitive word `p` (an `exp prim` export, or a record's
+/// word of one) as a `uint3`. RDNA2 packs 9-bit indices at [8:0], [18:10] and [28:20], with
+/// per-edge flags at bits 9, 19 and 29 and null_prim at 31 (ivall/xcl 3eab40a4): a 10-bit
+/// field reads an index whose edge flag is set as index + 512.
+fn prim_indices(p: &str) -> String {
+    let m = if prim9() { "0x1FFu" } else { "0x3FFu" };
+    format!("uint3({p} & {m}, ({p} >> 10) & {m}, ({p} >> 20) & {m})")
+}
+
+/// The record word of the GS strip triangle `t` (`xcl_tri`: three 10-bit indices of the
+/// lane's own vertices) whose vertices start at `xcl_vb` in a record of `maxv` vertices: a
+/// primitive word as `prim_indices` reads it. A vertex at or past `maxv` (at most 256, so
+/// every index fits 9 bits) has no place in the record, and the word is null (bit 31) – the
+/// sums at 512 and over would otherwise read as other vertices of the record.
+/// `XCL_RECOMP_NO_PRIM9`: the earlier 10-bit sums.
+fn gs_record_prim(maxv: u32) -> String {
+    let sums = "((t & 0x3FFu) + xcl_vb) | ((((t >> 10) & 0x3FFu) + xcl_vb) << 10) | ((((t >> 20) & 0x3FFu) + xcl_vb) << 20)";
+    if !prim9() {
+        return sums.to_string();
+    }
+    format!("select(any(uint3(t & 0x3FFu, (t >> 10) & 0x3FFu, (t >> 20) & 0x3FFu) + xcl_vb >= {maxv}u), 0x80000000u, {sums})")
+}
+
 impl Em {
     pub fn new(opt: Options) -> Self {
         let carry_check = opt.mem_windows > 1 && std::env::var("XCL_DS_VALIDATE").is_ok_and(|v| v != "0");
@@ -803,6 +1153,7 @@ impl Em {
             dynamic_f16_rm: false,
             safe_barrier: false,
             mem_coherence: MemCoherence::Plain,
+            plain_load: false,
             mesh_export_barriers: false,
             group_sync_edges: Vec::new(),
             group_sync_end: None,
@@ -815,6 +1166,7 @@ impl Em {
             since_tick: 0,
             page_groups: page_groups(),
             groups: Vec::new(),
+            outline: false,
         }
     }
 
@@ -836,6 +1188,7 @@ impl Em {
         let mut reads_dp = false;
         let mesh = matches!(self.opt.mode, Mode::Mesh(_));
         let compute = matches!(self.opt.mode, Mode::Compute(_));
+        self.outline = compute && self.opt.mem_windows > 1 && outline_from(insts.len());
         if let Mode::Compute(cs) = &self.opt.mode {
             let inputs = self.opt.compute_per_access_coherence.then_some(cs.user_sgprs);
             self.mem_coherence = mem_coherence(insts, inputs);
@@ -966,6 +1319,12 @@ impl Em {
     /// docs/wave64-on-wave32.md).
     fn x64(&self) -> bool {
         self.opt.mesh_native.is_none() && !self.packed_compute() && self.opt.wave64 && self.opt.split_wave64 && matches!(self.opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_) | Mode::Geometry(_))
+    }
+
+    /// A compute program whose launch EXEC leaves out the lanes past a dispatch's thread limits
+    /// (`Options::thread_limits`, io[`IO_THREAD_LIMIT`]).
+    fn thread_limited(&self) -> bool {
+        self.opt.thread_limits && matches!(self.opt.mode, Mode::Compute(_))
     }
 
     fn mesh_packed(&self) -> bool {
@@ -1110,12 +1469,13 @@ impl Em {
 
     /// The accessor call `mem.{method}(addr)` of a load in group `g` (None: no group).
     fn group_call(&mut self, g: Option<usize>, method: &str, addr: &str) -> String {
-        let Some(group) = g.and_then(|i| self.groups.get_mut(i)) else { return format!("mem.{method}({addr})") };
+        let mem = if self.plain_load { "memc" } else { "mem" };
+        let Some(group) = g.and_then(|i| self.groups.get_mut(i)) else { return format!("{mem}.{method}({addr})") };
         match &group.name {
-            Some(n) => format!("mem.{method}G({addr}, {n}_g, {n}_r)"),
+            Some(n) => format!("{mem}.{method}G({addr}, {n}_g, {n}_r)"),
             None => {
                 group.calls.push((method.to_string(), addr.to_string()));
-                format!("mem.{method}({addr})")
+                format!("{mem}.{method}({addr})")
             }
         }
     }
@@ -1123,9 +1483,10 @@ impl Em {
     /// A four-address load (`xcl_loadx4`) whose addresses are each a constant offset below 16
     /// from the start of the bytes of group `g`'s load, or 0: through the group's pages.
     fn loadx4(&mut self, g: Option<usize>, addrs: &str) -> String {
+        let cached = if self.plain_load { "_cached" } else { "" };
         match g.and_then(|i| self.groups.get(i)).and_then(|g| g.name.as_ref()) {
-            Some(n) => format!("xcl_loadx4G({addrs}, {n}_g, {n}_r)"),
-            None => format!("xcl_loadx4({addrs})"),
+            Some(n) => format!("xcl_loadx4G{cached}({addrs}, {n}_g, {n}_r)"),
+            None => format!("xcl_loadx4{cached}({addrs})"),
         }
     }
 
@@ -1155,9 +1516,13 @@ impl Em {
     }
 
     /// The lane's EXEC bit, kept in `xcl_on` (`track_exec`): one test per EXEC write instead of
-    /// one per instruction, which DXC spent much of its time on in big programs.
+    /// one per instruction, which DXC spent much of its time on in big programs. Where EXEC is
+    /// the launch EXEC (`full`) that is every lane, unless the launch leaves lanes out
+    /// (`thread_limited`): then only a VGPR write goes unguarded (`write32` / `write64`; what a
+    /// lane the console never started holds is never defined), and every other effect keeps
+    /// the test.
     fn act(&self) -> &'static str {
-        if self.full {
+        if self.full && !self.thread_limited() {
             "true"
         } else {
             "xcl_on"
@@ -1430,6 +1795,7 @@ impl Em {
         self.cur_loose = if packed { Vec::new() } else { self.loose.get(&d.pc).cloned().unwrap_or_default() };
         let flow = self.inst_body(d, next);
         self.drop_page_groups(d);
+        self.plain_load = false;
         self.full = false;
         self.cur_loose.clear();
         flow
@@ -2208,6 +2574,7 @@ impl Em {
         let soff_regs = if soff_code < 128 { 1u128 << soff_code } else { 0 };
         let t = self.t();
         let mut vals = Vec::new();
+        self.plain_load = matches!(self.mem_coherence, MemCoherence::PlainBefore(pc) if d.pc < pc);
         if name.starts_with("s_buffer_load") {
             // V#: base = dw0 | dw1[15:0] << 32, stride = dw1[29:16], num_records = dw2
             let (d0, d1, d2) = (self.sreg(sbase), self.sreg(sbase + 1), self.sreg(sbase + 2));
@@ -2261,10 +2628,12 @@ impl Em {
             self.line(&format!("uint {t}_a = ({b} + {} + {soff}) & ~3u;", hex(imm)));
             let load = if matches!(self.mem_coherence, MemCoherence::CachedBefore(pc) if d.pc < pc) {
                 "xcl_m_cachedLoad"
+            } else if self.plain_load {
+                "memc.Load"
             } else {
                 "mem.Load"
             };
-            let group = if load == "mem.Load" {
+            let group = if load != "xcl_m_cachedLoad" {
                 self.page_group(format!("smem|{hi}|{b}|{soff}"), 3u128 << sbase | soff_regs, Vec::new(), imm as i32 as i64, 4 * count as i64, format!("{t}_a"), count.div_ceil(4))
             } else {
                 None
@@ -2916,6 +3285,13 @@ impl Em {
         };
         let base = name.trim_start_matches("image_");
         if base == "bvh_intersect_ray" || base == "bvh64_intersect_ray" {
+            if self.opt.rt_all_miss {
+                // every ray misses (`rt_all_miss`): no node is read, the result is the null structure's
+                let act = self.act();
+                let st: Vec<String> = (0..4).map(|c| format!("{} = 0xFFFFFFFFu;", self.vreg(vdata + c))).collect();
+                self.line(&format!("if ({act}) {{ {} }}", st.join(" ")));
+                return Ok(());
+            }
             // ray tracing: one BVH node per instruction (public RDNA2 / RADV node format)
             let r = |s: &mut Self, j: u64| s.vreg(addr_reg(j));
             let wide = base == "bvh64_intersect_ray";
@@ -5602,9 +5978,22 @@ uint4 ld_raw(").unwrap();
         } else {
             PRELUDE_MEM_ACCESS
         };
-        h.push_str(mem_access);
-        if windows > 1 {
-            h.push_str(&lane_helpers(mem_access));
+        let grouped_ld_raw;
+        let mem_access = if windows > 1 && self.page_groups && !self.packed_wave() && !self.code_loads && body.contains("ld_raw") && accessor_shrink() {
+            grouped_ld_raw = mem_access.replacen(LD_RAW_LOADS, LD_RAW_GROUPED, 1);
+            grouped_ld_raw.as_str()
+        } else {
+            mem_access
+        };
+        if self.outline {
+            let helper = |n: &str| matches!(n, "ld_raw" | "st_bytes" | "ld_raw_v" | "st_bytes_v");
+            h.push_str(&outlined(mem_access, &helper));
+            h.push_str(&outlined(&lane_helpers(mem_access), &helper));
+        } else {
+            h.push_str(mem_access);
+            if windows > 1 {
+                h.push_str(&lane_helpers(mem_access));
+            }
         }
         if self.uses_scratch {
             h.push_str(PRELUDE_SCRATCH);
@@ -5809,7 +6198,37 @@ uint4 ld_raw(").unwrap();
                     let wave = if packed { "xcl_wave".into() } else if self.x64() { "xcl_cw".into() } else { format!("(gi / {lanes}u)") };
                     let _ = writeln!(h, "    {} = {}u | ({wave} << 6);", sname(next).unwrap(), (x * y * z).div_ceil(lanes));
                 }
-                if packed {
+                if self.thread_limited() {
+                    // a dispatch with thread dimensions (io[`IO_THREAD_LIMIT`]): a lane whose console
+                    // thread (its group times the group size plus its thread in the group) is at or
+                    // past an axis's count is not in EXEC, as the console never starts it. A count
+                    // of 0 (no limit) less 1 passes every thread: one load and a compare an axis,
+                    // no branch, the same EXEC as before for every other dispatch
+                    let at = super::IO_THREAD_LIMIT[0] * 4;
+                    let live = |gtid: &str| format!("all(gid * uint3({x}u, {y}u, {z}u) + {gtid} <= xcl_tl)");
+                    if packed {
+                        let _ = writeln!(
+                            h,
+                            "    uint scc = 0u;\n    {{\n        uint3 xcl_tl = io.Load3({at}u) - 1u;\n        exec_lo = xcl_valid_lo & WaveActiveBallot({}).x;\n        exec_hi = xcl_valid_hi & WaveActiveBallot({}).x;\n    }}",
+                            live("gtid"),
+                            live("hi_gtid")
+                        );
+                    } else {
+                        let _ = writeln!(
+                            h,
+                            "    uint scc = 0u;\n    {{\n        uint3 xcl_tl = io.Load3({at}u) - 1u;\n        uint2 e0 = {}({});\n        exec_lo = e0.x; exec_hi = e0.y;\n    }}",
+                            self.ballot_fn(),
+                            live("gtid")
+                        );
+                    }
+                    // a wave with no thread left (one wholly past the count in a group of several)
+                    // is one the console does not start: it leaves (from the early-exit-safe
+                    // barrier too), but not where a plain group barrier would wait for it
+                    if !body.contains("GroupMemoryBarrierWithGroupSync") {
+                        let leave = if self.safe_barrier { "xcl_s_barrier_exit(); " } else { "" };
+                        let _ = writeln!(h, "    if ((exec_lo | exec_hi) == 0u) {{ {leave}return; }}");
+                    }
+                } else if packed {
                     h.push_str("    uint scc = 0u;\n    exec_lo = xcl_valid_lo;\n    exec_hi = xcl_valid_hi;\n");
                 } else {
                     let _ = writeln!(h, "    uint scc = 0u;\n    {{ uint2 e0 = {}(true); exec_lo = e0.x; exec_hi = e0.y; }}", self.ballot_fn());
@@ -5880,7 +6299,8 @@ uint4 ld_raw(").unwrap();
                 let _ = writeln!(h, "    uint xcl_nv = min(WaveReadLaneFirst(xcl_ms_nv), {mv}u);\n    uint xcl_np = min(WaveReadLaneFirst(xcl_ms_np), {mp}u);");
                 h.push_str("    SetMeshOutputCounts(xcl_nv, xcl_np);\n");
                 let outputs = format!(
-                    "    if (xcl_slot < xcl_nv) {{\n{fill}        verts[xcl_slot] = o;\n    }}\n    if (xcl_slot < xcl_np) {{\n        uint3 x = uint3(xcl_op & 0x3FFu, (xcl_op >> 10) & 0x3FFu, (xcl_op >> 20) & 0x3FFu);\n        bool bad = or((xcl_op >> 31) != 0u, any(x >= xcl_nv));\n        tris[xcl_slot] = select(bad, uint3(0u, 0u, 0u), x);\n    }}\n"
+                    "    if (xcl_slot < xcl_nv) {{\n{fill}        verts[xcl_slot] = o;\n    }}\n    if (xcl_slot < xcl_np) {{\n        uint3 x = {};\n        bool bad = or((xcl_op >> 31) != 0u, any(x >= xcl_nv));\n        tris[xcl_slot] = select(bad, uint3(0u, 0u, 0u), x);\n    }}\n",
+                    prim_indices("xcl_op")
                 );
                 h.push_str(&outputs);
                 if packed {
@@ -5991,8 +6411,9 @@ uint4 ld_raw(").unwrap();
                     let _ = writeln!(h, "    for (uint j = 0u; j < xcl_ntri; j++) {{\n        uint t = xcl_tri[j];\n        if (xcl_tb + j >= {maxp}u) break;");
                     let _ = writeln!(
                         h,
-                        "        res.Store((xcl_rec + {}u + xcl_tb + j) * 4u, ((t & 0x3FFu) + xcl_vb) | ((((t >> 10) & 0x3FFu) + xcl_vb) << 10) | ((((t >> 20) & 0x3FFu) + xcl_vb) << 20));\n    }}",
-                        MESH_HEADER + maxv as usize * vd
+                        "        res.Store((xcl_rec + {}u + xcl_tb + j) * 4u, {});\n    }}",
+                        MESH_HEADER + maxv as usize * vd,
+                        gs_record_prim(maxv)
                     );
                     h.push_str("}\n");
                 } else {
@@ -6070,8 +6491,9 @@ uint4 ld_raw(").unwrap();
                 let _ = writeln!(h, "    for (uint j = 0u; j < xcl_ntri; j++) {{\n        uint t = xcl_tri[j];\n        if (xcl_tb + j >= {maxp}u) break;");
                 let _ = writeln!(
                     h,
-                    "        res.Store((xcl_rec + {}u + xcl_tb + j) * 4u, ((t & 0x3FFu) + xcl_vb) | ((((t >> 10) & 0x3FFu) + xcl_vb) << 10) | ((((t >> 20) & 0x3FFu) + xcl_vb) << 20));\n    }}",
-                    MESH_HEADER + maxv as usize * vd
+                    "        res.Store((xcl_rec + {}u + xcl_tb + j) * 4u, {});\n    }}",
+                    MESH_HEADER + maxv as usize * vd,
+                    gs_record_prim(maxv)
                 );
                 h.push_str("    }\n}\n");
                 }
@@ -6145,7 +6567,7 @@ uint4 ld_raw(").unwrap();
                 h.push_str("    return xo;\n}\n");
             }
         }
-        windowed(&h, windows, self.mem_coherence)
+        windowed(&h, windows, self.mem_coherence, self.outline)
     }
 }
 
@@ -6161,19 +6583,55 @@ fn out_struct(h: &mut String, name: &str, outputs: &[SigElement]) {
     h.push_str("};\n");
 }
 
+#[cfg(test)]
+thread_local! {
+    /// tests: the earlier rect list corner rule (`XCL_RECOMP_NO_RECT_LONGEST`) on this thread
+    pub(super) static NO_RECT_LONGEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `rect_list_gs` takes the right angle opposite the longest side (off:
+/// `XCL_RECOMP_NO_RECT_LONGEST`).
+fn rect_longest() -> bool {
+    #[cfg(test)]
+    if NO_RECT_LONGEST.get() {
+        return false;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("XCL_RECOMP_NO_RECT_LONGEST").is_none())
+}
+
+/// The right angle of a rect's three corners (`rect_list_gs`) from their clip-space x and y:
+/// the corner opposite the longest side by squared distance – v0 if d12 is strictly the
+/// longest, v2 if d01 is, else v1 (ties) – and 3 (no corner, the one triangle) for a NaN.
+pub(super) const RECT_CORNER: &str = r#"uint xcl_rect_corner(float2 q0, float2 q1, float2 q2)
+{
+    float2 e12 = q1 - q2, e20 = q2 - q0, e01 = q0 - q1;
+    float d12 = e12.x * e12.x + e12.y * e12.y, d20 = e20.x * e20.x + e20.y * e20.y, d01 = e01.x * e01.x + e01.y * e01.y;
+    if (any(isnan(float3(d12, d20, d01))))
+        return 3u;
+    return select(and(d12 > d20, d12 > d01), 0u, select(and(d01 > d12, d01 > d20), 2u, 1u));
+}
+"#;
+
 /// Geometry shader for the console's rect lists (IASetPrimitiveTopology 17, AMD's
 /// DI_PT_RECTLIST; PSO topology type 19) behind a translated VS with these outputs: the PC has
 /// no such topology, the draw arrives as a triangle list and each rect's three vertices come
 /// here. They are three corners of a screen-aligned rectangle (AMD PAL, `palCmdBuffer.h`:
 /// "Each rect is three 2D axis-aligned rectangle vertices"), and the corner between the other
 /// two is not always the same vertex: Mesa's radeonsi blits send (x1,y1), (x1,y2), (x2,y1) – v0
-/// – and xf86-video-ati's r600 EXA (x1,y1), (x1,y2), (x2,y2) – v1. The corner is the vertex
-/// sharing x with one of the others and y with the other; the fourth vertex is the opposite
-/// corner, a + b - corner, with every float output taken the same way (both drivers' texture
-/// coordinates rely on the implied corner continuing them linearly). Only for three vertices
-/// with one positive w – then a + b - corner is the same in clip and screen space and every
-/// interpolation mode agrees; three that are not such corners, or differ in w, stay the one
-/// triangle they make.
+/// – and xf86-video-ati's r600 EXA (x1,y1), (x1,y2), (x2,y2) – v1. The corner is the right
+/// angle, opposite the longest side (`RECT_CORNER`); the fourth vertex is the opposite corner,
+/// a + b - corner, with every float output taken the same way (both drivers' texture
+/// coordinates rely on the implied corner continuing them linearly). Every rect is completed,
+/// as the console does (Marvisak/VIctory 8ff7913, `emit/rect.rs`: the same rule, behaviour
+/// only): a corner off by an ulp, or three w that differ, no longer leave half the rect
+/// undrawn. The sum is taken in clip space, where a rectangle of the scene stays a
+/// parallelogram whatever its w; with one w it is the screen's rectangle too and every
+/// interpolation mode agrees, with w that differ the perspective-correct outputs agree and
+/// `noperspective` ones are continued in clip space, not on the screen. Only a NaN in the
+/// corners' x and y keeps the one triangle. `XCL_RECOMP_NO_RECT_LONGEST`: the earlier rule – a
+/// corner sharing x with one vertex and y with the other by exact equality, one positive w,
+/// else the one triangle.
 ///
 /// Flat values are the rect's first vertex's: both triangles start with v[0], which is where
 /// the PC takes a flat input from (an integer input, or what the translation declares
@@ -6188,17 +6646,23 @@ pub fn rect_list_gs(outputs: &[SigElement]) -> String {
     let mut h = String::new();
     h.push_str("// generated by XCL: a console rect list's rectangles (three corners, the fourth implied)\n");
     out_struct(&mut h, "XclOut", outputs);
-    h.push_str("[maxvertexcount(6)]\nvoid main(triangle XclOut v[3], inout TriangleStream<XclOut> s)\n{\n");
-    // the corner c: x shared with a and y with b, or the other way round (a = c + 1, b = c + 2);
-    // one w: clip-space x and y compare as the screen's do
-    h.push_str("    uint c = 3u;\n");
-    h.push_str("    if (v[0].pos.w > 0.0 && v[1].pos.w == v[0].pos.w && v[2].pos.w == v[0].pos.w) {\n");
-    h.push_str("        float2 q[3] = { v[0].pos.xy, v[1].pos.xy, v[2].pos.xy };\n");
-    h.push_str("        [unroll] for (uint i = 0u; i < 3u; i++) {\n");
-    h.push_str("            float2 p = q[i], a = q[(i + 1u) % 3u], b = q[(i + 2u) % 3u];\n");
-    h.push_str("            bool corner = (p.x == a.x && p.y == b.y) || (p.x == b.x && p.y == a.y);\n");
-    h.push_str("            bool degenerate = all(p == a) || all(p == b) || all(a == b);\n");
-    h.push_str("            if (c == 3u && corner && !degenerate)\n                c = i;\n        }\n    }\n");
+    if rect_longest() {
+        h.push_str(RECT_CORNER);
+        h.push_str("[maxvertexcount(6)]\nvoid main(triangle XclOut v[3], inout TriangleStream<XclOut> s)\n{\n");
+        h.push_str("    uint c = xcl_rect_corner(v[0].pos.xy, v[1].pos.xy, v[2].pos.xy);\n");
+    } else {
+        h.push_str("[maxvertexcount(6)]\nvoid main(triangle XclOut v[3], inout TriangleStream<XclOut> s)\n{\n");
+        // the corner c: x shared with a and y with b, or the other way round (a = c + 1, b = c + 2);
+        // one w: clip-space x and y compare as the screen's do
+        h.push_str("    uint c = 3u;\n");
+        h.push_str("    if (v[0].pos.w > 0.0 && v[1].pos.w == v[0].pos.w && v[2].pos.w == v[0].pos.w) {\n");
+        h.push_str("        float2 q[3] = { v[0].pos.xy, v[1].pos.xy, v[2].pos.xy };\n");
+        h.push_str("        [unroll] for (uint i = 0u; i < 3u; i++) {\n");
+        h.push_str("            float2 p = q[i], a = q[(i + 1u) % 3u], b = q[(i + 2u) % 3u];\n");
+        h.push_str("            bool corner = (p.x == a.x && p.y == b.y) || (p.x == b.x && p.y == a.y);\n");
+        h.push_str("            bool degenerate = all(p == a) || all(p == b) || all(a == b);\n");
+        h.push_str("            if (c == 3u && corner && !degenerate)\n                c = i;\n        }\n    }\n");
+    }
     h.push_str("    if (c == 3u) {\n        s.Append(v[0]);\n        s.Append(v[1]);\n        s.Append(v[2]);\n        return;\n    }\n");
     h.push_str("    XclOut k = v[c], a = v[(c + 1u) % 3u], b = v[(c + 2u) % 3u];\n    XclOut d = v[0];\n");
     h.push_str("    d.pos = a.pos + b.pos - k.pos;\n");
@@ -6344,7 +6808,7 @@ pub fn mesh_passthrough_for(ms: &MsInterface, ps_inputs: Option<&[SigElement]>) 
         h.push_str("        verts[i] = o;\n    }\n");
         let _ = writeln!(h, "    for (uint j = gi; j < np; j += {t}u) {{");
         let _ = writeln!(h, "        uint p = res.Load((rec + {tri_base}u + j) * 4u);");
-        h.push_str("        uint3 x = uint3(p & 0x3FFu, (p >> 10) & 0x3FFu, (p >> 20) & 0x3FFu);\n");
+        let _ = writeln!(h, "        uint3 x = {};", prim_indices("p"));
         h.push_str("        bool bad = or((p >> 31) != 0u, any(x >= nv));\n");
         h.push_str("        tris[j] = select(bad, uint3(0u, 0u, 0u), x);\n    }\n}\n");
         return h;
@@ -6362,7 +6826,7 @@ pub fn mesh_passthrough_for(ms: &MsInterface, ps_inputs: Option<&[SigElement]>) 
     h.push_str("    SetMeshOutputCounts(3u * n, n);\n");
     let _ = writeln!(h, "    for (uint j = gi; j < n; j += {t}u) {{");
     let _ = writeln!(h, "        uint p = res.Load((rec + {tri_base}u + first + j) * 4u);");
-    h.push_str("        uint3 x = uint3(p & 0x3FFu, (p >> 10) & 0x3FFu, (p >> 20) & 0x3FFu);\n");
+    let _ = writeln!(h, "        uint3 x = {};", prim_indices("p"));
     h.push_str("        bool bad = or((p >> 31) != 0u, any(x >= nv));\n");
     h.push_str("        [unroll] for (uint c = 0u; c < 3u; c++) {\n");
     let _ = writeln!(h, "        uint b = (rec + {MESH_HEADER}u + select(bad, 0u, x[c]) * {vd}u) * 4u;");
@@ -6571,13 +7035,14 @@ const MEM_ACCESSORS_HERE: &str = "//XCL_MEM_ACCESSORS\n";
 /// Every `mem.Method(` of the program (and of the preludes) becomes an accessor
 /// `xcl_mMethod(` on the memory window `xcl_w` selects, and every `memv.Method(` one
 /// `xcl_vMethod(` on the per-lane window `xcl_wv`; their definitions replace the placeholder.
-fn windowed(h: &str, windows: u32, coherence: MemCoherence) -> String {
+fn windowed(h: &str, windows: u32, coherence: MemCoherence, outline: bool) -> String {
     let mut out = String::with_capacity(h.len() + 8192);
     let mut rest = h;
     while let Some(i) = rest.find("mem") {
         let before_ok = rest[..i].chars().next_back().is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'));
         let (prefix, skip) = match &rest[i..] {
             r if r.starts_with("memv.") => ("xcl_v", 5),
+            r if r.starts_with("memc.") => ("xcl_m_cached", 5),
             r if r.starts_with("mem.") => ("xcl_m", 4),
             _ => ("", 3),
         };
@@ -6595,7 +7060,13 @@ fn windowed(h: &str, windows: u32, coherence: MemCoherence) -> String {
     }
     out.push_str(rest);
     let groups = out.contains("xcl_group_pages(");
-    out.replacen(MEM_ACCESSORS_HERE, &mem_accessors(windows, coherence, groups), 1)
+    let accessors = mem_accessors(windows, coherence, groups);
+    let accessors = match (outline, outline_statics()) {
+        (false, _) => accessors,
+        (true, false) => outlined(&accessors, &outlined_accessor),
+        (true, true) => format!("{OUTLINE_RESULT_STATICS}{}", outlined(&accessors, &outlined_accessor)),
+    };
+    out.replacen(MEM_ACCESSORS_HERE, &accessors, 1)
 }
 
 /// The accessor functions: one per `mem` method (and overload) the translator emits, each on
@@ -6641,19 +7112,21 @@ fn mem_accessors(windows: u32, coherence: MemCoherence, groups: bool) -> String 
         &[("xcl_m", "xcl_mem_views")]
     };
     let mut s = String::new();
+    let shrink = groups && accessor_shrink();
     let coherent = if matches!(coherence, MemCoherence::Plain) { "" } else { "globallycoherent " };
     if windows > 1 {
         let _ = writeln!(s, "static const uint xcl_windows = {windows}u;");
         s.push_str(super::GPU_PAGE_DIRECTORY_HLSL);
         s.push_str(PHYSICAL_ACCESS);
         if groups {
-            s.push_str(&PAGE_GROUPS.replace("XCL_NULL_VIEW", &super::MEM_NULL_VIEW.to_string()));
+            let pages = PAGE_GROUPS.replace("XCL_NULL_VIEW", &super::MEM_NULL_VIEW.to_string());
+            s.push_str(&if shrink { pages.replacen(GROUP_PAGES_TWICE, GROUP_PAGES_LOOP, 1) } else { pages });
         }
     }
     for &(prefix, view) in families {
         let w = if prefix == "xcl_m" { "xcl_w" } else { "xcl_wv" };
         for cached in [false, true] {
-            if cached && (prefix != "xcl_m" || !matches!(coherence, MemCoherence::CachedBefore(_))) {
+            if cached && (prefix != "xcl_m" || !matches!(coherence, MemCoherence::CachedBefore(_) | MemCoherence::PlainBefore(_))) {
                 continue;
             }
             let prefix = if cached { "xcl_m_cached" } else { prefix };
@@ -6732,9 +7205,16 @@ fn mem_accessors(windows: u32, coherence: MemCoherence, groups: bool) -> String 
     }
     s.push_str("return uint4(b.Load(a.x), b.Load(a.y), b.Load(a.z), b.Load(a.w)); }\n");
     if windows > 1 && groups {
-        let _ = write!(s, "uint4 xcl_loadx4G(uint4 a, uint64_t g, uint4 r) {{ {coherent}RWByteAddressBuffer b = ResourceDescriptorHeap[{view}]; uint2 z = xcl_resolve_va(xcl_operand_va(0u)); ");
+        let _ = write!(s, "uint4 xcl_loadx4G(uint4 a, uint64_t g, uint4 r) {{ {coherent}RWByteAddressBuffer b = ResourceDescriptorHeap[{view}]; ");
+        if !shrink {
+            s.push_str("uint2 z = xcl_resolve_va(xcl_operand_va(0u)); ");
+        }
         for (k, c) in ["x", "y", "z", "w"].iter().enumerate() {
-            let _ = write!(s, "uint64_t v{k} = xcl_operand_va(a.{c}); uint2 q{k} = xcl_group_at(v{k}, g, r); uint2 p{k} = uint2(select(a.{c} == 0u, z.x, q{k}.x), select(a.{c} == 0u, z.y, q{k}.y)); ");
+            if shrink {
+                let _ = write!(s, "uint64_t v{k} = xcl_operand_va(a.{c}); uint2 p{k} = xcl_group_at(v{k}, g, r); ");
+            } else {
+                let _ = write!(s, "uint64_t v{k} = xcl_operand_va(a.{c}); uint2 q{k} = xcl_group_at(v{k}, g, r); uint2 p{k} = uint2(select(a.{c} == 0u, z.x, q{k}.x), select(a.{c} == 0u, z.y, q{k}.y)); ");
+            }
         }
         let _ = write!(s, "if (all((a >> 16) == (a.x >> 16))) {{ if (or(xcl_page_table != 0u, !xcl_direct(v0, xcl_w, 4u))) {{ {coherent}RWByteAddressBuffer x = ResourceDescriptorHeap[NonUniformResourceIndex(p0.x)]; a = (p0.y & 0xffff0000u) | (a & 65535u); return uint4(x.Load(a.x), x.Load(a.y), x.Load(a.z), x.Load(a.w)); }} }} else {{ ");
         for (k, c) in ["x", "y", "z", "w"].iter().enumerate() {
@@ -6742,7 +7222,44 @@ fn mem_accessors(windows: u32, coherence: MemCoherence, groups: bool) -> String 
         }
         s.push_str("return uint4(b0.Load(o0), b1.Load(o1), b2.Load(o2), b3.Load(o3)); }\nreturn uint4(b.Load(a.x), b.Load(a.y), b.Load(a.z), b.Load(a.w)); }\n");
     }
+    if matches!(coherence, MemCoherence::PlainBefore(_)) {
+        // the group and four-address loads once more on the view that is not coherent: their text
+        // without the qualifier, the single loads they fall back to with it
+        for (name, cached) in [("xcl_mLoadG", "xcl_m_cachedLoadG"), ("xcl_mLoad2G", "xcl_m_cachedLoad2G"), ("xcl_mLoad4G", "xcl_m_cachedLoad4G"), ("xcl_loadx4", "xcl_loadx4_cached"), ("xcl_loadx4G", "xcl_loadx4G_cached")] {
+            let Some(f) = function_text(&s, name) else { continue };
+            let f = f.replacen(&format!(" {name}("), &format!(" {cached}("), 1).replace("globallycoherent ", "").replace("xcl_mLoad(", "xcl_m_cachedLoad(");
+            s.push_str(&f);
+            s.push('\n');
+        }
+    }
     s
+}
+
+/// The definition of function `name` in `src` (it starts a line), to its closing brace.
+fn function_text<'a>(src: &'a str, name: &str) -> Option<&'a str> {
+    let head = format!(" {name}(");
+    let mut from = 0;
+    let start = loop {
+        let line = &src[from..];
+        let end = line.find('\n').unwrap_or(line.len());
+        if line[..end].split_once(&head).is_some_and(|(ret, rest)| !ret.contains(' ') && rest.contains(") {")) {
+            break from;
+        }
+        from += end + 1;
+        if from >= src.len() {
+            return None;
+        }
+    };
+    let mut depth = 0;
+    for (j, c) in src[start..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' if depth == 1 => return Some(&src[start..start + j + 1]),
+            '}' => depth -= 1,
+            _ => {}
+        }
+    }
+    None
 }
 
 /// The instruction helpers carry the low word of a byte address. Their component offsets are
@@ -6791,6 +7308,16 @@ uint2 xcl_group_at(uint64_t va, uint64_t g, uint4 r) {
     return uint2(x, select(y == 0u, 0u, y - 1u + ((uint)va & 65535u)));
 }
 "#;
+
+/// `xcl_group_pages` with one resolution in a loop (`accessor_shrink`): the same pages, half the
+/// code of the page walk.
+const GROUP_PAGES_TWICE: &str = "    return uint4(xcl_resolve_va(s | 1ull), xcl_resolve_va(s + 0x10001ull));\n";
+const GROUP_PAGES_LOOP: &str = "    uint4 r = uint4(0u, 0u, 0u, 0u);\n    [loop] for (uint k = 0u; k < 2u; k++) {\n        uint2 p = xcl_resolve_va(s + 0x10000ull * k + 1ull);\n        r = select(k == 0u, uint4(p, r.zw), uint4(r.xy, p));\n    }\n    return r;\n";
+
+/// `ld_raw`'s loads, and the same loads in one page group (`accessor_shrink`): its 20 bytes from
+/// `b` lie in `b`'s page and the next.
+pub(super) const LD_RAW_LOADS: &str = "uint4 w = mem.Load4(b); uint w4 = mem.Load(b + 16u);";
+pub(super) const LD_RAW_GROUPED: &str = "uint64_t g = xcl_operand_va(b); uint4 r = xcl_group_pages(g); uint4 w = mem.Load4G(b, g, r); uint w4 = mem.LoadG(b + 16u, g, r);";
 
 /// The memory helpers of `src` (`PRELUDE_MEM_ACCESS`, or a line of the program) on the
 /// per-lane window: `memv` and the helpers' `_v` forms.
@@ -6968,7 +7495,7 @@ uint fmt_pick(uint4 r, uint4 e, bool decode, uint constant, bool zero) { return 
 
 /// Unaligned and sub-dword memory access, BVH nodes. With several memory windows also
 /// emitted on the per-lane window (`lane_helpers`).
-const PRELUDE_MEM_ACCESS: &str = r#"
+pub(super) const PRELUDE_MEM_ACCESS: &str = r#"
 uint4 bvh_intersect(uint type, uint at, float tmax, float3 o, float3 d, float3 inv, bool sort) {
     if (type == 4u || type == 5u) {
         uint4 child = mem.Load4(at);

@@ -26,6 +26,7 @@ public:
     void setHelp(const QString& help);
     // Disable the controls and say why under the help ("Not in this XSEmu build yet.").
     void setUnavailable(const QString& why = notInBuild());
+    void setAvailable(); // undoes setUnavailable
     void setBorder(bool on);
     Label* helpLabel() const { return m_help; }
 

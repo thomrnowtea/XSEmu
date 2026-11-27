@@ -19,7 +19,7 @@ use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::hle::d3d12x::physical_directory::recordings::{self, PrivateBundle};
-use crate::hle::d3d12x::{bind, console_list, list_x, pso_async, real};
+use crate::hle::d3d12x::{bind, console_list, list_x, pso_async, real, shader_code};
 
 #[derive(Clone, Debug, PartialEq)]
 enum Cmd {
@@ -197,7 +197,9 @@ impl Recipe {
         // a native BUNDLE even where the title's own bundles are DIRECT lists (`single`)
         let mut pc = std::ptr::null_mut();
         let iid = &ID3D12GraphicsCommandList::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
-        let hr = real::dev_create_command_list(dev, 0, D3D12_COMMAND_LIST_TYPE_BUNDLE.0 as usize, a, pso_async::resolve_for_bind(self.pso), iid, &mut pc);
+        let first = pso_async::resolve_for_bind(self.pso);
+        shader_code::in_bundle(first);
+        let hr = real::dev_create_command_list(dev, 0, D3D12_COMMAND_LIST_TYPE_BUNDLE.0 as usize, a, first, iid, &mut pc);
         if hr < 0 || pc.is_null() {
             return Err(format!("private BUNDLE creation: {:#x}", hr as u32));
         }

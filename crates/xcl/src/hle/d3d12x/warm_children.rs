@@ -274,7 +274,38 @@ pub(super) struct Plan {
     pub recycle_keys: usize,
     pub recycle_commit: u64,
     pub key_timeout: Duration,
+    /// `XCL_DXC_THREADS` as set by hand: every child keeps it (`ProcessSpawner`), and a pool child
+    /// has no more workers than that (`with_env`)
+    pub dxc_set: Option<usize>,
+    /// a pool child is replaced only once the one it replaces has exited (`with_env`)
+    pub strict_pool: bool,
+    /// keys go to the pool children as the memory allows (`with_env`, `Follow`)
+    pub follow: Option<Follow>,
 }
+
+/// The pool children are fed as the memory allows (`XCL_WARM_FOLLOW_MEMORY=0`: as their workers
+/// free up): a key is given only while the memory available, less `per_key` for each key given
+/// and not started or started within `FRESH` (its memory does not show yet) and `CHILD_BASELINE`
+/// for each pool child that has not said hello, holds `per_key` above `URGENT_FLOOR` and `margin`.
+/// With nothing in flight anywhere one key is always given. The children's governors keep the
+/// same margin (`margin`), and so does a giant's child (`giant_fits`). play-102's passes ran the
+/// PC into its 1 GB stop: 25 driver compiles admitted at 14 to 15 GB available took it to 1.7 to
+/// 2.3 GB within seconds, each time as a replacement pool child started beside the one it replaced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Follow {
+    pub margin: u64,
+    pub per_key: u64,
+}
+
+/// What a warm-up process's driver compiles keep available above `URGENT_FLOOR`: the pass's
+/// `Follow::margin`, from the environment its children inherit (`real::DRIVER_COMPILES`).
+pub(super) fn governor_margin() -> u64 {
+    static MARGIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MARGIN.get_or_init(|| Plan::new(&ChildOptions::default(), 1).with_env(|name| std::env::var(name).ok()).margin())
+}
+
+/// How long a key's memory is taken not to show in the memory available yet (`Follow`).
+pub(super) const FRESH: Duration = Duration::from_secs(10);
 
 impl Plan {
     pub(super) fn new(options: &ChildOptions, cores: usize) -> Plan {
@@ -289,7 +320,35 @@ impl Plan {
             recycle_keys: options.recycle_keys.max(1),
             recycle_commit: options.recycle_mb.max(1) << 20,
             key_timeout: Duration::from_secs(options.key_timeout_s.max(1)),
+            dxc_set: None,
+            strict_pool: false,
+            follow: None,
         }
+    }
+
+    /// The plan under the environment (`var`): `XCL_DXC_THREADS` caps a pool child's workers as
+    /// well as its DXC threads, `XCL_WARM_POOL_THREADS` sets them; a pool child is replaced only
+    /// once the one it replaces has exited (`XCL_WARM_STRICT_POOL=0`: beside it, as before); keys
+    /// follow the memory (`Follow`; `XCL_WARM_FOLLOW_MEMORY=0`: off) with `XCL_WARM_MARGIN_MB` above
+    /// the 1 GB floor (2048) and `XCL_WARM_KEY_MB` for each key whose memory does not show yet
+    /// (512). play-102's pass 3 set `XCL_DXC_THREADS=4` and its pool child still ran 24 workers.
+    pub(super) fn with_env(mut self, var: impl Fn(&str) -> Option<String>) -> Plan {
+        let number = |name: &str| var(name).and_then(|v| v.trim().parse::<u64>().ok());
+        let on = |name: &str| var(name).map_or(true, |v| v.trim() != "0");
+        self.dxc_set = number("XCL_DXC_THREADS").map(|n| n.clamp(1, 64) as usize);
+        let threads = number("XCL_WARM_POOL_THREADS").map(|n| n.clamp(1, 64) as usize).or(self.dxc_set);
+        self.pool_threads = threads.map_or(self.pool_threads, |n| self.pool_threads.min(n));
+        self.strict_pool = on("XCL_WARM_STRICT_POOL");
+        self.follow = on("XCL_WARM_FOLLOW_MEMORY").then(|| Follow {
+            margin: number("XCL_WARM_MARGIN_MB").unwrap_or(2048).min(64 << 10) << 20,
+            per_key: number("XCL_WARM_KEY_MB").unwrap_or(512).clamp(64, 16 << 10) << 20,
+        });
+        self
+    }
+
+    /// What every admission of the pass keeps above `URGENT_FLOOR` (`Follow::margin`).
+    pub(super) fn margin(&self) -> u64 {
+        self.follow.map_or(0, |f| f.margin)
     }
 
     pub(super) fn threads(&self, lane: Lane) -> usize {
@@ -301,6 +360,9 @@ impl Plan {
 
     /// A child's share of the cores for DXC (`XCL_DXC_THREADS`).
     pub(super) fn dxc_threads(&self, lane: Lane) -> usize {
+        if let Some(n) = self.dxc_set {
+            return n;
+        }
         match lane {
             Lane::Pool => self.pool_threads,
             Lane::Single => self.single_dxc_threads,
@@ -396,6 +458,9 @@ pub(super) struct Stats {
     pub mismatched: usize,
     /// keys pool children handed back as giants
     pub handed: usize,
+    /// steps in which the pool children were given fewer keys than their workers had room for,
+    /// for the memory (`Follow`)
+    pub memory_holds: usize,
     pub peak_working_set: u64,
     pub peak_commit: u64,
 }
@@ -764,8 +829,21 @@ impl Coordinator {
             return actions;
         }
         let gate = self.start_singles(now, room, &mut actions);
-        self.feed_pool(now, gate, &mut actions);
+        self.feed_pool(now, gate, room, &mut actions);
         actions
+    }
+
+    /// Keys the pool children may be given now (`Follow`; unlimited without it).
+    fn pool_allowance(&self, now: Instant, room: &Room) -> usize {
+        let Some(follow) = self.plan.follow else { return usize::MAX };
+        let pool = || self.children.values().filter(|c| c.lane == Lane::Pool && c.killed.is_none());
+        let fresh: usize = pool().map(|c| c.assigned.len() + c.running.values().filter(|clock| clock.at(now) < FRESH).count()).sum();
+        let starting = pool().filter(|c| !c.hello).count() as u64;
+        let held = (fresh as u64).saturating_mul(follow.per_key).saturating_add(starting * CHILD_BASELINE);
+        let spare = room.available.saturating_sub(super::real::URGENT_FLOOR + follow.margin).saturating_sub(held);
+        let allowed = (spare / follow.per_key) as usize;
+        let idle = room.usage.running == 0 && pool().all(|c| c.outstanding() == 0);
+        if idle { allowed.max(1) } else { allowed }
     }
 
     /// `room` with the single-key giant children the shared table may not show yet, and what was
@@ -815,7 +893,7 @@ impl Coordinator {
                 }
             };
             let job = self.jobs.get(&key).copied().unwrap_or(Job { key, guest: 0, giant: false, dxil: None });
-            if job.giant && !giant_fits(job.peak(), &room) {
+            if job.giant && !giant_fits(job.peak().saturating_add(self.plan.margin()), &room) {
                 if room.usage.giants != 0 {
                     self.giant_waiting = None;
                     return false;
@@ -853,11 +931,16 @@ impl Coordinator {
     /// Each pool child kept at its threads plus one key given; one given `recycle_keys` or over
     /// `recycle_commit` is told to end and another takes its place. While a giant has waited for
     /// memory twice `GIANT_PATIENCE` (`gate`), every pool child is told to end, its memory freed.
-    fn feed_pool(&mut self, now: Instant, gate: bool, actions: &mut Vec<Action>) {
+    fn feed_pool(&mut self, now: Instant, gate: bool, room: &Room, actions: &mut Vec<Action>) {
         let plan = self.plan;
         let drain = gate && self.giant_waiting.is_some_and(|since| now.duration_since(since) >= 2 * GIANT_PATIENCE);
-        let feed = |c: &mut Child, pool: &mut VecDeque<u64>| {
-            let want = (plan.pool_threads + 1).saturating_sub(c.outstanding()).min(plan.recycle_keys.saturating_sub(c.given));
+        let mut allowance = self.pool_allowance(now, room);
+        let mut held = false;
+        let mut feed = |c: &mut Child, pool: &mut VecDeque<u64>| {
+            let room_for = (plan.pool_threads + 1).saturating_sub(c.outstanding()).min(plan.recycle_keys.saturating_sub(c.given));
+            let want = room_for.min(allowance);
+            held |= want < room_for && !pool.is_empty();
+            allowance -= want.min(allowance);
             let keys: Vec<u64> = (0..want).map_while(|_| pool.pop_front()).collect();
             c.given += keys.len();
             c.assigned.extend(&keys);
@@ -873,13 +956,16 @@ impl Coordinator {
                 actions.extend(feed(c, &mut self.pool).map(|order| Action::Send { child, order }));
             }
         }
-        while !gate && !self.pool.is_empty() && self.children.values().filter(|c| c.lane == Lane::Pool && c.live()).count() < plan.pool_children {
+        // (strict: a pool child told to end still counts until it has exited)
+        let counted = |c: &Child| c.lane == Lane::Pool && if plan.strict_pool { c.killed.is_none() } else { c.live() };
+        while !gate && !self.pool.is_empty() && self.children.values().filter(|c| counted(c)).count() < plan.pool_children {
             let spawn = self.spawn(Lane::Pool, now);
             let Action::Spawn { child, .. } = spawn else { unreachable!() };
             actions.push(spawn);
             let c = self.children.get_mut(&child).unwrap();
             actions.extend(feed(c, &mut self.pool).map(|order| Action::Send { child, order }));
         }
+        self.stats.memory_holds += held as usize;
     }
 }
 
@@ -1139,7 +1225,7 @@ impl JobObject {
 }
 
 /// Resumes process `pid`, started suspended (`CREATE_SUSPENDED`: its one thread).
-fn resume(pid: u32) -> std::io::Result<()> {
+pub(super) fn resume(pid: u32) -> std::io::Result<()> {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32};
     use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
@@ -1381,6 +1467,77 @@ mod tests {
         assert_eq!((p.pool_children, p.pool_threads, p.single_children), (2, 1, 2));
         let p = Plan::new(&ChildOptions { pool_children: Some(16), giant_children: Some(200), ..ChildOptions::default() }, 256);
         assert_eq!(p.single_children, super::super::warm_peers::SLOTS - 2 * 16 - 1, "within the peer table's slots, recycled pool children overlapping");
+    }
+
+    /// play-102's pass 3: `XCL_DXC_THREADS=4` and one pool child, which still ran 24 workers.
+    #[test]
+    fn the_environment_caps_the_pool_workers_and_sets_the_memory_rules() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| move |name: &str| pairs.iter().find(|(k, _)| *k == name).map(|(_, v)| v.to_string());
+        let one = ChildOptions { pool_children: Some(1), ..ChildOptions::default() };
+        let p = Plan::new(&one, 24).with_env(env(&[]));
+        assert_eq!((p.pool_threads, p.dxc_threads(Lane::Pool), p.dxc_set), (24, 24, None));
+        assert!(p.strict_pool);
+        assert_eq!(p.follow, Some(Follow { margin: 2 << 30, per_key: 512 << 20 }));
+        let p = Plan::new(&one, 24).with_env(env(&[("XCL_DXC_THREADS", "4")]));
+        assert_eq!((p.pool_threads, p.dxc_threads(Lane::Pool), p.dxc_threads(Lane::Single)), (4, 4, 4), "XCL_DXC_THREADS caps the workers too");
+        let p = Plan::new(&one, 24).with_env(env(&[("XCL_DXC_THREADS", "4"), ("XCL_WARM_POOL_THREADS", "8")]));
+        assert_eq!((p.pool_threads, p.dxc_threads(Lane::Pool)), (8, 4));
+        let p = Plan::new(&ChildOptions::default(), 24).with_env(env(&[("XCL_WARM_POOL_THREADS", "64")]));
+        assert_eq!(p.pool_threads, 12, "never more than the cores' share");
+        let p = Plan::new(&one, 24).with_env(env(&[("XCL_WARM_STRICT_POOL", "0"), ("XCL_WARM_FOLLOW_MEMORY", "0")]));
+        assert!(!p.strict_pool && p.follow.is_none() && p.margin() == 0);
+        let p = Plan::new(&one, 24).with_env(env(&[("XCL_WARM_MARGIN_MB", "3072"), ("XCL_WARM_KEY_MB", "1024")]));
+        assert_eq!(p.follow, Some(Follow { margin: 3 << 30, per_key: 1 << 30 }));
+    }
+
+    /// play-102: each pass hit the RAM stop as a replacement pool child started beside the one it
+    /// replaced (3 pool children with 2 asked for, 2 to 3 with 1). Strict, the replacement starts
+    /// once the old one has exited.
+    #[test]
+    fn a_strict_pool_child_is_replaced_only_after_the_old_one_exits() {
+        let now = Instant::now();
+        let plan = Plan { pool_children: 1, strict_pool: true, ..plan() };
+        let mut c = started(plan, small(1..20), now);
+        assert_eq!(keys_sent(&c.step(now, &ROOMY), 0), [1, 2, 3]);
+        c.on_msg(0, Msg::Start { key: 1 }, now);
+        c.on_msg(0, Msg::Done(done(1)), now);
+        assert_eq!(keys_sent(&c.step(now, &ROOMY), 0), [4], "the 4th key: recycle_keys");
+        for key in [2, 3] {
+            c.on_msg(0, Msg::Done(done(key)), now);
+        }
+        let a = c.step(now, &ROOMY);
+        assert!(a.contains(&Action::Send { child: 0, order: Order::End }));
+        assert!(spawned(&a).is_empty(), "the old child still runs key 4");
+        c.on_msg(0, Msg::Done(done(4)), now);
+        assert!(spawned(&c.step(now, &ROOMY)).is_empty(), "nor until it has exited");
+        c.on_exit(0, true, "exit code 0");
+        let a = c.step(now, &ROOMY);
+        assert_eq!(spawned(&a), [(1, Lane::Pool)]);
+        assert_eq!(keys_sent(&a, 1), [5, 6, 7]);
+    }
+
+    /// Keys follow the memory: each key given and not yet showing holds `per_key`, a child not yet
+    /// started holds `CHILD_BASELINE`, and with nothing in flight one key always goes.
+    #[test]
+    fn pool_keys_follow_the_memory_available() {
+        let now = Instant::now();
+        let follow = Follow { margin: 2 << 30, per_key: 1 << 30 };
+        let plan = Plan { pool_children: 1, pool_threads: 8, recycle_keys: 100, strict_pool: true, follow: Some(follow), ..plan() };
+        let floor = super::super::real::URGENT_FLOOR + follow.margin;
+        let room = |available: u64, running: usize| Room { available, usage: Usage { running, giants: 0, reserved: 0 } };
+        let mut c = started(plan, small(1..40), now);
+        assert_eq!(keys_sent(&c.step(now, &room(floor + (3 << 30), 0)), 0), [1, 2, 3], "3 GiB above the margin: 3 keys of the 9 it has room for");
+        assert!(keys_sent(&c.step(now, &room(floor + (3 << 30), 3)), 0).is_empty(), "their memory does not show yet");
+        for key in 1..=3 {
+            c.on_msg(0, Msg::Start { key }, now);
+        }
+        let later = now + FRESH;
+        assert_eq!(keys_sent(&c.step(later, &room(floor + (2 << 30), 3)), 0), [4, 5], "after FRESH their memory shows in the RAM available");
+        assert!(keys_sent(&c.step(later, &room(floor + (2 << 30), 3)), 0).is_empty());
+        assert_eq!(c.stats.memory_holds, 4);
+        let mut idle = started(plan, small(1..4), now);
+        assert_eq!(keys_sent(&idle.step(now, &room(1 << 30, 0)), 0), [1], "nothing in flight: one key whatever the memory");
+        assert!(keys_sent(&idle.step(now, &room(1 << 30, 0)), 0).is_empty());
     }
 
     #[test]

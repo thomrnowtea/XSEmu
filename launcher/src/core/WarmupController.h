@@ -19,7 +19,9 @@ struct RunnerSpec;
 
 // Shader warm-ups: "XSEmu.exe warm-up [--full] --progress-json", its JSON progress and cancel.
 // The cache is machine-wide (the emulator takes no game argument); the game picked in the UI is
-// recorded with the run so the Warm-up page can say which game it was for.
+// recorded with the run so the Warm-up page can say which game it was for, and its run environment
+// (LaunchConfig::runEnvironment, the same as Play's) picks the translator switches and so the cache
+// generation the warm-up fills.
 // A game set to run with a third-party runner gets that runner's pre-cache instead: its steps
 // (RunnerSpec::precache) run hidden one after another, their output read by the step's progress
 // parser; a check step that finds nothing waiting, or a step whose needed files are missing, ends
@@ -68,7 +70,8 @@ public:
     void setRunners(RunnerManager* runners) { m_runners = runners; }
     // The runner whose warm-up runs for this game: its "Runs with" choice (XSEmu without a game).
     const RunnerSpec& runnerFor(const Game& game) const;
-    // Why a warm-up for this game cannot start now (empty: it can).
+    // Why a warm-up for this game cannot start now (empty: it can); XSEmu's own warm-up never starts
+    // while AppSettings::xsemuWarmup is off.
     QString checkStart(const Game& forGame = {}) const;
     bool start(bool full, const Game& forGame = {}, QString* error = nullptr);
     // Ask it to stop starting compiles; builds in flight finish (can take minutes for giants).
@@ -129,6 +132,7 @@ private:
     QElapsedTimer m_stepClock;
     RunnerManager* m_runners = nullptr;
     const RunnerSpec* m_spec = nullptr; // the runner of this pre-cache; nullptr: XSEmu's warm-up
+    QString m_profile;                  // XSEmu's warm-up: the run profile identity it started with
     int m_step = 0;
     qint64 m_built = 0; // what the runner's finished steps built
 };

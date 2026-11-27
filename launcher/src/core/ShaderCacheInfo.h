@@ -79,8 +79,13 @@ struct ShaderCacheInfo {
 // A game's warm-up state as far as the launcher can tell: from its own warm-up records (the
 // emulator keeps no per-title shader state, so a game nobody warmed up from this launcher is Unknown
 // unless the machine-wide cache is empty). A finished warm-up is Ready only while the cache still
-// holds driver blobs, so a cleared cache reads as NeverWarmed. Before the cache is scanned nothing is
-// claimed about it: only the launcher's own records count.
-enum class TitleShaderState { Unknown, NeverWarmed, Ready, LastRunIncomplete, LastRunFailed };
+// holds driver blobs, so a cleared cache reads as NeverWarmed, and only while it ran with the game's
+// current run profile (profile: LaunchConfig::profileIdentity; a record or a profile that is empty is
+// not compared), so a changed translator switch reads as ProfileChanged. Before the cache is scanned
+// nothing is claimed about it: only the launcher's own records count.
+enum class TitleShaderState { Unknown, NeverWarmed, Ready, LastRunIncomplete, LastRunFailed, ProfileChanged };
 
-TitleShaderState titleShaderState(const QString& titleId, const QList<WarmupRun>& recent, const ShaderCacheInfo& cache);
+TitleShaderState titleShaderState(const QString& titleId, const QList<WarmupRun>& recent, const ShaderCacheInfo& cache, const QString& profile = {});
+// The state the launcher shows and acts on: titleShaderState with the game's current run profile, or
+// Unknown while the XSEmu warm-up is turned off (AppSettings::xsemuWarmup), so nothing asks for it.
+TitleShaderState shownShaderState(const AppSettings& settings, const QString& titleId, const QList<WarmupRun>& recent, const ShaderCacheInfo& cache);

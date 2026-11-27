@@ -145,6 +145,8 @@ struct Pending {
     compute: bool,
     image_only: std::sync::atomic::AtomicBool,
     depth_only: std::sync::atomic::AtomicBool,
+    /// a ray pass built with every ray a miss (`rt_pass_last`): built behind every other one
+    rt_pass: std::sync::atomic::AtomicBool,
     /// of its shaders (`used`); 0 = none
     key: u64,
     record: u64,
@@ -190,6 +192,14 @@ struct Pending {
     left_out: std::sync::atomic::AtomicBool,
     /// a stage of the acceleration-structure builder (`mark_builder`): its real pipeline is one too
     builder: std::sync::atomic::AtomicBool,
+    /// draws and dispatches skipped for want of it since a bind-queue worker last took it
+    /// (`bound_by_skips`)
+    skips_waiting: AtomicU64,
+    /// in the bind queue and not taken by a worker yet (`bound_by_skips`: queued once)
+    in_bound: std::sync::atomic::AtomicBool,
+    /// a submit gave up waiting for it (`wait_for_submit`): later calls with it are skipped, not
+    /// put off to the submit
+    submit_gave_up: std::sync::atomic::AtomicBool,
 }
 
 impl Drop for Pending {
@@ -297,7 +307,7 @@ fn complete(p: &Pending, real: usize, fast: bool) {
     // outside `done`: the Release override takes PENDING (`counts` takes PENDING, then `done`)
     release(drop_now);
     // (one nothing bound keeps its build: its pipeline may be released and built again)
-    if !fast && p.bound.load(Ordering::SeqCst) {
+    if !fast && p.bound.load(Ordering::SeqCst) && !keeps_build(p) {
         *p.job.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 }
@@ -367,6 +377,111 @@ fn release_idle(p: &Pending, limit: std::time::Duration) -> bool {
     true
 }
 
+/// With a budget for the compiled code the lists use (`shader_code::budget`), a pipeline the
+/// budget may take away (a compute one; a graphics one too with `shader_code::graphics`) keeps
+/// its build after a bind too: `release_used` may take its pipeline away, and its next bind
+/// builds it again.
+fn keeps_build(p: &Pending) -> bool {
+    super::shader_code::budget() != 0 && (p.compute || super::shader_code::graphics())
+}
+
+/// Take `real` away from `p`, a pipeline that lists have used: a compute one, or with `graphics`
+/// (`shader_code::graphics`) a graphics one (true: taken; the caller
+/// gives it to `shader_code::retire`, which keeps it until those lists are through). The stand-in
+/// and its build stay; the next bind finds it not built and has it built again, as after
+/// `release_idle` (a draw with it is skipped or waits meanwhile, as before it was first built).
+///
+/// (A bind that read `real` before this took it goes on to set it on its list, where
+/// `shader_code::used` notes that list: that is why the pipeline is retired, not released here.)
+fn release_used(p: &Pending, real: usize, graphics: bool) -> bool {
+    if (!p.compute && !graphics) || p.orphan.load(Ordering::Acquire) || p.builder.load(Ordering::Acquire) || p.real_fast.load(Ordering::Acquire) || job_of(p).is_none() {
+        return false;
+    }
+    let mut done = p.done.lock().unwrap();
+    if !*done || p.real.compare_exchange(real, 0, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        return false;
+    }
+    *done = false;
+    p.built_at.store(0, Ordering::Release);
+    p.full_started.store(false, Ordering::Release);
+    p.tiered_started.store(false, Ordering::Release);
+    p.urgent.store(false, Ordering::Release);
+    p.preload.lock().unwrap_or_else(|e| e.into_inner()).demanded = false;
+    p.sent.store(false, Ordering::Release);
+    // (a bind that was skipped for want of it before does not queue its build again)
+    p.skipped.store(false, Ordering::Release);
+    p.submit_gave_up.store(false, Ordering::Release);
+    p.released_idle.store(true, Ordering::Release);
+    true
+}
+
+/// The thread that keeps the compiled code the lists use within its budget
+/// (`shader_code::budget`; started by the first bind when there is one): every second it
+/// releases the retired pipelines whose lists are through, and while the code is over the budget
+/// it takes the pipelines no list took for `shader_code::idle_ms` from their stand-ins (the
+/// compute ones; the graphics ones too with `shader_code::graphics`), the longest unused first.
+pub(super) fn start_code_release() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let (budget, idle_s) = (super::shader_code::budget() >> 20, super::shader_code::idle_ms() / 1000);
+        let graphics = super::shader_code::graphics();
+        // (with XCL_SHADER_CODE_GRAPHICS=0 every line here reads as it did for compute pipelines alone)
+        let (kind, also) = if graphics { ("", " (graphics pipelines too; XCL_SHADER_CODE_GRAPHICS=0: compute ones only)") } else { ("compute ", "") };
+        crate::xlog_info!("D3D12.X: compiled shader code budget {budget} MB (XCL_SHADER_CODE_MB; unset or 0: none): over it, {kind}pipelines no list took for {idle_s} s are released and built again at their next bind{also}");
+        let _ = std::thread::Builder::new().name("xcl-pso-code".into()).spawn(move || {
+            let (mut rounds, mut stuck) = (0usize, 0usize);
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                let (through, parked) = super::shader_code::through();
+                through.into_iter().for_each(release);
+                let (in_use, over) = super::shader_code::over_budget();
+                if over == 0 {
+                    stuck = 0;
+                    continue;
+                }
+                // (a member of a pass chain stays: while one is not built no pass of its chain
+                // runs, `pass_chain`)
+                let built: Vec<(usize, Arc<Pending>)> = PENDING.lock().unwrap().as_ref().map_or_else(Vec::new, |m| m.iter().filter(|(_, p)| (p.compute || graphics) && p.real.load(Ordering::Acquire) != 0).map(|(&standin, p)| (standin, p.clone())).collect());
+                // (PENDING is free again here: `pass_chain` takes it under its own lock)
+                let all: Vec<Arc<Pending>> = built.into_iter().filter(|(standin, _)| !super::pass_chain::member(*standin)).map(|(_, p)| p).collect();
+                // (a retail game holds about 51 000 stand-ins and a few hundred built pipelines)
+                let idle = all.iter().enumerate().filter(|(_, p)| (p.compute || graphics) && p.real.load(Ordering::Acquire) != 0).filter_map(|(at, p)| {
+                    let (last, bytes) = super::shader_code::idle(p.real.load(Ordering::Acquire))?;
+                    Some((last, bytes, at))
+                });
+                let (mut released, mut freed, mut drawing) = (0usize, 0usize, 0usize);
+                for (at, bytes) in super::shader_code::to_release(idle.collect(), over) {
+                    let real = all[at].real.load(Ordering::Acquire);
+                    // (looked at again: a list may have taken it since the candidates were listed)
+                    if real != 0 && super::shader_code::idle(real).is_some() && release_used(&all[at], real, graphics) {
+                        super::shader_code::retire(real);
+                        released += 1;
+                        freed += bytes;
+                        drawing += !all[at].compute as usize;
+                    }
+                }
+                if released > 0 {
+                    (rounds, stuck) = (rounds + 1, 0);
+                    if rounds <= 4 || rounds.is_power_of_two() {
+                        crate::xlog_info!(
+                            "D3D12.X: {released} {kind}pipelines no list took for {idle_s} s released{}, {} MB of compiled code: {} MB were in use against a budget of {budget} MB; {} released ones are kept until their lists are through; each is built again at its next bind (#{rounds})",
+                            if graphics { format!(" ({drawing} of them graphics)") } else { String::new() },
+                            freed >> 20,
+                            in_use >> 20,
+                            parked + released
+                        );
+                    }
+                } else {
+                    stuck += 1;
+                    if stuck == 5 || (stuck > 5 && stuck % 60 == 0) {
+                        crate::xlog_warn!("D3D12.X: the compiled code in use ({} MB) is {} MB over its budget of {budget} MB and no {kind}pipeline has gone {idle_s} s without a list taking it: nothing is released", in_use >> 20, over >> 20);
+                    }
+                }
+            }
+        });
+    });
+}
+
 /// How many built pipelines nothing has bound yet are kept at most (`XCL_PSO_IDLE_KEEP`, 4096 by
 /// default: ~1.6 GB in an NVIDIA driver): beyond it the oldest are released before `idle_limit`.
 /// Workers on every core build a retail game's pipelines faster than 30 s release them.
@@ -405,7 +520,7 @@ fn start_idle_release() {
             let mut unbound = Vec::new();
             for (at, p) in all.iter().enumerate() {
                 if p.bound.load(Ordering::SeqCst) {
-                    if *p.done.lock().unwrap() {
+                    if !keeps_build(p) && *p.done.lock().unwrap() {
                         *p.job.lock().unwrap_or_else(|e| e.into_inner()) = None;
                     }
                 } else {
@@ -708,15 +823,116 @@ fn enqueue_bound(p: Arc<Pending>) {
     let mut queue = QUEUE.lock().unwrap();
     queue.bound.push_back(p);
     if queue.bound.len() > BOUND_QUEUE {
-        queue.bound.pop_front();
+        if let Some(old) = queue.bound.pop_front() {
+            old.in_bound.store(false, Ordering::Release);
+        }
         drop(crate::progress::PIPELINES.take());
     }
+    BOUND_WAITING.store(queue.bound.len(), Ordering::Release);
     drop(queue);
     READY.notify_one();
 }
 
+/// pipelines in the bind queue no worker has taken (`bound_first`)
+static BOUND_WAITING: AtomicUsize = AtomicUsize::new(0);
+/// bind-queue builds taken by their skipped draws (`take_bound`)
+static BOUND_TAKEN: AtomicUsize = AtomicUsize::new(0);
+
+/// The bind queue holds each pipeline whose draws are skipped once and gives a worker the one
+/// with the most draws and dispatches skipped while it waited, the newest of equals first
+/// (`XCL_BOUND_BY_SKIPS=0`: every frame's skip queues it again, the last bound taken first).
+/// play-97 ended with 654 pipelines pending, the 181 tiled-lighting variants drawn every frame
+/// among them, behind builds bound once.
+pub(super) fn bound_by_skips() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("XCL_BOUND_BY_SKIPS").map_or(true, |v| v.trim() != "0");
+        if !on {
+            crate::xlog_info!("D3D12.X: the bind queue takes the pipeline bound last first (XCL_BOUND_BY_SKIPS=0)");
+        }
+        on
+    })
+}
+
+/// While pipelines whose draws are skipped wait in the bind queue for a worker, the preload
+/// workers start nothing new: the CPU and memory go to what the frame draws
+/// (`XCL_BOUND_FIRST=0`: they go on). In play-98 small compiles ran 5 to 10 times their
+/// expected time beside the preload's, while 797 pipelines stayed pending.
+fn bound_first() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = bound_by_skips() && std::env::var("XCL_BOUND_FIRST").map_or(true, |v| v.trim() != "0");
+        if !on {
+            crate::xlog_info!("D3D12.X: preload builds go on while skipped draws wait for theirs (XCL_BOUND_FIRST=0)");
+        }
+        on
+    })
+}
+
+fn bound_waiting() -> bool {
+    bound_first() && BOUND_WAITING.load(Ordering::Acquire) != 0
+}
+
+/// Of the skip counts of the bind queue's pipelines (oldest first), the one to build next: the
+/// most skipped, the newest of equals. (A ray pass built with every ray a miss ranks below every
+/// other pipeline: `rt_pass_last`.)
+fn most_skipped<K: Ord>(skips: impl Iterator<Item = K>) -> Option<usize> {
+    skips.enumerate().max_by(|a, b| (&a.1, a.0).cmp(&(&b.1, b.0))).map(|(at, _)| at)
+}
+
+/// The next pipeline of the bind queue (`bound_by_skips`); built and released ones leave it.
+fn take_bound(bound: &mut VecDeque<Arc<Pending>>) -> Option<Arc<Pending>> {
+    if !bound_by_skips() {
+        return bound.pop_back();
+    }
+    bound.retain(|p| {
+        let wanted = p.real.load(Ordering::Acquire) == 0 && !p.orphan.load(Ordering::Acquire);
+        if !wanted {
+            p.in_bound.store(false, Ordering::Release);
+        }
+        wanted
+    });
+    let at = most_skipped(bound.iter().map(|p| (!p.rt_pass.load(Ordering::Relaxed), p.skips_waiting.load(Ordering::Relaxed))));
+    let p = at.and_then(|at| bound.remove(at));
+    BOUND_WAITING.store(bound.len(), Ordering::Release);
+    let p = p?;
+    p.in_bound.store(false, Ordering::Release);
+    let skipped = p.skips_waiting.swap(0, Ordering::Relaxed);
+    let n = BOUND_TAKEN.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        crate::xlog_info!(
+            "D3D12.X: bind queue: {n} builds taken by their skipped draws, the latest with {skipped} skipped while it waited ({}; {} more queued)",
+            if p.what.is_empty() { "shaders unknown" } else { &p.what },
+            bound.len()
+        );
+    }
+    Some(p)
+}
+
 /// threads that build only what binds wait for, besides the workers (which take it first too)
 const URGENT_THREADS: usize = 4;
+
+/// The bind queue's workers besides the `URGENT_THREADS`: as many as the preload has
+/// (`preload_threads`), or DXC's pool when that is more (`XCL_BIND_WORKERS_BY_CORES=0`: DXC's
+/// pool, sized once by the memory left over its 6 GB reserve when it is first asked for;
+/// `XCL_BIND_WORKERS` sets the count). Each compile is still admitted by the memory it takes
+/// (`real::driver_slot`). play-101 built its skipped draws' pipelines on 4 threads, 2 more held
+/// by FFX_FSR4 giants, while its 12 preload workers waited behind the bind queue (`bound_first`)
+/// with ~9 GB available: ~1,850 pending for 500 s, 128 bind-queue builds in 740 s.
+fn bind_workers() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        let dxc = crate::gpu::recomp::dxc::compile_threads();
+        let set = std::env::var("XCL_BIND_WORKERS").ok().and_then(|v| v.trim().parse::<usize>().ok());
+        let by_cores = std::env::var("XCL_BIND_WORKERS_BY_CORES").map_or(true, |v| v.trim() != "0");
+        let n = set.map_or(if by_cores { dxc.max(preload_threads()) } else { dxc }, |n| n.clamp(1, 64));
+        crate::xlog_info!(
+            "D3D12.X: the bind queue is built on {n} workers, and {URGENT_THREADS} more take only builds a bind waits for (DXC's pool: {dxc}; XCL_BIND_WORKERS sets the count{})",
+            if by_cores { ", XCL_BIND_WORKERS_BY_CORES=0 keeps DXC's" } else { "" }
+        );
+        n
+    })
+}
 static READY: Condvar = Condvar::new();
 
 pub(super) fn diagnostic_queued() -> impl Iterator<Item = crate::live_stall::Sample> {
@@ -735,7 +951,7 @@ pub(super) fn diagnostic_queued() -> impl Iterator<Item = crate::live_stall::Sam
 fn start_workers() {
     static WORKERS: std::sync::Once = std::sync::Once::new();
     WORKERS.call_once(|| {
-        let n = crate::gpu::recomp::dxc::compile_threads();
+        let n = bind_workers();
         for k in 0..n + URGENT_THREADS {
             let urgent_only = k >= n;
             let name = if urgent_only { format!("xcl-pso-urgent-{}", k - n) } else { format!("xcl-pso-{k}") };
@@ -755,7 +971,7 @@ fn start_workers() {
                                 queue = READY.wait_timeout(queue, PARKED_POLL).unwrap().0;
                                 continue;
                             }
-                            if let Some(p) = queue.bound.pop_back() {
+                            if let Some(p) = take_bound(&mut queue.bound) {
                                 break (p, false, None);
                             }
                         }
@@ -1093,6 +1309,205 @@ pub(super) fn ready(pso: usize) -> bool {
     entry(pso).is_none_or(|p| p.real.load(Ordering::Acquire) != 0)
 }
 
+/// `p`'s build is waited for: before every other on the workers (a preload worker building it
+/// is raised instead), once.
+fn urge(p: &Arc<Pending>) {
+    if p.urgent.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    if p.compute && !*p.done.lock().unwrap() && !p.counted.swap(true, Ordering::AcqRel) {
+        COMPUTE_BOUND_PENDING.fetch_add(1, Ordering::AcqRel);
+    }
+    if !p.promote_preload() {
+        enqueue_urgent(p.clone());
+    }
+}
+
+/// `XCL_DEFER_TO_SUBMIT` (default 1): a draw or dispatch that `skip_until_built` would skip
+/// for want of its build gets a segment of its own, recorded at the submit (`list_x::defer`),
+/// and the submit waits for the build (`wait_for_submit`): a pass the title records once (a LUT
+/// bake, an init pass) is not lost for the whole run. 0: such a call is skipped, as before.
+pub(super) fn defer_to_submit() -> bool {
+    #[cfg(test)]
+    if let Some(on) = DEFER_FOR_TEST.with(Cell::get) {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("XCL_DEFER_TO_SUBMIT").map_or(true, |v| v.trim() != "0");
+        if !on {
+            crate::xlog_info!("D3D12.X: draws and dispatches whose pipeline is still being built are skipped, not put off to the submit (XCL_DEFER_TO_SUBMIT=0)");
+        }
+        on
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// `XCL_DEFER_TO_SUBMIT` for this test thread
+    static DEFER_FOR_TEST: Cell<Option<bool>> = const { Cell::new(None) };
+    /// `SUBMIT_WAIT_MOST` for this test thread
+    static SUBMIT_WAIT_FOR_TEST: Cell<Option<std::time::Duration>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn set_defer_for_test(on: Option<bool>) {
+    DEFER_FOR_TEST.with(|d| d.set(on));
+}
+
+#[cfg(test)]
+pub(super) fn set_submit_wait_for_test(most: Option<std::time::Duration>) {
+    SUBMIT_WAIT_FOR_TEST.with(|d| d.set(most));
+}
+
+/// Whether a call with `pso` would be skipped now for want of its build (`skip_until_built`) and
+/// may be put off to the submit instead (`defer_to_submit`). Not a pipeline left out (ray
+/// tracing off: it is never built), an image-only one (`XCL_PSO_IMAGE_SKIP`: skipped by choice)
+/// or one a submit already gave up on (a cold giant held for memory: later frames skip it as
+/// before instead of standing still at every submit).
+pub(super) fn deferrable(pso: usize) -> bool {
+    if !defer_to_submit() || !skip_until_built() {
+        return false;
+    }
+    let Some(p) = entry(pso) else { return false };
+    if p.left_out.load(Ordering::Acquire) || p.image_only.load(Ordering::Acquire) || p.submit_gave_up.load(Ordering::Acquire) || *p.done.lock().unwrap() {
+        return false;
+    }
+    if p.compute { super::bind::skip_failed_dispatches() } else { super::bind::skip_failed_draws() }
+}
+
+/// A call with `pso` was put off to the submit (`list_x::defer`): the submit will wait for its
+/// build, which goes before the others on the workers, as one a bind waits for.
+pub(super) fn need_by_submit(pso: usize) {
+    let Some(p) = entry(pso) else { return };
+    p.note_bind();
+    start_status();
+    p.sent.store(true, Ordering::Release);
+    urge(&p);
+}
+
+/// `XCL_DEFER_DRAWS` (default 1): draws are put off to the submit as dispatches are
+/// (`defer_to_submit`). 0: only dispatches are; a draw whose pipeline is still being built is
+/// skipped, as before.
+pub(super) fn defer_draws() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("XCL_DEFER_DRAWS").map_or(true, |v| v.trim() != "0");
+        if !on {
+            crate::xlog_info!("D3D12.X: draws whose pipeline is still being built are skipped, not put off to the submit; dispatches still are (XCL_DEFER_DRAWS=0)");
+        }
+        on
+    })
+}
+
+/// Whether `pso` is a compute pipeline, its shaders for the log and its real pipeline (0: not
+/// built) – None: not a pipeline built here.
+pub(super) fn kind_of(pso: usize) -> Option<(bool, String, usize)> {
+    entry(pso).map(|p| (p.compute, p.what.clone(), p.real.load(Ordering::Acquire)))
+}
+
+/// How long one submit waits at most for the pipelines of the calls put off to it, all of them
+/// together (`XCL_SUBMIT_WAIT_MS`, at most 30 s; 0: it does not wait, and such a call not built
+/// by its submit is skipped). The submitting thread is the title's, which a retail title's
+/// watchdog lets stand still 30 s at most, and what other queues wait for (a fence it signals)
+/// goes in only after the waits: a build that takes longer than this (a cold giant, an outlined
+/// DXC build) is not waited for to its end.
+const SUBMIT_WAIT_MOST: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn submit_wait_most() -> std::time::Duration {
+    #[cfg(test)]
+    if let Some(most) = SUBMIT_WAIT_FOR_TEST.with(Cell::get) {
+        return most;
+    }
+    static MOST: OnceLock<std::time::Duration> = OnceLock::new();
+    *MOST.get_or_init(|| {
+        let set = std::env::var("XCL_SUBMIT_WAIT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok());
+        let most = set.map_or(SUBMIT_WAIT_MOST, |ms| std::time::Duration::from_millis(ms.min(30_000)));
+        if set.is_some() {
+            crate::xlog_info!("D3D12.X: a submit waits {} ms at most for the pipelines of the calls put off to it (XCL_SUBMIT_WAIT_MS)", most.as_millis());
+        }
+        most
+    })
+}
+
+/// When the waits of a submit starting now end (`wait_for_submit`).
+pub(super) fn submit_deadline() -> std::time::Instant {
+    std::time::Instant::now() + submit_wait_most()
+}
+
+/// put-off calls whose pipeline was not built by their submit's deadline
+static SUBMIT_GAVE_UP: AtomicUsize = AtomicUsize::new(0);
+/// put-off calls skipped at their submit without a wait, a submit having given up on their
+/// pipeline already (`wait_for_submit`)
+static SUBMIT_SKIPPED_AT_ONCE: AtomicUsize = AtomicUsize::new(0);
+
+/// A submit records a call put off to it (`list_x::record_deferred`): wait until `pso` is built
+/// (or its build failed) or until `deadline`, whichever comes first. The submitting thread is
+/// held meanwhile (`title_held`), as a bind's wait holds it, and the build goes before the others.
+/// The workers and the memory governor build it as any other: one held for memory or put off is
+/// waited for no longer than `deadline` either. False: not built by then – the call goes the way
+/// it went before calls were put off (skipped and counted), and later calls with it are not put
+/// off again. One a submit gave up on already (put off before that) is not waited for again.
+pub(super) fn wait_for_submit(pso: usize, deadline: std::time::Instant) -> bool {
+    let Some(p) = entry(pso) else { return true };
+    if *p.done.lock().unwrap() {
+        return true;
+    }
+    if p.submit_gave_up.load(Ordering::Acquire) {
+        let n = SUBMIT_SKIPPED_AT_ONCE.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 4 || n.is_power_of_two() {
+            crate::xlog_info!(
+                "D3D12.X: deferred {} skipped at its submit without a wait: a submit gave up on its pipeline {pso:#x} already (#{n})",
+                if p.compute { "dispatch" } else { "draw" }
+            );
+        }
+        return false;
+    }
+    let _held = Held::new(&p);
+    let _live = crate::live_stall::begin(crate::live_stall::Stage::PipelineWait, p.record, p.key, None, None);
+    urge(&p);
+    let t0 = std::time::Instant::now();
+    let built = {
+        let mut done = p.done.lock().unwrap();
+        while !*done {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            done = p.cv.wait_timeout(done, left).unwrap().0;
+        }
+        *done
+    };
+    let ms = t0.elapsed().as_millis() as usize;
+    WAIT_MS.fetch_add(ms, Ordering::Relaxed);
+    let (kind, what) = (if p.compute { "compute" } else { "graphics" }, if p.what.is_empty() { "shaders unknown" } else { &p.what });
+    if built {
+        if ms >= 250 {
+            crate::xlog_info!("D3D12.X: a submit waited {ms} ms for {kind} pipeline {pso:#x} ({what}) of a call put off to it");
+        }
+        return true;
+    }
+    p.submit_gave_up.store(true, Ordering::Release);
+    if p.key != 0 && !p.skipped.swap(true, Ordering::AcqRel) {
+        used::note_skipped(p.key);
+    }
+    let n = SUBMIT_GAVE_UP.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 16 || n.is_power_of_two() {
+        crate::xlog_warn!(
+            "D3D12.X: deferred {} skipped after waiting {ms} ms for its pipeline (a submit waits {} ms at most; {n} so far): {kind} pipeline {pso:#x} ({what}) – later calls with it are skipped until it is built",
+            if p.compute { "dispatch" } else { "draw" },
+            submit_wait_most().as_millis()
+        );
+    }
+    false
+}
+
+/// put-off calls skipped at their submit so far (`wait_for_submit`)
+#[cfg(test)]
+fn submit_gave_up() -> usize {
+    SUBMIT_GAVE_UP.load(Ordering::Relaxed)
+}
+
 /// Ray tracing off (`raytracing::left_out`): `pso` is never built; its draws and dispatches are
 /// skipped as a failed build's, and counted (`raytracing::note_dispatch`).
 pub(super) fn give_up(pso: usize) {
@@ -1103,9 +1518,31 @@ pub(super) fn give_up(pso: usize) {
     complete(&p, 0, false);
 }
 
+/// `give_up` for a pipeline whose build is not wanted any more (`fsr4_standin`). None: nothing to
+/// drop, it is built, failed or left out already (or no stand-in). Some(started): a worker had
+/// started its build – that build runs on to its next wait for a driver compile's memory
+/// (`building_left_out`); one no worker had taken is never translated or compiled.
+pub(super) fn drop_build(pso: usize) -> Option<bool> {
+    let p = entry(pso)?;
+    if p.real.load(Ordering::Acquire) != 0 || *p.done.lock().unwrap() {
+        return None;
+    }
+    let started = p.full_started.load(Ordering::Acquire) || p.tiered_started.load(Ordering::Acquire) || p.preload.lock().unwrap_or_else(|e| e.into_inner()).worker.is_some();
+    give_up(pso);
+    Some(started)
+}
+
+/// The pipeline this worker builds was left out since the build started (`drop_build`): its
+/// driver compile is not to start (`real::Governor::acquire_within`), and a helper process
+/// compiling it is ended (`real::giant_helper`).
+pub(super) fn building_left_out() -> bool {
+    BUILDING.with(|b| b.borrow().as_ref().is_some_and(|p| p.left_out.load(Ordering::Acquire)))
+}
+
 /// Release a pipeline state XCL owns (raw pointer, 0 = none).
 pub fn release(p: usize) {
     if p != 0 {
+        super::shader_code::gone(p);
         unsafe { drop(<windows::Win32::Graphics::Direct3D12::ID3D12PipelineState as windows::core::Interface>::from_raw(p as *mut std::ffi::c_void)) };
     }
 }
@@ -1181,6 +1618,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, (key, record):
         compute,
         image_only: Default::default(),
         depth_only: Default::default(),
+        rt_pass: Default::default(),
         key,
         record,
         used: Default::default(),
@@ -1204,6 +1642,9 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, (key, record):
         first: Default::default(),
         left_out: Default::default(),
         builder: Default::default(),
+        skips_waiting: Default::default(),
+        in_bound: Default::default(),
+        submit_gave_up: Default::default(),
     });
     PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -1374,6 +1815,7 @@ enum Change {
     Push { n: u64, shader_bytes: usize, known: bool, compute: bool, group: u64, slow_ms: Option<u64>, item: Weak<Pending> },
     Promote(u64),
     DepthOnly(u64),
+    RtPass(u64),
 }
 
 /// the numbers pipelines get in the backlog (`pso_sched::Backlog::push_as`)
@@ -1425,6 +1867,7 @@ fn apply(list: &mut super::pso_sched::Backlog<Weak<Pending>>, change: Change) {
         Change::Push { n, shader_bytes, known, compute, group, slow_ms, item } => list.push_as(n, shader_bytes, known, compute, group, slow_ms, item),
         Change::Promote(n) => list.promote(n),
         Change::DepthOnly(n) => list.depth_only(n),
+        Change::RtPass(n) => list.rt_pass(n),
     }
 }
 
@@ -1481,6 +1924,13 @@ pub fn put_off(dxil_len: usize) {
             d.set(PutOff::Left(dxil_len));
         }
     });
+}
+
+/// The job this thread runs made no pipeline and did not fail: it only prepared the shaders
+/// (`preparing`), or its driver compile was put off for memory (`put_off`) and the pipeline is
+/// built later.
+pub fn left_for_later() -> bool {
+    preparing() || matches!(PUT_OFF.with(|d| d.get()), PutOff::Left(_))
 }
 
 /// The full-quality build on a preload worker (one runs). Some(DXIL bytes): its big driver
@@ -1750,7 +2200,7 @@ fn preload() -> Option<&'static Preload> {
                             continue;
                         }
                         // (a job is yielded at its end: none is taken while a live compile waits for a slot)
-                        if super::real::background_memory_paused() || super::real::live_compile_waiting() {
+                        if super::real::background_memory_paused() || super::real::live_compile_waiting() || bound_waiting() {
                             drop(q.cv.wait_timeout(g, PARKED_POLL).unwrap());
                             continue;
                         }
@@ -2146,6 +2596,52 @@ mod used_tests {
         assert_eq!(RELEASES.load(Ordering::SeqCst), 1);
     }
 
+    /// A graphics pipeline lists have used gives its real pipeline up to the code budget
+    /// (`release_used`) only when the budget takes graphics pipelines, and its next bind builds
+    /// it again; a compute one gives it up either way.
+    #[test]
+    fn a_used_graphics_pipeline_is_taken_away_only_when_the_budget_takes_graphics_ones() {
+        static BUILDS: AtomicUsize = AtomicUsize::new(0);
+        let (draw, compute) = (0x7E57_7014usize, 0x7E57_7015usize);
+        let build = || -> Arc<JobFn> { Arc::new(|| 0x7E57_9000 + 0x10 * BUILDS.fetch_add(1, Ordering::SeqCst)) };
+        // (with no budget, as in the tests, a bound pipeline's build is dropped at any time: it is
+        // put back until a call saw it)
+        let with_build = |p: &Pending, take: &dyn Fn() -> bool| loop {
+            *p.job.lock().unwrap() = Some(build());
+            let taken = take();
+            if taken || job_of(p).is_some() {
+                return taken;
+            }
+        };
+        submit_lazy(draw, false, Box::new(|| 0x7E57_8000), 0);
+        submit_lazy(compute, true, Box::new(|| 0x7E57_8010), 0);
+        let (p, c) = (entry(draw).unwrap(), entry(compute).unwrap());
+        let first = resolve_wait(draw);
+        assert_eq!(first, 0x7E57_8000, "built at its bind");
+        assert!(!with_build(&p, &|| release_used(&p, first, false)), "graphics pipelines are not taken away: kept");
+        assert_eq!(p.real.load(Ordering::SeqCst), first);
+        assert!(!with_build(&p, &|| release_used(&p, first + 8, true)), "not the pipeline it has now");
+        p.builder.store(true, Ordering::Release);
+        assert!(!with_build(&p, &|| release_used(&p, first, true)), "a stage of the acceleration-structure builder stays");
+        p.builder.store(false, Ordering::Release);
+        p.skipped.store(true, Ordering::Release);
+        p.submit_gave_up.store(true, Ordering::Release);
+        assert!(with_build(&p, &|| release_used(&p, first, true)));
+        // (the idle thread may have looked at it just before it was taken away)
+        *p.job.lock().unwrap() = Some(build());
+        assert_eq!(p.real.load(Ordering::SeqCst), 0, "taken away: the caller keeps it until its lists are through");
+        assert!(!p.skipped.load(Ordering::Acquire) && !p.submit_gave_up.load(Ordering::Acquire), "its next bind waits for it and queues its build as a first bind does");
+        assert!(is_pending(draw), "waiting for a bind again");
+        let second = resolve_wait(draw);
+        assert!(second >= 0x7E57_9000 && second != first, "a bind builds it again: {second:#x}");
+        assert!(p.rebuild.load(Ordering::Acquire), "logged as a rebuild");
+        let real = resolve_wait(compute);
+        assert_eq!(real, 0x7E57_8010);
+        assert!(with_build(&c, &|| release_used(&c, real, false)), "a compute pipeline is taken away either way");
+        let _ = released(draw);
+        let _ = released(compute);
+    }
+
     #[test]
     fn a_new_compute_pipeline_is_built_without_a_bind() {
         let compute = 0x7E57_7003;
@@ -2187,6 +2683,204 @@ mod used_tests {
         assert!(t.elapsed() < std::time::Duration::from_secs(1));
         assert!(!build_first(pso), "never put first");
         assert_eq!(released(pso), 0);
+    }
+
+    /// A call put off to the submit is waited for there (`wait_for_submit`): the submitting
+    /// thread counts as held for the build (`title_held`) while it waits, and its build went
+    /// before the others (`need_by_submit`).
+    #[test]
+    fn a_call_put_off_to_the_submit_is_waited_for_there_and_holds_the_title() {
+        use std::time::{Duration, Instant};
+        let standin = 0x7E57_D201usize;
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let g = gate.clone();
+        submit_lazy(standin, true, Box::new(move || {
+            let mut open = g.0.lock().unwrap();
+            while !*open {
+                open = g.1.wait(open).unwrap();
+            }
+            0x1271
+        }), 0);
+        SKIP_UNTIL_BUILT.with(|s| s.set(true));
+        set_defer_for_test(Some(true));
+        assert!(deferrable(standin), "a pending pipeline a bind would skip for");
+        need_by_submit(standin);
+        assert!(entry(standin).unwrap().urgent.load(Ordering::Acquire), "a submit waits for it: urgent");
+        let opener = std::thread::spawn(move || {
+            let t = Instant::now();
+            while !title_held() && t.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let held = title_held();
+            *gate.0.lock().unwrap() = true;
+            gate.1.notify_all();
+            held
+        });
+        let built = wait_for_submit(standin, Instant::now() + Duration::from_secs(20));
+        let held = opener.join().unwrap();
+        SKIP_UNTIL_BUILT.with(|s| s.set(false));
+        set_defer_for_test(None);
+        assert!(held, "the submit waited without holding the title");
+        assert!(built && !is_pending(standin));
+        assert_eq!(resolve(standin), 0x1271);
+        assert!(!title_held());
+        let _ = released(standin);
+    }
+
+    /// A submit waits for a put-off call's pipeline no longer than its bound (30 s, shorter
+    /// here), then gives up, counts it, and later calls with it are skipped as before instead of
+    /// put off again (a cold giant held for memory does not stand every submit still).
+    #[test]
+    fn a_submit_waits_no_longer_than_its_bound_and_later_calls_are_not_put_off() {
+        use std::time::{Duration, Instant};
+        let standin = 0x7E57_D202usize;
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let g = gate.clone();
+        submit(standin, true, Box::new(move || {
+            let mut open = g.0.lock().unwrap();
+            while !*open {
+                open = g.1.wait(open).unwrap();
+            }
+            0x1272
+        }));
+        SKIP_UNTIL_BUILT.with(|s| s.set(true));
+        set_defer_for_test(Some(true));
+        set_submit_wait_for_test(Some(Duration::from_millis(300)));
+        assert!(deferrable(standin));
+        let gave_up = submit_gave_up();
+        let t = Instant::now();
+        let built = wait_for_submit(standin, submit_deadline());
+        let took = t.elapsed();
+        let (counted, again, pending) = (submit_gave_up() > gave_up, deferrable(standin), is_pending(standin));
+        set_submit_wait_for_test(None);
+        SKIP_UNTIL_BUILT.with(|s| s.set(false));
+        set_defer_for_test(None);
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        let start = Instant::now();
+        while is_pending(standin) && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let _ = released(standin);
+        assert!(!built && pending, "the build ended before the bound");
+        assert!(took >= Duration::from_millis(280) && took < Duration::from_secs(5), "the submit waited {took:?}");
+        assert!(counted, "the call skipped at the submit was not counted");
+        assert!(!again, "a later call with it is put off again");
+    }
+
+    /// A call put off before a submit gave up on its pipeline (another list of the same frame)
+    /// is skipped at its own submit without a wait: the submit does not stand still for that
+    /// build once more (play-102: twice 30 s for one outlined DXC build).
+    #[test]
+    fn a_submit_does_not_wait_again_for_a_pipeline_a_submit_gave_up_on() {
+        use std::time::{Duration, Instant};
+        let standin = 0x7E57_D20Cusize;
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let g = gate.clone();
+        submit(standin, true, Box::new(move || {
+            let mut open = g.0.lock().unwrap();
+            while !*open {
+                open = g.1.wait(open).unwrap();
+            }
+            0x1273
+        }));
+        SKIP_UNTIL_BUILT.with(|s| s.set(true));
+        set_defer_for_test(Some(true));
+        set_submit_wait_for_test(Some(Duration::from_millis(200)));
+        let first = wait_for_submit(standin, submit_deadline());
+        let t = Instant::now();
+        let second = wait_for_submit(standin, Instant::now() + Duration::from_secs(5));
+        let took = t.elapsed();
+        let pending = is_pending(standin);
+        set_submit_wait_for_test(None);
+        SKIP_UNTIL_BUILT.with(|s| s.set(false));
+        set_defer_for_test(None);
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        let start = Instant::now();
+        while is_pending(standin) && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let built_later = wait_for_submit(standin, Instant::now());
+        let _ = released(standin);
+        assert!(!first && pending, "the build ended before the first bound");
+        assert!(!second && took < Duration::from_millis(100), "the second submit waited {took:?}");
+        assert!(built_later, "once built, a submit takes it");
+    }
+
+    /// `XCL_DEFER_TO_SUBMIT=0`: a call whose pipeline is still being built is not put off; it is
+    /// skipped at once, as before. A pipeline left out (ray tracing off) is never put off either.
+    #[test]
+    fn with_defer_to_submit_off_a_pending_call_is_skipped_as_before() {
+        use std::time::{Duration, Instant};
+        let standin = 0x7E57_D203usize;
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let g = gate.clone();
+        submit_lazy(standin, true, Box::new(move || {
+            let mut open = g.0.lock().unwrap();
+            while !*open {
+                open = g.1.wait(open).unwrap();
+            }
+            0x1273
+        }), 0);
+        SKIP_UNTIL_BUILT.with(|s| s.set(true));
+        set_defer_for_test(Some(false));
+        let off = deferrable(standin);
+        let t = Instant::now();
+        let skipped = matches!(resolve_for_compute_use(standin), Ok(p) if p == standin);
+        let quick = t.elapsed() < Duration::from_millis(500);
+        set_defer_for_test(Some(true));
+        let on = deferrable(standin);
+        let left_out = 0x7E57_D204usize;
+        submit_lazy(left_out, true, Box::new(|| 0), 0);
+        give_up(left_out);
+        let left_out_deferrable = deferrable(left_out);
+        SKIP_UNTIL_BUILT.with(|s| s.set(false));
+        let waiting = deferrable(standin);
+        set_defer_for_test(None);
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        let start = Instant::now();
+        while is_pending(standin) && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let _ = released(standin);
+        let _ = released(left_out);
+        assert!(!off, "put off with XCL_DEFER_TO_SUBMIT=0");
+        assert!(skipped && quick, "not skipped at once with XCL_DEFER_TO_SUBMIT=0");
+        assert!(on, "not put off with XCL_DEFER_TO_SUBMIT=1");
+        assert!(!left_out_deferrable, "a pipeline left out was put off");
+        assert!(!waiting, "put off where the bind waits for its build");
+    }
+
+    /// A pipeline a submit will wait for is built before the workers' queue (`need_by_submit`).
+    #[test]
+    fn a_pipeline_a_submit_needs_is_built_before_the_queue() {
+        use std::time::{Duration, Instant};
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let backlog = 8 * crate::gpu::recomp::dxc::compile_threads();
+        let standins: Vec<usize> = (0..=backlog).map(|i| 0x7E57_E000usize + i).collect();
+        for &standin in &standins {
+            let order = order.clone();
+            submit(standin, true, Box::new(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                order.lock().unwrap().push(standin);
+                0x6161
+            }));
+        }
+        let last = *standins.last().unwrap();
+        need_by_submit(last);
+        let start = Instant::now();
+        while standins.iter().any(|&s| is_pending(s)) && start.elapsed() < Duration::from_secs(60) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let order = order.lock().unwrap().clone();
+        for &standin in &standins {
+            let _ = released(standin);
+        }
+        assert_eq!(order.len(), standins.len());
+        let at = order.iter().position(|&s| s == last).unwrap();
+        assert!(at < order.len() / 2, "made last and needed by a submit, it was built {at} of {}", order.len());
     }
 
     /// The acceleration-structure builder runs as a whole or not at all (play-92: some stages
@@ -2560,6 +3254,18 @@ pub(super) fn allow_image_skip(pso: usize) {
 /// frame wait budgets (`frame_budget`) before they are skipped at once.
 const DEPTH_ONLY_BUDGETS: u32 = 4;
 
+/// Ray tracing off with every ray a miss (`raytracing::miss_pass`): `pso`'s build goes behind every
+/// other one, in the bind queue and in the preload's backlog, so it never takes a worker or a
+/// driver slot a pipeline the frame draws with is waiting for.
+pub(super) fn rt_pass_last(pso: usize) {
+    if let Some(p) = entry(pso) {
+        p.rt_pass.store(true, Ordering::Release);
+        if let Some(Some(q)) = Q.get() {
+            q.change(Change::RtPass(p.preload_seq.load(Ordering::Relaxed)));
+        }
+    }
+}
+
 pub(super) fn allow_depth_wait(pso: usize) {
     if let Some(p) = entry(pso).filter(|p| !p.compute) {
         p.depth_only.store(true, Ordering::Release);
@@ -2593,7 +3299,9 @@ fn resolve_wait_from(pso: usize, site_waits: &AtomicUsize) -> usize {
 fn resolve_with_deadline(pso: usize, site_waits: &AtomicUsize, compute_limit: Option<std::time::Duration>) -> Result<usize, PendingComputeSkip> {
     let Some(p) = entry(pso) else { return Ok(pso) };
     if p.left_out.load(Ordering::Acquire) {
-        super::raytracing::note_dispatch();
+        if !super::fsr4_standin::member(pso) {
+            super::raytracing::note_dispatch();
+        }
         return Ok(pso);
     }
     p.note_bind();
@@ -2617,6 +3325,10 @@ fn resolve_with_deadline(pso: usize, site_waits: &AtomicUsize, compute_limit: Op
         if skip_until_built() && if p.compute { super::bind::skip_failed_dispatches() } else { super::bind::skip_failed_draws() } {
             start_status();
             p.sent.store(true, Ordering::Release);
+            let by_skips = bound_by_skips();
+            if by_skips {
+                p.skips_waiting.fetch_add(1, Ordering::Relaxed);
+            }
             let frame = super::present::presents().wrapping_add(1);
             if p.last_bound.swap(frame, Ordering::AcqRel) != frame {
                 let seq = p.preload_seq.load(Ordering::Relaxed);
@@ -2625,7 +3337,7 @@ fn resolve_with_deadline(pso: usize, site_waits: &AtomicUsize, compute_limit: Op
                         q.change(Change::Promote(seq));
                     }
                 }
-                if !p.promote_preload() {
+                if !p.promote_preload() && !(by_skips && p.in_bound.swap(true, Ordering::AcqRel)) {
                     enqueue_bound(p.clone());
                 }
             }
@@ -2637,14 +3349,7 @@ fn resolve_with_deadline(pso: usize, site_waits: &AtomicUsize, compute_limit: Op
         // (the title's thread is held from here until the pipeline is built or the bind gives up)
         let _held = Held::new(&p);
         let _live = crate::live_stall::begin(crate::live_stall::Stage::PipelineWait, p.record, p.key, None, None);
-        if !p.urgent.swap(true, Ordering::AcqRel) {
-            if p.compute && !*p.done.lock().unwrap() && !p.counted.swap(true, Ordering::AcqRel) {
-                COMPUTE_BOUND_PENDING.fetch_add(1, Ordering::AcqRel);
-            }
-            if !p.promote_preload() {
-                enqueue_urgent(p.clone());
-            }
-        }
+        urge(&p);
         let t0 = std::time::Instant::now();
         let frame_waited = frame_waited();
         let budgets = if p.depth_only.load(Ordering::Acquire) { DEPTH_ONLY_BUDGETS } else { 1 };
@@ -2864,6 +3569,20 @@ pub(super) fn pending_or_built(pso: usize) -> bool {
     entry(pso).is_some_and(|p| p.real.load(Ordering::Acquire) != 0 || !*p.done.lock().unwrap())
 }
 
+/// Where `pso`'s build is (`pass_chain`): built (or no stand-in), still building (released
+/// unbound and not built again yet included), or failed (or left out).
+pub(super) fn build_state(pso: usize) -> super::pass_chain::Build {
+    use super::pass_chain::Build;
+    let Some(p) = entry(pso) else { return Build::Built };
+    if p.real.load(Ordering::Acquire) != 0 {
+        Build::Built
+    } else if !*p.done.lock().unwrap() {
+        Build::Building
+    } else {
+        Build::Failed
+    }
+}
+
 /// `pso` is a stand-in whose real pipeline is still being built.
 pub fn is_pending(pso: usize) -> bool {
     entry(pso).is_some_and(|p| !*p.done.lock().unwrap())
@@ -2893,6 +3612,28 @@ pub fn counts() -> (usize, usize, usize) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_bind_queue_builds_the_most_skipped_first_the_newest_of_equals() {
+        assert_eq!(super::most_skipped([3u64, 40, 7].into_iter()), Some(1), "drawn every frame before bound once");
+        assert_eq!(super::most_skipped([5u64, 5, 2].into_iter()), Some(1), "the newest of equals");
+        assert_eq!(super::most_skipped(std::iter::empty::<u64>()), None);
+        assert_eq!(super::most_skipped([(false, 900u64), (true, 3), (false, 5)].into_iter()), Some(1), "a ray pass built with every ray a miss after every other");
+        assert_eq!(super::most_skipped([(false, 900u64), (false, 5)].into_iter()), Some(0), "of ray passes, the most skipped");
+    }
+
+    #[test]
+    fn a_put_off_or_prepared_job_is_left_for_later_not_failed() {
+        assert!(!super::left_for_later());
+        super::PUT_OFF.with(|d| d.set(super::PutOff::Allowed));
+        assert!(!super::left_for_later(), "allowed, not put off");
+        super::put_off(4096);
+        assert!(super::left_for_later(), "put off for memory");
+        super::PUT_OFF.with(|d| d.set(super::PutOff::No));
+        super::PREPARING.with(|p| p.set(true));
+        assert!(super::left_for_later(), "only its shaders prepared");
+        super::PREPARING.with(|p| p.set(false));
+    }
+
     use super::*;
     use std::time::{Duration, Instant};
 
@@ -3083,6 +3824,7 @@ mod tests {
             compute,
             image_only: Default::default(),
             depth_only: Default::default(),
+            rt_pass: Default::default(),
             key: 0,
             record: 0,
             used: Default::default(),
@@ -3106,6 +3848,9 @@ mod tests {
             first: Default::default(),
             left_out: Default::default(),
             builder: Default::default(),
+            skips_waiting: Default::default(),
+            in_bound: Default::default(),
+            submit_gave_up: Default::default(),
         });
         let q = Arc::new(Preload::new(Default::default()));
         let ps: Vec<Arc<Pending>> = (0..3).map(|_| pending(true)).collect();
@@ -3145,6 +3890,7 @@ mod tests {
             compute,
             image_only: Default::default(),
             depth_only: Default::default(),
+            rt_pass: Default::default(),
             key: 0,
             record: 0,
             used: Default::default(),
@@ -3168,6 +3914,9 @@ mod tests {
             first: Default::default(),
             left_out: Default::default(),
             builder: Default::default(),
+            skips_waiting: Default::default(),
+            in_bound: Default::default(),
+            submit_gave_up: Default::default(),
         });
         let (c1, c2, g1, g2) = (pending(true), pending(true), pending(false), pending(false));
         let mut queue = BuildQueue::default();

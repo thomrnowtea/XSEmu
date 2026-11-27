@@ -4,12 +4,17 @@
 // FAKE_XSEMU_SCENARIO = ok | crash | device_removed | files_missing | slow_boot | warmup_fail |
 //                       warmup_ram_floor | warmup_refuse
 // FAKE_XSEMU_VERSION_DELAY_MS = how long --version takes to answer (default 0)
+// FAKE_XSEMU_ENV_DUMP = a folder: run and warm-up write their XCL_* environment, sorted, to <folder>/<run|warm-up>.env
 #include "FakeRun.h"
 #include "FakeRunner.h"
 #include "FakeWarmup.h"
 
 #include <QCoreApplication>
+#include <QDir>
+#include <QFile>
 #include <QGuiApplication>
+#include <QProcessEnvironment>
+#include <QRegularExpression>
 #include <QStringList>
 
 #include <chrono>
@@ -22,6 +27,18 @@ static int usage(FILE* to = stderr)
     std::fprintf(to, "usage: fake-xsemu run [--host-hwnd <hex>] [--control-pipe <name>] <game folder> [-- args]\n"
                      "       fake-xsemu warm-up [--full] [--progress-json]\n");
     return to == stderr ? 2 : 0;
+}
+
+static void dumpEnvironment(const QString& mode)
+{
+    const QString dir = qEnvironmentVariable("FAKE_XSEMU_ENV_DUMP");
+    if (dir.isEmpty())
+        return;
+    QStringList lines = QProcessEnvironment::systemEnvironment().toStringList().filter(QRegularExpression(QStringLiteral("^XCL_")));
+    lines.sort();
+    QFile f(QDir(dir).filePath(mode + QStringLiteral(".env")));
+    if (f.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        f.write(lines.join(QLatin1Char('\n')).toUtf8());
 }
 
 int main(int argc, char** argv)
@@ -43,6 +60,7 @@ int main(int argc, char** argv)
         return usage(stdout);
 
     if (args.first() == QLatin1String("warm-up")) {
+        dumpEnvironment(args.first());
         QCoreApplication app(argc, argv);
         FakeWarmup warmup(args.contains(QStringLiteral("--full")), args.contains(QStringLiteral("--progress-json")), scenario);
         QMetaObject::invokeMethod(&warmup, &FakeWarmup::start, Qt::QueuedConnection);
@@ -70,6 +88,7 @@ int main(int argc, char** argv)
     if (i >= args.size())
         return usage();
     o.folder = args[i];
+    dumpEnvironment(args.first());
 
     QGuiApplication app(argc, argv);
     app.setQuitOnLastWindowClosed(true);

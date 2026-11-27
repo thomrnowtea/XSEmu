@@ -111,7 +111,7 @@ fn table(out: &mut Vec<String>, param: usize, table: u32) {
     let (mut read, mut empty) = (0u32, Vec::new());
     let mut addr = table;
     for k in 0..most {
-        let Some(s) = super::console_heap::slot((uma.base() + addr as usize) as u64) else { break };
+        let Some(s) = super::console_heap::lookup((uma.base() + addr as usize) as u64) else { break };
         let n = if s.sampler { 4 } else { 8 };
         let mut w = [0u32; 8];
         unsafe { std::ptr::copy_nonoverlapping(s.at as *const u32, w.as_mut_ptr(), n) };

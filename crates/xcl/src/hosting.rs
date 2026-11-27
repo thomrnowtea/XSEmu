@@ -173,6 +173,28 @@ pub fn child_rect(parent: isize) -> [i32; 4] {
     rect
 }
 
+/// The game window was made as a top-level window: in hosted mode it becomes a child of the host,
+/// covering `child_rect` over a black class background, and follows the host's size from then on.
+pub fn adopt(hwnd: *mut c_void) {
+    let Some(parent) = host_hwnd() else { return };
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Graphics::Gdi::{GetStockObject, BLACK_BRUSH};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SetClassLongPtrW, SetParent, SetWindowLongPtrW, SetWindowPos, GCLP_HBRBACKGROUND, GWL_STYLE, SWP_FRAMECHANGED, SWP_NOZORDER, SWP_SHOWWINDOW,
+        WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
+    };
+    let [x, y, w, h] = child_rect(parent);
+    let me = HWND(hwnd);
+    unsafe {
+        SetWindowLongPtrW(me, GWL_STYLE, (WS_CHILD | WS_CLIPSIBLINGS | WS_CLIPCHILDREN | WS_VISIBLE).0 as isize);
+        let _ = SetParent(me, Some(HWND(parent as *mut c_void)));
+        SetClassLongPtrW(me, GCLP_HBRBACKGROUND, GetStockObject(BLACK_BRUSH).0 as isize);
+        let _ = SetWindowPos(me, None, x, y, w, h, SWP_NOZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    }
+    crate::xlog_info!("XCL window moved into the launcher's window ({w}x{h} at {x},{y})");
+    attach(hwnd);
+}
+
 /// The game window is up (a child of the host): it follows the host's size from now on.
 pub fn attach(hwnd: *mut c_void) {
     unsafe { SetTimer(hwnd, FOLLOW_TIMER, FOLLOW_MS, std::ptr::null()) };
