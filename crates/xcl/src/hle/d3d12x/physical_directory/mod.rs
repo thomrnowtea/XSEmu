@@ -4,6 +4,7 @@ mod ownership;
 mod tests;
 
 use super::{console_heap, physical_import};
+use console_heap::Owner;
 use crate::hle::kernelx::PhysicalPageRef;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -16,10 +17,10 @@ pub(super) use ownership::Plane;
 const LEAF_WORDS: usize = 65536;
 const ROOT_WORDS: usize = 2 * 65536;
 
-struct Descriptor(u32);
+struct Descriptor(u32, Owner);
 impl Drop for Descriptor {
     fn drop(&mut self) {
-        console_heap::release_global(self.0, 1);
+        console_heap::release_range(self.1, self.0, 1);
     }
 }
 
@@ -158,10 +159,11 @@ unsafe fn view(
     device: &ID3D12Device,
     resource: ID3D12Resource,
     placed: crate::gpu::rebar::Placed,
+    owner: Owner,
 ) -> Option<ReadBuffer> {
     let words = u32::try_from(resource.GetDesc().Width / 4).ok()?;
-    let (index, cpu, _) = console_heap::reserve_own(1)?;
-    let guard = Descriptor(index);
+    let (index, cpu, _) = console_heap::reserve_own_as(owner, 1)?;
+    let guard = Descriptor(index, owner);
     if index == 0 || index >= 1 << 20 {
         return None;
     }
@@ -200,7 +202,7 @@ impl PrivateUpload {
             crate::gpu::rebar::Class::Directory,
         )
         .ok()?;
-        let b = view(device, resource, placed)?;
+        let b = view(device, resource, placed, Owner::DirectoryTable)?;
         let mut p = std::ptr::null_mut();
         b.resource
             .Map(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }), Some(&mut p))
@@ -273,8 +275,8 @@ pub(super) fn bind(page: &PhysicalPageRef) -> Result<Arc<PageBinding>, &'static 
     }
     let run = physical_import::resolve_page(&b.dev, page).ok_or("physical section not imported")?;
     let (index, cpu, _) =
-        console_heap::reserve_own(1).ok_or("physical descriptor space exhausted")?;
-    let guard = Descriptor(index);
+        console_heap::reserve_own_as(Owner::DirectoryPage, 1).ok_or("physical descriptor space exhausted")?;
+    let guard = Descriptor(index, Owner::DirectoryPage);
     ownership::mapped_pte(index, 0).ok_or("descriptor index not encodable")?;
     let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
         Format: DXGI_FORMAT_R32_TYPELESS,

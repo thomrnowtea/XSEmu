@@ -1,4 +1,4 @@
-use super::{buffer, view, ReadBuffer, Topology, BACKEND};
+use super::{buffer, view, Owner, ReadBuffer, Topology, BACKEND};
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::{
@@ -57,7 +57,7 @@ impl Locator {
         let b = BACKEND.get().ok_or("physical directory not initialized")?;
         let resource =
             buffer(&b.dev, 4, D3D12_HEAP_TYPE_UPLOAD).ok_or("locator allocation failed")?;
-        let cell = view(&b.dev, resource, Default::default()).ok_or("locator SRV unavailable")?;
+        let cell = view(&b.dev, resource, Default::default(), Owner::Locator).ok_or("locator SRV unavailable")?;
         let mut ptr = std::ptr::null_mut();
         cell.resource
             .Map(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }), Some(&mut ptr))

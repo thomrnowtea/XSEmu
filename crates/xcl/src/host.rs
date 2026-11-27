@@ -76,6 +76,9 @@ pub fn host_main(boot_path: &Path) -> i32 {
             let mut last = snap();
             for tick in 1u64.. {
                 std::thread::sleep(std::time::Duration::from_secs(2));
+                if tick % 5 == 0 {
+                    crate::hle::d3d12x::console_heap::log_occupancy();
+                }
                 if tick % 15 == 0 {
                     let (live, idle, again) = crate::hle::d3d12x::pso_async::live();
                     crate::xlog_info!(

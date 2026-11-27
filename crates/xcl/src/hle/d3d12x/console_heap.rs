@@ -85,10 +85,51 @@ struct Global {
     cpu: u64,
     gpu: u64,
     inc: u32,
+    ranges: SharedRanges,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum Owner {
+    Title,
+    DirectoryPage,
+    DirectoryTable,
+    Locator,
+    Other,
+}
+
+const OWNER_COUNT: usize = Owner::Other as usize + 1;
+
+struct SharedRanges {
     cap: u32,
     next: u32,
     /// Free ranges (first, count), ordered by start and separated by live descriptors.
     free: Vec<(u32, u32)>,
+    live: [u32; OWNER_COUNT],
+    refused: [u64; OWNER_COUNT],
+}
+
+impl SharedRanges {
+    fn new(cap: u32) -> Self {
+        Self { cap, next: NULL_IMAGE_VIEWS, free: Vec::new(), live: [0; OWNER_COUNT], refused: [0; OWNER_COUNT] }
+    }
+
+    fn reserve(&mut self, owner: Owner, count: u32) -> Option<u32> {
+        let first = take_range(&mut self.free, &mut self.next, self.cap, count);
+        if first.is_some() {
+            self.live[owner as usize] += count;
+        } else {
+            if self.refused == [0; OWNER_COUNT] {
+                crate::xlog_warn!("console descriptor heaps: the shared heap ({}) cannot fit {count} descriptors – shaders do not see the missing views", self.cap);
+            }
+            self.refused[owner as usize] += 1;
+        }
+        first
+    }
+
+    fn release(&mut self, owner: Owner, first: u32, count: u32) {
+        return_range(&mut self.free, &mut self.next, first, count);
+        self.live[owner as usize] -= count;
+    }
 }
 
 // D3D12 descriptor heaps and devices are free-threaded
@@ -214,29 +255,10 @@ pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
             gpu: heap.GetGPUDescriptorHandleForHeapStart().ptr,
             inc: dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV),
             heap,
-            cap,
-            next: NULL_IMAGE_VIEWS,
-            free: Vec::new(),
+            ranges: SharedRanges::new(cap),
         });
     }
     true
-}
-
-/// `count` descriptors of the shared heap: the index of the first. None: no shared heap, or
-/// no room left in it.
-fn reserve_global(count: u32) -> Option<u32> {
-    let mut g = GLOBAL.lock().unwrap();
-    let s = g.as_mut()?;
-    let (cap, mut next) = (s.cap, s.next);
-    let r = take_range(&mut s.free, &mut next, cap, count);
-    s.next = next;
-    if r.is_none() {
-        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
-            crate::xlog_warn!("console descriptor heaps: the shared heap ({cap}) is full – shaders do not see the views of slots past it");
-        }
-    }
-    r
 }
 
 /// The place in the shared heap of the page slot `k` of `h` is in – (index of the page's
@@ -246,16 +268,21 @@ fn page_of(h: &mut Heap, k: u32) -> Option<(u32, u32)> {
     let p = (k / PAGE_SLOTS) as usize;
     let mut first = *h.pages.get(p)?;
     if first == UNMAPPED {
-        first = reserve_global(page_descriptors(h.n, p as u32))?;
+        let mut g = GLOBAL.lock().unwrap();
+        first = g.as_mut()?.ranges.reserve(Owner::Title, page_descriptors(h.n, p as u32))?;
         h.pages[p] = first;
     }
     Some((first, p as u32 * PAGE_SLOTS))
 }
 
-/// The shared range starting at `first` (`count` descriptors) is free again.
+/// A shared range from `reserve_own` is free again.
 pub fn release_global(first: u32, count: u32) {
+    release_range(Owner::Other, first, count);
+}
+
+pub(super) fn release_range(owner: Owner, first: u32, count: u32) {
     if let Some(s) = GLOBAL.lock().unwrap().as_mut() {
-        return_range(&mut s.free, &mut s.next, first, count);
+        s.ranges.release(owner, first, count);
     }
 }
 
@@ -263,10 +290,30 @@ pub fn release_global(first: u32, count: u32) {
 /// the index of the first and its CPU handle (the next ones `inc` apart). None: no shared heap,
 /// or no room left in it.
 pub fn reserve_own(count: u32) -> Option<(u32, D3D12_CPU_DESCRIPTOR_HANDLE, u32)> {
-    let first = reserve_global(count)?;
-    let g = GLOBAL.lock().unwrap();
-    let s = g.as_ref()?;
+    reserve_own_as(Owner::Other, count)
+}
+
+pub(super) fn reserve_own_as(owner: Owner, count: u32) -> Option<(u32, D3D12_CPU_DESCRIPTOR_HANDLE, u32)> {
+    let mut g = GLOBAL.lock().unwrap();
+    let s = g.as_mut()?;
+    let first = s.ranges.reserve(owner, count)?;
     Some((first, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: (s.cpu + first as u64 * s.inc as u64) as usize }, s.inc))
+}
+
+/// Sample the allocator state without reading the console slots that the title can write.
+pub(crate) fn log_occupancy() {
+    let (cap, high, largest, live, refused) = {
+        let g = GLOBAL.lock().unwrap();
+        let Some(g) = g.as_ref() else { return };
+        let r = &g.ranges;
+        let largest = r.free.iter().map(|&(_, count)| count).max().unwrap_or(0).max(r.cap - r.next);
+        (r.cap, r.next, largest, r.live, r.refused)
+    };
+    let [title, pages, tables, locators, other] = live;
+    let total = live.iter().sum::<u32>() + NULL_IMAGE_VIEWS;
+    crate::xlog_info!(
+        "console descriptor heaps: {total} of {cap} live, high water {high}, largest free range {largest}; title {title}, directory pages {pages}, directory tables {tables}, locators {locators}, other {other}; reservations refused by owner (same order) {refused:?}"
+    );
 }
 
 /// The shader-visible PC heap lists bind for view descriptors (None: none shared).
@@ -372,7 +419,7 @@ pub fn unregister(obj: usize) {
             res.forget(h.shadow..h.shadow + h.n as usize * h.slot_bytes() as usize);
         }
         for (p, &f) in h.pages.iter().enumerate().filter(|&(_, &f)| f != UNMAPPED) {
-            release_global(f, page_descriptors(h.n, p as u32));
+            release_range(Owner::Title, f, page_descriptors(h.n, p as u32));
         }
         match h.memory {
             Memory::Sparse => {
@@ -966,6 +1013,27 @@ mod tests {
         assert_eq!(take_range(&mut free, &mut next, 100, 20), Some(80));
         assert_eq!(take_range(&mut free, &mut next, 100, 10), Some(30));
         assert!(free.is_empty());
+    }
+
+    #[test]
+    fn shared_ranges_count_live_and_refused_descriptors_by_owner() {
+        let start = NULL_IMAGE_VIEWS;
+        let mut ranges = SharedRanges::new(start + 6);
+        let title = ranges.reserve(Owner::Title, 4).unwrap();
+        let page = ranges.reserve(Owner::DirectoryPage, 1).unwrap();
+        assert_eq!((title, page), (start, start + 4));
+        assert_eq!(ranges.reserve(Owner::DirectoryTable, 2), None);
+        assert_eq!(ranges.live, [4, 1, 0, 0, 0]);
+        assert_eq!(ranges.refused, [0, 0, 1, 0, 0]);
+
+        ranges.release(Owner::Title, title, 4);
+        assert_eq!(ranges.reserve(Owner::Locator, 3), Some(title));
+        assert_eq!(ranges.live, [0, 1, 0, 3, 0]);
+        ranges.release(Owner::Locator, title, 3);
+        ranges.release(Owner::DirectoryPage, page, 1);
+        assert_eq!(ranges.live, [0; OWNER_COUNT]);
+        assert_eq!(ranges.next, start);
+        assert!(ranges.free.is_empty());
     }
 
     #[test]
