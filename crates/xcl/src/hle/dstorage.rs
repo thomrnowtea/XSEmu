@@ -1047,12 +1047,13 @@ unsafe fn execute(
     };
     let written_for = crate::alias::Request { options: r.options, offset: if r.memory_source() { r.source } else { r.offset }, source_size: r.source_size, list: list_was };
     crate::alias::with_request(written_for, || crate::eh::with_write_context(request, || {
-        if r.dest_physical_pages() {
+        let written = if r.dest_physical_pages() {
             let pages = destination_pages(r.destination as usize, list.as_deref().ok_or(E_ACCESS_VIOLATION)?)?;
-            if !crate::hle::kernelx::write_physical_pages(&pages, r.destination_page_offset as usize, &payload[..n]) {
-                return Err(E_ACCESS_VIOLATION);
-            }
-        } else if !write_virtual(r.destination as usize, &payload[..n]) {
+            pool::timed(pool::Stage::Write, || crate::hle::kernelx::write_physical_pages(&pages, r.destination_page_offset as usize, &payload[..n]), |_| n)
+        } else {
+            pool::timed(pool::Stage::Write, || write_virtual(r.destination as usize, &payload[..n]), |_| n)
+        };
+        if !written {
             return Err(E_ACCESS_VIOLATION);
         }
         Ok(())
@@ -1064,7 +1065,37 @@ unsafe fn execute(
 /// ahead of the request's turn (`pool`); its result waits for the turn.
 unsafe fn load(r: &Request, file: Option<&FileInner>, src_pages: Option<(&[usize], ListPlace)>) -> Result<Vec<u8>, HRESULT> {
     let n = r.destination_size as usize;
-    let src: Vec<u8> = if r.memory_source() {
+    let src = pool::timed(pool::Stage::Read, || read_source(r, file, src_pages), |_| r.source_size as usize)?;
+
+    if r.swizzle() != 0 {
+        return Err(E_DECOMPRESSION);
+    }
+
+    Ok(if r.bcpack() != 0 {
+        unpack_bcpack(r, &src)?
+    } else if r.zlib() {
+        let stage1_len = if r.intermediate_size != 0 { r.intermediate_size as usize } else { n };
+        let mut d = inflate(&src, stage1_len)?;
+        if d.len() != stage1_len {
+            return Err(E_ZLIB_DATA);
+        }
+        if d.len() < n {
+            d.resize(n, 0);
+        }
+        d
+    } else {
+        src
+    })
+}
+
+/// zlib (RFC 1950) into at most `limit` bytes, timed as its stage.
+fn inflate(src: &[u8], limit: usize) -> Result<Vec<u8>, HRESULT> {
+    pool::timed(pool::Stage::Inflate, || miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(src, limit).map_err(|_| E_ZLIB_DATA), |d| d.as_ref().map_or(0, Vec::len))
+}
+
+/// A request's source bytes: from its file, or from the title's memory at its turn.
+unsafe fn read_source(r: &Request, file: Option<&FileInner>, src_pages: Option<(&[usize], ListPlace)>) -> Result<Vec<u8>, HRESULT> {
+    Ok(if r.memory_source() {
         let mut b = vec![0u8; r.source_size as usize];
         if r.source_physical_pages() {
             let (at_enqueue, place) = src_pages.ok_or(E_ACCESS_VIOLATION)?;
@@ -1088,26 +1119,6 @@ unsafe fn load(r: &Request, file: Option<&FileInner>, src_pages: Option<(&[usize
         let mut b = vec![0u8; r.source_size as usize];
         read_exact_at(&f, r.offset, &mut b)?;
         b
-    };
-
-    if r.swizzle() != 0 {
-        return Err(E_DECOMPRESSION);
-    }
-
-    Ok(if r.bcpack() != 0 {
-        unpack_bcpack(r, &src)?
-    } else if r.zlib() {
-        let stage1_len = if r.intermediate_size != 0 { r.intermediate_size as usize } else { n };
-        let mut d = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&src, stage1_len).map_err(|_| E_ZLIB_DATA)?;
-        if d.len() != stage1_len {
-            return Err(E_ZLIB_DATA);
-        }
-        if d.len() < n {
-            d.resize(n, 0);
-        }
-        d
-    } else {
-        src
     })
 }
 
@@ -1229,13 +1240,14 @@ fn unpack_bcpack(r: &Request, src: &[u8]) -> Result<Vec<u8>, HRESULT> {
     let inflated;
     let packed = if r.zlib() {
         let limit = if r.intermediate_size != 0 { r.intermediate_size } else { r.destination_size };
-        inflated = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(src, limit as usize).map_err(|_| E_ZLIB_DATA)?;
+        inflated = inflate(src, limit as usize)?;
         &inflated[..]
     } else {
         src
     };
     let mut out = vec![0u8; r.destination_size as usize];
-    crate::hle::bcpack::decode(bc, packed, &mut out, tables).map_err(|e| {
+    let len = out.len();
+    pool::timed(pool::Stage::Bcpack, || crate::hle::bcpack::decode(bc, packed, &mut out, tables), |_| len).map_err(|e| {
         warn_once(&format!("BCPack BC{bc}"), format_args!("{e} (packed {} bytes, destination {})", packed.len(), out.len()));
         E_DECOMPRESSION
     })?;

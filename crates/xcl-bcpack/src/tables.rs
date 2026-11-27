@@ -37,6 +37,9 @@ pub(crate) struct Model {
     pub(crate) freq: [u32; BUCKETS],
     /// Cumulative frequency where each bucket begins; `SCALE` for buckets the model lacks.
     pub(crate) start: [u32; BUCKETS],
+    /// `ceil(2^32 / freq)` per bucket (0 for buckets the model lacks): `x / freq` is
+    /// `x * recip >> 32` for every `x` below `SCALE`, without a division per symbol.
+    pub(crate) recip: [u64; BUCKETS],
 }
 
 pub struct Tables {
@@ -102,6 +105,7 @@ impl Tables {
                     return Err(Error::TableModel(index));
                 }
                 model.start[b] = total;
+                model.recip[b] = (1u64 << 32).div_ceil(u64::from(model.freq[b]));
                 total += model.freq[b] << b.saturating_sub(1);
             }
             if total != SCALE {

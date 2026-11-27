@@ -21,15 +21,18 @@ const STUCK_ROUNDS: u32 = 4;
 
 impl Model {
     /// Decodes one symbol from `state`, returning it and the next state.
-    fn decode(&self, state: u32) -> (u8, u32) {
+    pub(crate) fn decode(&self, state: u32) -> (u8, u32) {
         let slot = state & (SCALE - 1);
-        let bucket = self.start[1..].iter().take_while(|&&s| s <= slot).count();
+        // The starts rise, so the buckets that begin at or before the slot are a prefix:
+        // counted without a branch per bucket.
+        let bucket = self.start[1..].iter().map(|&s| usize::from(s <= slot)).sum::<usize>();
         let (symbol, freq, cumulative) = match bucket {
             // Slot 0 belongs to no symbol: symbol 0 owns slots 1 .. freq[0].
             0 => (0, self.freq[0].wrapping_sub(1), 1),
             b => {
                 let freq = self.freq[b];
-                let offset = (slot - self.start[b]) / freq;
+                // (slot - start) / freq, exact: the dividend is below 2^16 and freq at most 2^16
+                let offset = ((u64::from(slot - self.start[b]) * self.recip[b]) >> 32) as u32;
                 ((1 << (b - 1)) + offset, freq, self.start[b] + offset * freq)
             }
         };

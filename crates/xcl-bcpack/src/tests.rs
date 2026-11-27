@@ -484,3 +484,69 @@ fn reference_cases() {
     eprintln!("{same} identical outputs, {errors} shared errors");
     assert!(same > 0);
 }
+
+/// A model's symbol lookup (branchless bucket count, reciprocal for the division) gives what
+/// the plain scan and division give, for every slot of every model.
+#[test]
+fn model_decode_matches_the_plain_lookup() {
+    let mut all: Vec<Tables> = [(1, true), (7, false), (23, false)].iter().map(|&(seed, uniform)| Tables::parse(&synthetic_tables(seed, uniform)).unwrap()).collect();
+    all.extend(real_tables());
+    for t in &all {
+        for model in t.models.iter() {
+            for slot in 0..SCALE {
+                let bucket = model.start[1..].iter().take_while(|&&s| s <= slot).count();
+                let (symbol, freq, cumulative) = match bucket {
+                    0 => (0, model.freq[0].wrapping_sub(1), 1),
+                    b => {
+                        let freq = model.freq[b];
+                        let offset = (slot - model.start[b]) / freq;
+                        ((1 << (b - 1)) + offset, freq, model.start[b] + offset * freq)
+                    }
+                };
+                for high in [1u32 << 8, 0xABCD, 0xFFFF] {
+                    let state = high << 16 | slot;
+                    let next = (state >> 16).wrapping_mul(freq).wrapping_sub(cumulative).wrapping_add(slot);
+                    assert_eq!(model.decode(state), (symbol as u8, next), "slot {slot}");
+                }
+            }
+        }
+    }
+}
+
+/// Decode speed on synthetic streams, per format (ignored: a measurement, not a check). Run
+/// with `cargo test --release -p xcl-bcpack decode_speed -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn decode_speed() {
+    let t = real_tables().unwrap_or_else(|| Tables::parse(&synthetic_tables(5, false)).unwrap());
+    let mut rng = Rng(1234);
+    for format in FORMATS {
+        let blocks = (1 << 20) / format.block_bytes();
+        let records = random_records(&t, format, blocks, &mut rng);
+        let stream = pack(&t, format, &records, rng.next());
+        let mut out = vec![0u8; blocks * format.block_bytes()];
+        let mut best = f64::MAX;
+        for _ in 0..5 {
+            let start = std::time::Instant::now();
+            decode(mode_of(format), &stream, &mut out, &t).unwrap();
+            best = best.min(start.elapsed().as_secs_f64());
+        }
+        let mut lanes_best = f64::MAX;
+        let mut recs = vec![0u8; blocks * format.record_len()];
+        for _ in 0..5 {
+            let start = std::time::Instant::now();
+            let mut input = stream.iter().copied();
+            lanes::decode(&t, format, blocks, |_| input.next(), &mut recs).unwrap();
+            lanes_best = lanes_best.min(start.elapsed().as_secs_f64());
+        }
+        println!(
+            "BCPack {format:?}: {} KiB out from {} KiB packed in {:.2} ms (rANS lanes {:.2} ms): {:.0} MB/s of output, {:.1} M blocks/s",
+            out.len() >> 10,
+            stream.len() >> 10,
+            best * 1e3,
+            lanes_best * 1e3,
+            out.len() as f64 / best / 1e6,
+            blocks as f64 / best / 1e6
+        );
+    }
+}

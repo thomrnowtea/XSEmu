@@ -23,9 +23,11 @@
 //! slows a low queue down but never stops it. Queues of one priority take turns.
 //!
 //! Telemetry stays bounded: per priority, the entries queued now and at most, and the count, total
-//! and longest of the time an entry waited for a worker and of the time decoding took. Every 10 s
-//! with activity one log line gives those for the interval; `stats` gives them since the start for
-//! the run report.
+//! and longest of the time an entry waited for a worker and of the time decoding took ("decode":
+//! reading the source and unpacking it). Every 10 s with activity one log line gives those for the
+//! interval, and how that time splits into stages over all priorities (`Stage`: the source read,
+//! zlib, BCPack, and the write into the title's memory), so a slow interval shows whether it waited
+//! on the disk or on the CPU; `stats` gives them since the start for the run report.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -73,6 +75,80 @@ const MAX_STAGING: u64 = 256 << 20;
 /// A wait for a worker this long is logged.
 const LONG_WAIT: Duration = Duration::from_secs(2);
 const LOG_EVERY: Duration = Duration::from_secs(10);
+
+/// The stages of a request's work, timed apart for the interval line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Stage {
+    /// the source: a file read, or a copy from the title's memory
+    Read,
+    /// zlib, counted in output bytes
+    Inflate,
+    /// BCPack, counted in destination bytes
+    Bcpack,
+    /// the payload into the title's memory (virtual or physical pages)
+    Write,
+}
+
+const STAGE_NAMES: [&str; 4] = ["read", "zlib", "BCPack", "write"];
+
+/// One stage's totals since the start.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct StageTotals {
+    count: u64,
+    us: u64,
+    bytes: u64,
+}
+
+struct StageClock {
+    count: AtomicU64,
+    us: AtomicU64,
+    bytes: AtomicU64,
+    /// the longest since the interval line last took it
+    max_us: AtomicU64,
+}
+
+static STAGES: [StageClock; 4] = [const { StageClock { count: AtomicU64::new(0), us: AtomicU64::new(0), bytes: AtomicU64::new(0), max_us: AtomicU64::new(0) } }; 4];
+
+/// `f`, timed as `stage`, counted as moving `bytes` of its result.
+pub(super) fn timed<R>(stage: Stage, f: impl FnOnce() -> R, bytes: impl FnOnce(&R) -> usize) -> R {
+    let t = Instant::now();
+    let r = f();
+    let us = t.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+    let bytes = bytes(&r);
+    let c = &STAGES[stage as usize];
+    c.count.fetch_add(1, Ordering::Relaxed);
+    c.us.fetch_add(us, Ordering::Relaxed);
+    c.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+    c.max_us.fetch_max(us, Ordering::Relaxed);
+    r
+}
+
+fn stage_totals() -> [StageTotals; 4] {
+    std::array::from_fn(|k| StageTotals { count: STAGES[k].count.load(Ordering::Relaxed), us: STAGES[k].us.load(Ordering::Relaxed), bytes: STAGES[k].bytes.load(Ordering::Relaxed) })
+}
+
+/// The stages of an interval (totals `now` less `before`, and each one's longest): count, MB,
+/// average and longest time, and MB/s over the time spent in it. `None` when none ran.
+fn stages_line(before: &[StageTotals; 4], now: &[StageTotals; 4], max_us: &[u64; 4]) -> Option<String> {
+    let parts: Vec<String> = (0..4)
+        .filter_map(|k| {
+            let n = now[k].count.saturating_sub(before[k].count);
+            let us = now[k].us.saturating_sub(before[k].us);
+            let bytes = now[k].bytes.saturating_sub(before[k].bytes);
+            (n > 0).then(|| {
+                format!(
+                    "{} {n} ({:.1} MB, avg {:.2} ms / max {:.1} ms, {:.0} MB/s)",
+                    STAGE_NAMES[k],
+                    bytes as f64 / f64::from(1 << 20),
+                    us as f64 / n as f64 / 1000.0,
+                    max_us[k] as f64 / 1000.0,
+                    bytes as f64 / f64::from(1 << 20) / (us.max(1) as f64 / 1e6)
+                )
+            })
+        })
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
 
 /// `IDStorageFactoryX::SetStagingBufferSize`, as the title last set it.
 static STAGING: AtomicU64 = AtomicU64::new(MIN_STAGING);
@@ -254,6 +330,8 @@ struct State {
     most_busy: usize,
     interval_busy: usize,
     logged: Instant,
+    /// the stage totals when the interval line was last written
+    stages_at: [StageTotals; 4],
 }
 
 struct Pool {
@@ -278,6 +356,7 @@ fn pool() -> &'static Pool {
                 most_busy: 0,
                 interval_busy: 0,
                 logged: Instant::now(),
+                stages_at: stage_totals(),
             }),
             wake: Condvar::new(),
             workers,
@@ -485,12 +564,17 @@ impl State {
                 )
             })
             .collect();
+        let now = stage_totals();
+        let max_us: [u64; 4] = std::array::from_fn(|k| STAGES[k].max_us.swap(0, Ordering::Relaxed));
+        let stages = stages_line(&self.stages_at, &now, &max_us);
+        self.stages_at = now;
         let line = format!(
-            "DirectStorage pool (10 s): {workers} workers, up to {} busy, read-ahead holds {} of {} MB; {}",
+            "DirectStorage pool (10 s): {workers} workers, up to {} busy, read-ahead holds {} of {} MB; {}{}",
             self.interval_busy,
             self.held >> 20,
             read_ahead_room() >> 20,
-            parts.join("; ")
+            parts.join("; "),
+            stages.map_or(String::new(), |s| format!("; stages: {s}"))
         );
         self.interval = Default::default();
         self.interval_busy = self.busy;
@@ -683,6 +767,28 @@ mod tests {
         serve(&mut share, [false, false, false, true], [64 << 10; 4], 5_000);
         let served = serve(&mut share, [true, false, false, true], [64 << 10; 4], 1_000);
         assert!((1..=2).contains(&served[0]), "low after an idle stretch: {served:?}");
+    }
+
+    #[test]
+    fn the_stage_line_gives_each_stage_of_the_interval() {
+        let at = |count, us, bytes| StageTotals { count, us, bytes };
+        let before = [at(10, 1_000, 4 << 20), at(5, 500, 1 << 20), at(0, 0, 0), at(10, 100, 4 << 20)];
+        let now = [at(14, 201_000, 6 << 20), at(5, 500, 1 << 20), at(2, 8_000, 2 << 20), at(14, 300, 6 << 20)];
+        let line = stages_line(&before, &now, &[90_000, 0, 5_000, 120]).unwrap();
+        assert_eq!(
+            line,
+            "read 4 (2.0 MB, avg 50.00 ms / max 90.0 ms, 10 MB/s), BCPack 2 (2.0 MB, avg 4.00 ms / max 5.0 ms, 250 MB/s), write 4 (2.0 MB, avg 0.05 ms / max 0.1 ms, 10000 MB/s)"
+        );
+        assert_eq!(stages_line(&now, &now, &[0; 4]), None, "an interval with no stage has no part");
+    }
+
+    #[test]
+    fn timed_adds_to_its_stage() {
+        let before = stage_totals();
+        assert_eq!(timed(Stage::Bcpack, || 7, |_| 4096), 7);
+        let after = stage_totals();
+        assert!(after[Stage::Bcpack as usize].count > before[Stage::Bcpack as usize].count);
+        assert!(after[Stage::Bcpack as usize].bytes >= before[Stage::Bcpack as usize].bytes + 4096);
     }
 
     #[test]
