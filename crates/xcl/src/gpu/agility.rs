@@ -220,7 +220,14 @@ pub(crate) fn resolve_dir(
     }
 }
 
+/// The Agility SDK is a host file: XSEmu on a drive letter the title mounts (the default
+/// xcl.toml maps `D:` to the game folder) must not have the title's file hooks redirect the
+/// probe into the game folder, or the SDK is silently not found and inbox D3D12 is used.
 fn init() -> State {
+    crate::vfs_hooks::with_host_io(init_host)
+}
+
+fn init_host() -> State {
     let env_dir = clean_env_path(std::env::var_os(ENV));
     let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf));
     let local_app_data = clean_env_path(std::env::var_os("LOCALAPPDATA"));
