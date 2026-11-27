@@ -19,7 +19,8 @@ pub fn tables() -> Option<&'static Tables> {
                 crate::xlog_warn!("BCPack: no table file (set XCL_BCPACK_TABLES); BCPack requests fail with E_DECOMPRESSION");
                 return None;
             };
-            match Tables::load(&path) {
+            // This is a host file, even if it is on a drive letter the title mounts.
+            match crate::vfs_hooks::with_host_io(|| Tables::load(&path)) {
                 Ok(t) => {
                     crate::xlog_info!("BCPack: tables loaded from {}", path.display());
                     Some(t)

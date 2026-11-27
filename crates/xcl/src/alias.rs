@@ -477,6 +477,19 @@ unsafe fn report_inner(p: usize, compact: bool) -> Option<String> {
         lines.extend(crate::gpu::uma::history_at(p));
     }
     if compact {
+        let lo = p & !(SMALL - 1);
+        let offset = lo & (PAGE - 1);
+        let recent = try_lock(&PAYLOADS).and_then(|ledger| {
+            backing.filter(|b| b.page != 0)
+                .and_then(|b| ledger.to_page(b.page, offset, offset + SMALL, 1).into_iter().next())
+                .or_else(|| ledger.over(lo, lo + SMALL, 1).into_iter().next().map(|(payload, _)| payload))
+        });
+        if let Some(w) = recent {
+            lines.push(format!(
+                "Recorded DirectStorage write: {:.3} s, {:#x} bytes at {:#x}, through {} ({})",
+                w.t, w.len, w.at, show_backing(w.backing), show_request(&w.request)
+            ));
+        }
         return (!lines.is_empty()).then(|| lines.join("\n"));
     }
     for (a, what) in views.aliases {
@@ -653,6 +666,8 @@ mod tests {
             let first = payloads_at(at, None);
             assert_eq!(first.len(), 1, "{first:?}");
             assert!(first[0].contains("0x800 bytes at") && first[0].contains("STILL HOLDS") && first[0].contains("options 0x1: 153 bytes at 0x1234") && first[0].contains("then and now"), "{first:?}");
+            let snapshot = crash_ownership(at).unwrap();
+            assert!(snapshot.contains("Recorded DirectStorage write:") && snapshot.contains("options 0x1: 153 bytes at 0x1234"), "{snapshot}");
             let second = payloads_at(base + PAGE + 0x10, None);
             assert!(second.len() == 1 && second[0].contains("STILL HOLDS"), "the piece on the next 64 KiB page: {second:?}");
             // something else changes the second piece: no payload was written over it

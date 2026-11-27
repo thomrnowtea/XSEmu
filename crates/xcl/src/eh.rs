@@ -1472,6 +1472,7 @@ unsafe extern "system" fn minidump_write_dump(process: HANDLE, pid: u32, file: H
 /// (`xcl minidump`), waited for up to `wait_ms`; `pointers`: the crashing thread's exception
 /// pointers, or 0. The error says what did not work.
 unsafe fn dump_by_helper(file: HANDLE, ty: u32, tid: u32, pointers: usize, wait_ms: u32, summary: Option<HANDLE>) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::{CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, WAIT_OBJECT_0};
     use windows_sys::Win32::System::Threading::{CreateProcessW, GetCurrentProcess, GetCurrentProcessId, GetExitCodeProcess, TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW, PROCESS_INFORMATION, STARTUPINFOW};
     let pid = GetCurrentProcessId();
@@ -1492,11 +1493,14 @@ unsafe fn dump_by_helper(file: HANDLE, ty: u32, tid: u32, pointers: usize, wait_
         if !inherited_summary.is_null() { CloseHandle(inherited_summary); }
         return Err("no executable path cached for the helper".into());
     };
+    // Command-line module discovery can pass through the title's file hooks.
+    // Name the host executable explicitly, even on a drive letter the title mounts.
+    let application: Vec<u16> = exe.as_os_str().encode_wide().chain([0]).collect();
     let exe = exe.display();
     let mut cmd = crate::util::wide(&format!("\"{exe}\" minidump {pid} {} {ty} {tid} {pointers} {}", inherited as usize, inherited_summary as usize));
     let si = STARTUPINFOW { cb: std::mem::size_of::<STARTUPINFOW>() as u32, ..std::mem::zeroed() };
     let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
-    let started = CreateProcessW(std::ptr::null(), cmd.as_mut_ptr(), std::ptr::null(), std::ptr::null(), 1, CREATE_NO_WINDOW, std::ptr::null(), std::ptr::null(), &si, &mut pi) != 0;
+    let started = CreateProcessW(application.as_ptr(), cmd.as_mut_ptr(), std::ptr::null(), std::ptr::null(), 1, CREATE_NO_WINDOW, std::ptr::null(), std::ptr::null(), &si, &mut pi) != 0;
     let error = std::io::Error::last_os_error();
     if !inherited.is_null() { CloseHandle(inherited); }
     if !inherited_summary.is_null() { CloseHandle(inherited_summary); }

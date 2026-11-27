@@ -266,13 +266,20 @@ fn crash_worker() {
             .and_then(|p| verified_dir(&p));
         (dir, dump_dir, sddl())
     });
+    let mut first_unhandled_saved = false;
     unsafe {
         while WaitForSingleObject(reporter.request.as_raw_handle(), INFINITE) == WAIT_OBJECT_0 {
             let Some((ticket, job)) = reporter.job.lock().ok().and_then(|mut job| job.take())
             else {
                 continue;
             };
-            let ok = report(job, dir.as_deref(), dump_dir.as_deref(), sddl.as_deref());
+            let ok = report(
+                job,
+                dir.as_deref(),
+                dump_dir.as_deref(),
+                sddl.as_deref(),
+                &mut first_unhandled_saved,
+            );
             reporter.ok.store(ok, Ordering::Release);
             if reporter
                 .busy
@@ -662,6 +669,7 @@ unsafe fn report(
     dir: Option<&Path>,
     dump_dir: Option<&Path>,
     sddl: Option<&[u16]>,
+    first_unhandled_saved: &mut bool,
 ) -> bool {
     let Job {
         tid,
@@ -682,7 +690,8 @@ unsafe fn report(
     } else {
         "unhandled access violation"
     };
-    let file = if summary {
+    // The game can fault again while shutting down. Keep the first unhandled fault's summary.
+    let file = if summary && !*first_unhandled_saved {
         match (dir, sddl) {
             (Some(dir), Some(sddl)) => crate::vfs_hooks::with_host_io(|| {
                 let final_path = dir.join("last-access-violation.txt");
@@ -695,7 +704,10 @@ unsafe fn report(
                 }
                 let from = wide_path(&temp);
                 let to = wide_path(&final_path);
-                MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_REPLACE_EXISTING);
+                let published = MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_REPLACE_EXISTING) != 0;
+                if published && title.is_none() {
+                    *first_unhandled_saved = true;
+                }
                 capture(&file, GetCurrentProcess(), tid, &rec, ctx);
                 Some(file)
             }),
@@ -708,15 +720,7 @@ unsafe fn report(
         crate::log::access_violation_notice(tid, title.is_none());
     }
     if let Some(file) = file.as_ref().filter(|_| rec.NumberParameters >= 2) {
-        let details = crate::alias::crash_ownership(rec.ExceptionInformation[1])
-            .unwrap_or_else(|| "unavailable or no record".into());
-        let mut details = format!("Guest ownership snapshot (best effort):\n{details}\n");
-        let mut out = file;
-        if let Ok(end) = out.seek(SeekFrom::End(0)) {
-            let cap = (LIMIT / 2).saturating_sub(end) as usize;
-            details.truncate(details.floor_char_boundary(cap.min(details.len())));
-            let _ = out.write_all(details.as_bytes());
-        }
+        append_guest_ownership(file, rec.ExceptionInformation[1], ctx.as_ref().map(|c| &c.0));
     }
     let full = if title.is_none() {
         dump_dir.zip(sddl).and_then(|(dir, sddl)| {
@@ -766,6 +770,102 @@ unsafe fn report(
         }
     }
     result.is_ok()
+}
+
+/// The failed address can be unowned when a mapped record supplied the pointer.
+/// Sample distinct mapped pages from the registers in the original context.
+fn mapped_register_pages(
+    c: &CONTEXT,
+    destination: usize,
+    is_mapped: impl Fn(usize) -> bool,
+) -> impl Iterator<Item = (&'static str, usize)> {
+    let mut pages = vec![destination & !(crate::alias::PAGE - 1)];
+    [
+        ("rdi", c.Rdi), ("rsi", c.Rsi), ("rbx", c.Rbx), ("rbp", c.Rbp),
+        ("r12", c.R12), ("r13", c.R13), ("r14", c.R14), ("r15", c.R15),
+        ("rcx", c.Rcx), ("rdx", c.Rdx), ("r8", c.R8), ("r9", c.R9),
+        ("rax", c.Rax), ("r10", c.R10), ("r11", c.R11),
+    ]
+    .into_iter()
+    .map(|(reg, address)| (reg, address as usize))
+    .filter(move |&(_, address)| {
+        let page = address & !(crate::alias::PAGE - 1);
+        if pages.contains(&page) || !is_mapped(address) {
+            return false;
+        }
+        pages.push(page);
+        true
+    })
+    .take(4)
+}
+
+fn append_guest_ownership(mut file: &File, destination: usize, ctx: Option<&CONTEXT>) {
+    use std::fmt::Write;
+    let Ok(end) = file.seek(SeekFrom::End(0)) else { return };
+    let cap = (LIMIT / 2).saturating_sub(end) as usize;
+    if cap == 0 {
+        return;
+    }
+    let ownership = |address| crate::alias::crash_ownership(address)
+        .unwrap_or_else(|| "unavailable or no record".into());
+    let mut details = format!(
+        "Guest ownership snapshot (best effort):\nDestination {destination:#x}:\n{}\n",
+        ownership(destination),
+    );
+    if let Some(ctx) = ctx {
+        let process = unsafe { GetCurrentProcess() };
+        let is_mapped = |address| vm(process, address)
+            .is_some_and(|m| m.State == MEM_COMMIT && m.Type == MEM_MAPPED);
+        for (reg, address) in mapped_register_pages(ctx, destination, is_mapped) {
+            if details.len() >= cap {
+                break;
+            }
+            let _ = writeln!(details, "{reg} {address:#x} (mapped):\n{}", ownership(address));
+        }
+    }
+    details.truncate(details.floor_char_boundary(cap.min(details.len())));
+    let _ = file.write_all(details.as_bytes());
+}
+
+#[cfg(test)]
+#[test]
+fn mapped_register_snapshot_deduplicates_and_limits_pages() {
+    let c = CONTEXT {
+        Rdi: 0x30008, Rsi: 0x80008, Rbx: 0x30018, Rbp: 0x20000,
+        R12: 0x40000, R13: 0x50000, R14: 0x60000, R15: 0x70000,
+        ..CONTEXT::default()
+    };
+    let pages: Vec<_> = mapped_register_pages(&c, 0x80000, |a| a >= 0x30000).collect();
+    assert_eq!(pages, [("rdi", 0x30008), ("r12", 0x40000), ("r13", 0x50000), ("r14", 0x60000)]);
+}
+
+#[cfg(test)]
+#[test]
+fn a_later_fault_keeps_the_first_unhandled_summary() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("xcl-first-av-{}-{nonce}", std::process::id()));
+    std::fs::create_dir(&dir).unwrap();
+    let dir = verified_dir(&dir).unwrap();
+    let descriptor = sddl().unwrap();
+    let mut first_unhandled_saved = false;
+    for (tid, ip) in [(61, 0x1234), (62, 0x5678)] {
+        let rec = EXCEPTION_RECORD {
+            ExceptionCode: AV as i32,
+            ExceptionAddress: ip as *mut c_void,
+            ..Default::default()
+        };
+        let job = Job { tid, rec, ctx: None, title: None, summary: true };
+        unsafe { report(job, Some(&dir), None, Some(&descriptor), &mut first_unhandled_saved) };
+    }
+    let path = dir.join("last-access-violation.txt");
+    let summary = std::fs::read_to_string(&path).unwrap();
+    std::fs::remove_file(path).unwrap();
+    std::fs::remove_dir(dir).unwrap();
+    assert!(first_unhandled_saved);
+    assert!(summary.contains("Minimum record: thread 61; fault instruction 0x1234"), "{summary}");
 }
 
 fn access_type(value: usize) -> &'static str {
