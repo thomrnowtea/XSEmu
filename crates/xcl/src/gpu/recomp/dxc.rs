@@ -654,7 +654,7 @@ fn submit(src: &str, entry: &str, profile: &str, extra: &[&str], dxc_only: bool)
             Ok(dxil) => {
                 let program = PROGRAM.with(|p| p.borrow().clone()).map_or(String::new(), |p| format!(" of {p}"));
                 crate::xlog_warn!(
-                    "[SHADER] direct DXIL backend: {} B container, more than the driver can build within this machine's memory; DXC compiles this {profile} program{program} ({} B HLSL)",
+                    "[SHADER] direct DXIL backend: {} B container, too big for the driver to build beside a running title; DXC compiles this {profile} program{program} ({} B HLSL)",
                     dxil.len(),
                     src.len()
                 );
@@ -706,10 +706,19 @@ fn submit(src: &str, entry: &str, profile: &str, extra: &[&str], dxc_only: bool)
     })
 }
 
-/// The driver cannot build `dxil_len` bytes of DXIL within this machine's memory (cold, no kept
-/// blob: `real::cold_compile_exceeds_machine`). Only giants can be.
+/// Direct containers from this size up go to DXC whatever the machine has. The driver's expected
+/// peak there is `len * 3380` (`pso_sched::peak_at`): 13.5 GB at 4 MiB. A running title leaves
+/// less than that available (GTA VI's world load: 11-20 GB), so a bind waits on such a compile
+/// indefinitely. Attempt 3 held three waited-for compiles of about 5-8 MB direct DXIL (16-25 GiB
+/// estimated) for over 330 s at under 1 fps. DXC -O1 makes such programs several times smaller.
+const DIRECT_DXC_LINE: usize = 4 << 20;
+
+/// The driver cannot build `dxil_len` bytes of direct DXIL within the memory a running title
+/// leaves: from `DIRECT_DXC_LINE` up, or beyond this machine's memory (cold, no kept blob:
+/// `real::cold_compile_exceeds_machine`). Only giants can be.
 fn too_big_to_build(dxil_len: usize) -> bool {
-    dxil_len >= crate::hle::d3d12x::real::GIANT_DXIL && crate::hle::d3d12x::real::cold_compile_exceeds_machine(dxil_len)
+    dxil_len >= crate::hle::d3d12x::real::GIANT_DXIL
+        && (dxil_len >= DIRECT_DXC_LINE || crate::hle::d3d12x::real::cold_compile_exceeds_machine(dxil_len))
 }
 
 /// Of DXC's container and the direct backend's, the one the driver builds with less memory.
@@ -1525,6 +1534,9 @@ mod cache_tests {
         // only giants can be too big; a container no machine's memory holds always is
         assert!(!too_big_to_build(crate::hle::d3d12x::real::GIANT_DXIL - 1));
         assert!(too_big_to_build(64 << 30));
+        // from the DXC line up, whatever the machine's memory
+        assert!(too_big_to_build(DIRECT_DXC_LINE));
+        assert!(too_big_to_build(8 << 20));
         // the smaller container wins, DXC's on a tie
         assert_eq!(smaller(vec![1; 3], vec![2; 5]), vec![1; 3]);
         assert_eq!(smaller(vec![1; 6], vec![2; 5]), vec![2; 5]);
