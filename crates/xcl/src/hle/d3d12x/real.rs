@@ -4866,6 +4866,15 @@ fn compile_cost(dxil_len: usize) -> (u64, bool) {
     (super::pso_sched::cost(dxil_len, kept, GIANT_FACTOR), !kept && dxil_len >= super::pso_sched::GIANT_DXIL)
 }
 
+/// A cold driver compile (no kept blob) of `dxil_len` bytes of DXIL is refused on this machine
+/// whatever is free (`Refused::NoMemory`, the same test `acquire_within` makes): its expected
+/// peak exceeds the physical RAM less the urgent floor. `dxc::submit` then has DXC make a
+/// smaller container of the same program.
+pub(crate) fn cold_compile_exceeds_machine(dxil_len: usize) -> bool {
+    let cost = if live_lanes() { super::pso_sched::cost(dxil_len, false, GIANT_FACTOR) } else { peak(dxil_len) };
+    !super::pso_sched::fits_on_machine(cost, URGENT_FLOOR, total_physical())
+}
+
 /// What a compile leaves of the physical memory when nothing else is said: the user's rule
 /// (2026-11-26 15:22Z): every compile is admitted when its expected peak fits in the memory
 /// available less 1 GB, and waits otherwise.

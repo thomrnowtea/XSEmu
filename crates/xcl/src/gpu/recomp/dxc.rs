@@ -626,6 +626,10 @@ pub fn compile_dxc_only(src: &str, entry: &str, profile: &str) -> Result<Vec<u8>
 /// what the direct backend did not make. DXC arguments (an optimisation level, a define) ask
 /// for DXC itself, and so does `dxc_only`.
 fn submit(src: &str, entry: &str, profile: &str, extra: &[&str], dxc_only: bool) -> Result<Vec<u8>, String> {
+    // the direct backend's container when the driver cannot build it on this machine: DXC's
+    // optimised one is several times smaller (a retail CS of 165 k guest instructions: 14.5 MB
+    // direct, 2.8 MB from DXC -O1), the smaller of the two is kept
+    let mut oversized: Option<Vec<u8>> = None;
     if backend() != Backend::Dxc && extra.is_empty() && !dxc_only {
         let direct = {
             let _slot = wait_for_memory();
@@ -635,7 +639,16 @@ fn submit(src: &str, entry: &str, profile: &str, extra: &[&str], dxc_only: bool)
             })
         };
         match direct {
-            Ok(dxil) => return Ok(dxil),
+            Ok(dxil) if !(backend() == Backend::Direct && too_big_to_build(dxil.len())) => return Ok(dxil),
+            Ok(dxil) => {
+                let program = PROGRAM.with(|p| p.borrow().clone()).map_or(String::new(), |p| format!(" of {p}"));
+                crate::xlog_warn!(
+                    "[SHADER] direct DXIL backend: {} B container, more than the driver can build within this machine's memory; DXC compiles this {profile} program{program} ({} B HLSL)",
+                    dxil.len(),
+                    src.len()
+                );
+                oversized = Some(dxil);
+            }
             Err(why) if backend() == Backend::DirectOnly => return Err(format!("xcl-dxil: {why}")),
             Err(why) => {
                 let c = direct_counts();
@@ -668,7 +681,43 @@ fn submit(src: &str, entry: &str, profile: &str, extra: &[&str], dxc_only: bool)
         }
     }
     QUEUED.notify_one();
-    rx.recv().map_err(|_| "DXC: the compile thread exited".to_string())?
+    let r = rx.recv().map_err(|_| "DXC: the compile thread exited".to_string())?;
+    let Some(direct) = oversized else { return r };
+    Ok(match r {
+        Ok(dxc) => {
+            crate::xlog_info!("[SHADER] DXC: {} B of DXIL in place of the direct backend's {} B", dxc.len(), direct.len());
+            smaller(dxc, direct)
+        }
+        Err(e) => {
+            crate::xlog_warn!("[SHADER] DXC failed on a program the direct backend made {} B of: {e}; the direct container stays", direct.len());
+            direct
+        }
+    })
+}
+
+/// The driver cannot build `dxil_len` bytes of DXIL within this machine's memory (cold, no kept
+/// blob: `real::cold_compile_exceeds_machine`). Only giants can be.
+fn too_big_to_build(dxil_len: usize) -> bool {
+    dxil_len >= crate::hle::d3d12x::real::GIANT_DXIL && crate::hle::d3d12x::real::cold_compile_exceeds_machine(dxil_len)
+}
+
+/// Of DXC's container and the direct backend's, the one the driver builds with less memory.
+fn smaller(dxc: Vec<u8>, direct: Vec<u8>) -> Vec<u8> {
+    if dxc.len() <= direct.len() { dxc } else { direct }
+}
+
+/// Whether a DXBC container (already checked by `valid_dxil_container`) has a part `fourcc`.
+fn has_part(blob: &[u8], fourcc: &[u8; 4]) -> bool {
+    let rd = |at: usize| blob.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize);
+    let count = rd(28).unwrap_or(0).min(64);
+    (0..count).filter_map(|i| rd(32 + i * 4)).any(|off| blob.get(off..off + 4) == Some(&fourcc[..]))
+}
+
+/// A cached container of the direct backend (it writes no STAT part; DXC always writes its
+/// reflection there) that the driver cannot build on this machine: a cache miss, so `submit`
+/// has DXC replace it. DXC's own containers are never compiled again for their size.
+fn stale_direct_giant(blob: &[u8]) -> bool {
+    backend() == Backend::Direct && !has_part(blob, b"STAT") && too_big_to_build(blob.len())
 }
 
 /// `XCL_DXC_OPT=0|1|2|3`: the level of every compile that names none.
@@ -1156,7 +1205,7 @@ where
     let key = cache_key_for_toolchain(src, entry, profile, opt, toolchain_identity());
     let dir = normalized_cache_dir(dir);
     let file = dir.join(format!("{key:016x}.dxil"));
-    if let Some(b) = cached_file(&file) {
+    if let Some(b) = cached_file(&file).filter(|b| !stale_direct_giant(b)) {
         counters.hits.fetch_add(1, Ordering::Relaxed);
         return Ok((b, true));
     }
@@ -1172,7 +1221,7 @@ where
     let _guard = flight.lock().unwrap_or_else(|e| e.into_inner());
     let _process_guard = process_cache_lock(&file)?;
     // Another caller may have populated the cache while this one waited.
-    if let Some(b) = cached_file(&file) {
+    if let Some(b) = cached_file(&file).filter(|b| !stale_direct_giant(b)) {
         counters.coalesced_hits.fetch_add(1, Ordering::Relaxed);
         return Ok((b, true));
     }
@@ -1440,6 +1489,37 @@ mod cache_tests {
             assert_eq!(opt_level(), "-O1");
             assert_eq!(cache_key("source", "main", "cs_6_6"), cache_key_for_toolchain("source", "main", "cs_6_6", "-O1", toolchain_identity()));
         }
+    }
+
+    #[test]
+    fn oversized_direct_containers_go_to_dxc() {
+        // a direct-backend container (no STAT part) and a DXC-style one with a STAT part
+        let direct = synthetic_dxil(1);
+        assert!(has_part(&direct, b"DXIL") && !has_part(&direct, b"STAT"));
+        // header (32 B), two offsets, an empty STAT part at 40, a 24 B DXIL part at 48
+        let mut dxc = vec![0u8; 80];
+        dxc[..4].copy_from_slice(b"DXBC");
+        dxc[20..24].copy_from_slice(&1u32.to_le_bytes());
+        dxc[24..28].copy_from_slice(&80u32.to_le_bytes());
+        dxc[28..32].copy_from_slice(&2u32.to_le_bytes());
+        dxc[32..36].copy_from_slice(&40u32.to_le_bytes());
+        dxc[36..40].copy_from_slice(&48u32.to_le_bytes());
+        dxc[40..44].copy_from_slice(b"STAT");
+        dxc[48..52].copy_from_slice(b"DXIL");
+        dxc[52..56].copy_from_slice(&24u32.to_le_bytes());
+        dxc[64..68].copy_from_slice(b"DXIL");
+        assert!(valid_dxil_container(&dxc));
+        assert!(has_part(&dxc, b"STAT") && has_part(&dxc, b"DXIL"));
+        assert!(!has_part(&[0u8; 8], b"DXIL"), "a short blob has no parts");
+        // only giants can be too big; a container no machine's memory holds always is
+        assert!(!too_big_to_build(crate::hle::d3d12x::real::GIANT_DXIL - 1));
+        assert!(too_big_to_build(64 << 30));
+        // the smaller container wins, DXC's on a tie
+        assert_eq!(smaller(vec![1; 3], vec![2; 5]), vec![1; 3]);
+        assert_eq!(smaller(vec![1; 6], vec![2; 5]), vec![2; 5]);
+        assert_eq!(smaller(vec![1; 5], vec![2; 5]), vec![1; 5]);
+        // small containers are never stale, whatever made them
+        assert!(!stale_direct_giant(&direct));
     }
 
     #[test]
