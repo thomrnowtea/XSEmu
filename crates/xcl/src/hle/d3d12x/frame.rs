@@ -12,6 +12,11 @@
 //! XCL runs the clock on a thread of its own (high-resolution waitable timer, the last
 //! ~0.6 ms spun): at each event it releases the type's internal semaphore (origin) or sets its
 //! event, and signals the title's ancillary handles. Not locked to the monitor's vblank.
+//!
+//! `frame_interval_us` in xcl.toml (`XCL_FRAME_INTERVAL_US` overrides) runs the clock at an
+//! interval of the user's instead of the title's (16 667 µs where a title asks for 33 333: 60
+//! instead of 30 frames a second). The title's event offsets are scaled with it, so each event
+//! stays at the same fraction of the frame (`effective_offset`).
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -52,6 +57,32 @@ pub fn interval_valid(len_us: u32, high_refresh: bool) -> bool {
         return high_refresh;
     }
     near(16667, 16) || near(33333, 34) || near(50000, 49) || near(66667, 67)
+}
+
+/// The interval the clock runs at for the title's `title_us`: the user's `override_us` when it
+/// is set (non-zero), the title runs a clock (`title_us` non-zero) and the console accepts it on
+/// this display (`interval_valid`). `Err(override_us)`: an override the display does not accept.
+pub fn effective_interval(title_us: u32, override_us: u32, high_refresh: bool) -> Result<u32, u32> {
+    if title_us == 0 || override_us == 0 {
+        return Ok(title_us);
+    }
+    if interval_valid(override_us, high_refresh) {
+        Ok(override_us)
+    } else {
+        Err(override_us)
+    }
+}
+
+/// Where the clock fires an event the title schedules `offset_us` into its `title_us` frame,
+/// in a frame of `effective_us`: the same fraction of the frame (an offset of 20 000 µs into
+/// 33 333 is 10 000 into 16 667). Taken modulo the interval as the console does; without an
+/// override (`title_us == effective_us`) that is all.
+pub fn effective_offset(offset_us: u32, title_us: u32, effective_us: u32) -> u32 {
+    let effective = effective_us.max(1);
+    if title_us == 0 || title_us == effective {
+        return offset_us % effective;
+    }
+    ((offset_us % title_us) as u64 * effective as u64 / title_us as u64) as u32
 }
 
 /// The first deadline `base + offset + k·interval` after `after`.
@@ -96,7 +127,10 @@ struct Kind {
 }
 
 struct Clock {
+    /// the interval the clock runs at (`effective_interval`)
     interval_us: u32,
+    /// the interval the title set (`SetFrameIntervalX`): its event offsets are into this one
+    title_interval_us: u32,
     active: bool,
     kinds: [Kind; TYPES],
     /// bumped on every change: the clock thread re-plans
@@ -191,25 +225,48 @@ fn with<R>(f: impl FnOnce(&mut Clock) -> R) -> R {
             extra: Arc::new(Handles(Vec::new())),
             scheduled: false,
         };
-        Clock { interval_us: 0, active: false, kinds: [kind(0), kind(1), kind(2)], generation: 0, base_qpc: 0 }
+        Clock { interval_us: 0, title_interval_us: 0, active: false, kinds: [kind(0), kind(1), kind(2)], generation: 0, base_qpc: 0 }
     });
     f(c)
 }
 
 /// device #78 SetFrameIntervalX(output, length µs, periodicity, flags)
 pub unsafe extern "system" fn set_frame_interval_x(_this: *mut std::ffi::c_void, _output: *mut std::ffi::c_void, len_us: u32, periodicity: u32, flags: u32) -> HRESULT {
-    if len_us != 0 && !interval_valid(len_us, crate::state::config().reported_display_mode().map_or_else(high_refresh, |mode| mode.hz == 120)) {
+    let config = crate::state::config();
+    let high = config.reported_display_mode().map_or_else(high_refresh, |mode| mode.hz == 120);
+    set_interval(len_us, periodicity, flags, config.frame_interval_override_us(), high)
+}
+
+/// SetFrameIntervalX with the user's `override_us` (`frame_interval_us`, 0 = none) on a display
+/// of `high_refresh`.
+unsafe fn set_interval(len_us: u32, periodicity: u32, flags: u32, override_us: u32, high: bool) -> HRESULT {
+    if len_us != 0 && !interval_valid(len_us, high) {
         crate::xlog_warn!("D3D12.X: SetFrameIntervalX({len_us} µs) – not an interval of this display");
         return E_INVALIDARG;
     }
+    let effective = match effective_interval(len_us, override_us, high) {
+        Ok(v) => {
+            if v != len_us {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| crate::xlog_info!("D3D12.X: frame interval override active – the clock runs at {v} µs instead of the title's {len_us} µs"));
+            }
+            v
+        }
+        Err(bad) => {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| crate::xlog_warn!("D3D12.X: frame interval override {bad} µs is not an interval of this display – ignored, the title's {len_us} µs stays"));
+            len_us
+        }
+    };
     with(|c| {
-        if c.interval_us != len_us {
+        if c.interval_us != effective || c.title_interval_us != len_us {
             c.kinds[0].scheduled = false;
-            if c.active && len_us != 0 {
+            if c.active && effective != 0 {
                 c.base_qpc = qpc();
             }
         }
-        c.interval_us = len_us;
+        c.interval_us = effective;
+        c.title_interval_us = len_us;
         if len_us == 0 {
             c.active = false;
             for k in c.kinds.iter_mut() {
@@ -285,14 +342,14 @@ pub unsafe extern "system" fn schedule_frame_event_x(_this: *mut std::ffi::c_voi
             c.base_qpc = qpc();
             hr = STARTED_CLOCK;
         }
-        let interval = c.interval_us.max(1);
+        let (interval, title_interval) = (c.interval_us, c.title_interval_us);
         let k = &mut c.kinds[ty as usize];
         // the previous handles close with their last holder (the clock thread may be signalling them)
         k.extra = Arc::new(Handles(dups));
         if unschedule {
             k.scheduled = false;
         } else {
-            k.offset_us = offset_us % interval;
+            k.offset_us = effective_offset(offset_us, title_interval, interval);
             k.scheduled = true;
         }
         c.generation += 1;
@@ -545,6 +602,72 @@ mod tests {
         assert_eq!(next_deadline(100, 10, 3, 50), 103);
         assert_eq!(next_deadline(100, 10, 3, 103), 113);
         assert_eq!(next_deadline(100, 10, 3, 120), 123);
+    }
+
+    /// `frame_interval_us`: a console interval of the display replaces the title's; one the
+    /// display does not take is ignored, and 0 (or a title that stops its clock) leaves the
+    /// title's value.
+    #[test]
+    fn frame_interval_override_applies_only_when_valid() {
+        assert_eq!(effective_interval(33333, 16667, false), Ok(16667), "60 fps for a 30 fps title");
+        assert_eq!(effective_interval(33333, 16666, false), Ok(16666));
+        assert_eq!(effective_interval(33333, 8333, true), Ok(8333), "120 fps on a 120 Hz display");
+        assert_eq!(effective_interval(33333, 8333, false), Err(8333), "120 fps only on a 120 Hz display");
+        assert_eq!(effective_interval(33333, 16000, true), Err(16000), "not a console interval");
+        assert_eq!(effective_interval(33333, 0, true), Ok(33333), "0: the title's");
+        assert_eq!(effective_interval(16667, 0, false), Ok(16667));
+        assert_eq!(effective_interval(0, 16667, false), Ok(0), "the title stops its clock");
+    }
+
+    /// Event offsets keep their place in the frame under an override, and their order.
+    #[test]
+    fn event_offsets_scale_with_the_override() {
+        assert_eq!(effective_offset(20000, 33333, 16667), 10000);
+        assert_eq!(effective_offset(0, 33333, 16667), 0);
+        assert_eq!(effective_offset(33333 + 5000, 33333, 16667), 2500, "taken modulo the title's interval first");
+        let (a, b) = (effective_offset(10000, 33333, 16667), effective_offset(20000, 33333, 16667));
+        assert!(a < b && b < 16667, "{a} {b}");
+        // no override: modulo the interval, as before
+        assert_eq!(effective_offset(20000, 16667, 16667), 3333);
+        assert_eq!(effective_offset(5000, 0, 16667), 5000);
+    }
+
+    /// The clock runs at the override: a 30 fps title's origins come one 60 Hz interval apart,
+    /// and its frame statistics report those origins. An invalid override and 0 leave 33 333.
+    #[test]
+    fn the_clock_runs_at_the_override_interval() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let dev = std::ptr::null_mut();
+            let interval = || with(|c| (c.title_interval_us, c.interval_us));
+            assert_eq!(set_interval(33333, 3, 0, 16000, false), S_FALSE);
+            assert_eq!(interval(), (33333, 33333), "an invalid override is ignored");
+            assert_eq!(set_interval(33333, 3, 0, 0, false), S_FALSE);
+            assert_eq!(interval(), (33333, 33333), "0: the title's");
+            assert_eq!(set_interval(33333, 3, 0, 16667, false), S_FALSE);
+            assert_eq!(interval(), (33333, 16667), "the override applies");
+            let hr = schedule_frame_event_x(dev, 0, 0, std::ptr::null(), 0);
+            assert!(hr == STARTED_CLOCK || hr == S_FALSE, "{hr:#x}");
+            let mut tokens = [0u64; 3];
+            for t in tokens.iter_mut() {
+                assert_eq!(wait_frame_event_x(dev, 0, 200, std::ptr::null(), 0, t), S_OK);
+            }
+            let mut origins = Vec::new();
+            for &t in &tokens {
+                mark_flipped(t);
+                let (mut n, mut st) = (1u32, [0u8; 0x40]);
+                assert_eq!(frame_statistics_x(dev, t, 0, &mut n, st.as_mut_ptr()), S_OK);
+                origins.push(i64::from_le_bytes(st[0x10..0x18].try_into().unwrap()));
+            }
+            let spread = (origins[2] - origins[0]) * 1_000_000 / qpf();
+            assert!((25_000..=55_000).contains(&spread), "two 16 667 µs intervals, not 33 333: {spread} µs");
+            // a type-1 event the title puts 20 000 µs into its 33 333 µs frame: 10 000 into ours
+            assert_eq!(schedule_frame_event_x(dev, 1, 20000, std::ptr::null(), 0), S_FALSE);
+            assert_eq!(with(|c| c.kinds[1].offset_us), 10000);
+            assert_eq!(schedule_frame_event_x(dev, 1, 0, std::ptr::null(), UNSCHEDULE), S_FALSE);
+            assert_eq!(set_interval(0, 0, 0, 16667, false), S_FALSE, "stops the clock");
+            assert_eq!(interval(), (0, 0));
+        }
     }
 
     #[test]

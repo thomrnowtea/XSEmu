@@ -260,6 +260,7 @@ default, `"anaconda"`, is a Series X.
 | `XCL_PSO_DISK_CACHE=0` | Turns off the driver blob cache. |
 | `XCL_PSO_MANIFEST=0` | Stops recording pipelines in the manifest. |
 | `XCL_ASYNC_PSO=0` | Builds every pipeline inside the create call, with no stand-in. |
+| `XCL_FRAME_INTERVAL_US` | Frame interval in µs that the frame clock uses instead of the title's, for example `16667` (60 fps) for a title that asks for 33333 (30 fps). `8333` (120 fps) works only on a display of 120 Hz or more. `0` uses the title's interval. Overrides `frame_interval_us` in `xcl.toml`. |
 | `XCL_WARMUP_BUDGET_S` | Time limit in seconds for `XSEmu warm-up` without `--full`. |
 | `XCL_NETWORK=0` | Runs the title with no network, as on a console that is offline. Loopback still works. |
 | `XCL_STORE=offline-error` | Every store query fails with the GDK store network error. No licence is granted. |

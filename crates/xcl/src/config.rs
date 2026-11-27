@@ -80,6 +80,11 @@ pub struct Config {
     /// How far the right stick goes for a mouse speed: 1.0 = full deflection at 4000 mouse
     /// counts a second.
     pub mouse_sensitivity: f32,
+    /// Frame interval (µs) the frame clock runs at instead of the one the title sets with
+    /// `SetFrameIntervalX` (e.g. 16667 for 60 fps where the title asks for 33333); 0 = the
+    /// title's own. Only a console interval of the display (`frame::interval_valid`) is taken.
+    /// `XCL_FRAME_INTERVAL_US` overrides.
+    pub frame_interval_us: u32,
 }
 
 impl Config {
@@ -196,6 +201,7 @@ impl Default for Config {
             xbox_live_tokens: false,
             keyboard_mouse: true,
             mouse_sensitivity: 1.0,
+            frame_interval_us: 0,
         }
     }
 }
@@ -205,7 +211,8 @@ const HEADER: &str = "# XCL – title configuration. Created automatically; you 
 # display_mode: \"auto\" (Lockhart 1280x720@60 SDR, other devices host), \"host\", or \"WxH[@60|@120]\" (SDR); XCL_DISPLAY_MODE overrides\n\
 # mounts: console path prefix -> folder ({game} = game folder, read-only; {data} = XCL data)\n\
 # aliases: DLL pattern -> \"kernelx.dll\" / \"xgameruntime.dll\" / \"d3d12_xs.dll\" / \"@system\" / \"@stub\"\n\
-# stub_returns: \"dll!Function\" -> value the stub returns (e.g. \"E_NOTIMPL\", \"0\", \"0x1\")\n\n";
+# stub_returns: \"dll!Function\" -> value the stub returns (e.g. \"E_NOTIMPL\", \"0\", \"0x1\")\n\
+# frame_interval_us: frame interval in µs instead of the title's (0 = the title's): 16667 = 60 fps, 8333 = 120 fps (120 Hz displays only); XCL_FRAME_INTERVAL_US overrides\n\n";
 
 /// What XSystemGetConsoleId returns: a made-up id in the console id format, 38 characters
 /// (four groups of 8 hex digits and one of 2), which titles size their buffer for
@@ -276,6 +283,15 @@ impl Config {
     /// "off" and anything else leave it off. `XCL_RAYTRACING` overrides `xcl.toml`.
     pub fn raytracing_on(&self) -> bool {
         raytracing_mode_on(self.raytracing_mode().trim())
+    }
+
+    /// The frame interval override (µs, 0 = none): `XCL_FRAME_INTERVAL_US`, else `frame_interval_us`.
+    pub(crate) fn frame_interval_override_us(&self) -> u32 {
+        self.frame_interval_with_env(std::env::var("XCL_FRAME_INTERVAL_US").ok().as_deref())
+    }
+
+    fn frame_interval_with_env(&self, env: Option<&str>) -> u32 {
+        env.and_then(|v| v.trim().parse().ok()).unwrap_or(self.frame_interval_us)
     }
 
     fn raytracing_mode(&self) -> String {
@@ -375,6 +391,17 @@ mod tests {
         assert!(c.is_series_s());
         assert_eq!(c.gamertag, "Player1");
         assert_eq!(c.raytracing, "auto");
+        assert_eq!(c.frame_interval_us, 0);
+    }
+
+    #[test]
+    fn frame_interval_override_env_beats_toml() {
+        let c: Config = toml::from_str("frame_interval_us = 16667").unwrap();
+        assert_eq!(c.frame_interval_with_env(None), 16667);
+        assert_eq!(c.frame_interval_with_env(Some(" 8333 ")), 8333);
+        assert_eq!(c.frame_interval_with_env(Some("0")), 0, "0 in the environment: the title's interval");
+        assert_eq!(c.frame_interval_with_env(Some("fast")), 16667, "not a number: xcl.toml's");
+        assert_eq!(Config::default().frame_interval_with_env(None), 0);
     }
 
     #[test]
